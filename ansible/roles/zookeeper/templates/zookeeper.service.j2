@@ -1,0 +1,14 @@
+[Unit]
+Description=Apache Pulsar ZooKeeper
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Environment="PULSAR_LOG_DIR=/var/log/pulsar"
+ExecStart=/opt/pulsar/bin/pulsar zookeeper
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

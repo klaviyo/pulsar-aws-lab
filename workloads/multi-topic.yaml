@@ -1,0 +1,19 @@
+# Multi-Topic Workload - Distributed load across multiple topics
+name: multi-topic-test
+
+topics: 10
+partitionsPerTopic: 4
+messageSize: 1024  # 1 KB
+payloadFile: ""
+
+subscriptionsPerTopic: 1
+consumerPerSubscription: 1
+producersPerTopic: 1
+
+consumerBacklogSizeGB: 0
+
+testDurationMinutes: 5
+warmupDurationMinutes: 1
+
+# 25k msgs/sec distributed across 10 topics
+producerRate: 25000

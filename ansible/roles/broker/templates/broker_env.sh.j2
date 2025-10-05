@@ -1,0 +1,8 @@
+#!/bin/bash
+# Broker Environment Configuration
+
+PULSAR_MEM="-Xms{{ broker_heap_size }} -Xmx{{ broker_heap_size }}"
+PULSAR_GC="-XX:+UseG1GC -XX:MaxGCPauseMillis=10"
+PULSAR_EXTRA_OPTS="-XX:MaxDirectMemorySize={{ broker_direct_memory_size }}"
+
+export PULSAR_MEM PULSAR_GC PULSAR_EXTRA_OPTS

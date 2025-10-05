@@ -1,0 +1,243 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Test Plan Configuration",
+  "description": "Schema for defining systematic test runs and variations",
+  "type": "object",
+  "required": ["name", "base_workload", "test_runs"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Test plan name"
+    },
+    "description": {
+      "type": "string",
+      "description": "Test plan description"
+    },
+    "base_workload": {
+      "type": "object",
+      "description": "Base workload configuration that all test runs inherit",
+      "required": ["name", "topics", "partitions_per_topic", "message_size", "producers_per_topic", "consumers_per_topic"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Workload name"
+        },
+        "topics": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of topics"
+        },
+        "partitions_per_topic": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of partitions per topic"
+        },
+        "message_size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Message size in bytes"
+        },
+        "payload_file": {
+          "type": "string",
+          "description": "Path to payload file (optional)"
+        },
+        "subscriptions_per_topic": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Number of subscriptions per topic"
+        },
+        "producers_per_topic": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of producers per topic"
+        },
+        "consumers_per_topic": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of consumers per topic"
+        },
+        "consumer_backlog_size_gb": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Initial consumer backlog size in GB"
+        },
+        "test_duration_minutes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5,
+          "description": "Test duration in minutes"
+        },
+        "warmup_duration_minutes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1,
+          "description": "Warmup duration in minutes"
+        }
+      }
+    },
+    "test_runs": {
+      "type": "array",
+      "minItems": 1,
+      "description": "List of test run variations",
+      "items": {
+        "type": "object",
+        "required": ["name", "type"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Test run name (used for result identification)"
+          },
+          "description": {
+            "type": "string",
+            "description": "Test run description"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["fixed_rate", "max_rate", "ramp_up", "latency_test", "scale_to_failure"],
+            "description": "Test type"
+          },
+          "producer_rate": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Target producer rate (msgs/sec) - for fixed_rate type"
+          },
+          "ramp_up_steps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["rate", "duration_minutes"],
+              "properties": {
+                "rate": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "duration_minutes": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
+            "description": "Ramp up steps - for ramp_up type"
+          },
+          "failure_criteria": {
+            "type": "object",
+            "description": "Criteria for scale_to_failure type",
+            "properties": {
+              "max_latency_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum acceptable latency in ms"
+              },
+              "max_error_rate_percent": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 100,
+                "description": "Maximum error rate percentage"
+              }
+            }
+          },
+          "workload_overrides": {
+            "type": "object",
+            "description": "Override base workload parameters for this test run",
+            "properties": {
+              "topics": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "partitions_per_topic": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "message_size": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "producers_per_topic": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "consumers_per_topic": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "test_duration_minutes": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "warmup_duration_minutes": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "infrastructure_overrides": {
+            "type": "object",
+            "description": "Override infrastructure settings for this test run",
+            "properties": {
+              "broker_instance_type": {
+                "type": "string"
+              },
+              "bookkeeper_instance_type": {
+                "type": "string"
+              },
+              "broker_count": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "bookkeeper_count": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          },
+          "pulsar_config_overrides": {
+            "type": "object",
+            "description": "Override Pulsar configuration for this test run",
+            "properties": {
+              "broker_heap_size": {
+                "type": "string"
+              },
+              "bookkeeper_heap_size": {
+                "type": "string"
+              },
+              "managed_ledger_cache_size_mb": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      }
+    },
+    "reporting": {
+      "type": "object",
+      "description": "Report generation settings",
+      "properties": {
+        "output_format": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["html", "json", "csv"]
+          },
+          "default": ["html", "json"],
+          "description": "Report output formats"
+        },
+        "include_raw_data": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include raw benchmark data in report package"
+        },
+        "metrics_to_highlight": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["throughput", "p50_latency", "p95_latency", "p99_latency", "p999_latency", "max_latency", "cost_per_million_msgs"]
+          },
+          "default": ["throughput", "p99_latency", "cost_per_million_msgs"],
+          "description": "Metrics to highlight in report"
+        }
+      }
+    }
+  }
+}

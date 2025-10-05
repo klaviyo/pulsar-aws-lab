@@ -1,0 +1,35 @@
+# Proof of Concept Test Plan
+# Simple validation test - 20k msgs/sec for 2 minutes
+
+name: "poc"
+description: "Proof of concept - validate basic setup with simple load test"
+
+# Base workload configuration
+base_workload:
+  name: "poc-baseline"
+  topics: 1
+  partitions_per_topic: 16
+  message_size: 1024  # 1 KB messages
+  subscriptions_per_topic: 1
+  producers_per_topic: 1
+  consumers_per_topic: 1
+  consumer_backlog_size_gb: 0
+  test_duration_minutes: 2
+  warmup_duration_minutes: 1
+
+# Single test run
+test_runs:
+  - name: "poc-20k"
+    description: "20k msgs/sec validation test"
+    type: "fixed_rate"
+    producer_rate: 20000
+
+# Minimal reporting
+reporting:
+  output_format:
+    - "html"
+    - "json"
+  include_raw_data: true
+  metrics_to_highlight:
+    - "throughput"
+    - "p99_latency"

@@ -1,0 +1,11 @@
+---
+# ZooKeeper Handlers
+
+- name: reload systemd
+  systemd:
+    daemon_reload: yes
+
+- name: restart zookeeper
+  systemd:
+    name: zookeeper
+    state: restarted

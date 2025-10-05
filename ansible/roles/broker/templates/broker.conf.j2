@@ -1,0 +1,38 @@
+# Broker Configuration
+
+# Cluster name
+clusterName={{ pulsar_cluster_name }}
+
+# ZooKeeper connection
+zookeeperServers={{ groups['zookeeper'] | map('extract', hostvars, ['ansible_host']) | join(':2181,') }}:2181
+configurationStoreServers={{ groups['zookeeper'] | map('extract', hostvars, ['ansible_host']) | join(':2181,') }}:2181
+
+# Broker settings
+brokerServicePort=6650
+brokerServicePortTls=6651
+webServicePort=8080
+webServicePortTls=8443
+
+advertisedAddress={{ ansible_host }}
+advertisedListeners=internal:pulsar://{{ ansible_host }}:6650
+
+# Managed Ledger settings
+managedLedgerCacheSizeMB={{ broker_managed_ledger_cache_size_mb }}
+managedLedgerDefaultEnsembleSize={{ broker_managed_ledger_default_ensemble_size }}
+managedLedgerDefaultWriteQuorum={{ broker_managed_ledger_default_write_quorum }}
+managedLedgerDefaultAckQuorum={{ broker_managed_ledger_default_ack_quorum }}
+
+# Retention settings
+defaultRetentionTimeInMinutes={{ broker_default_retention_time_minutes }}
+defaultRetentionSizeInMB={{ broker_default_retention_size_mb }}
+
+# Flow control
+maxUnackedMessagesPerConsumer={{ broker_max_unacked_messages_per_consumer }}
+maxUnackedMessagesPerSubscription={{ broker_max_unacked_messages_per_subscription }}
+
+# Throttling
+dispatchThrottlingRatePerTopicInMsg={{ broker_dispatch_throttling_rate_per_topic_in_msg }}
+dispatchThrottlingRatePerTopicInByte={{ broker_dispatch_throttling_rate_per_topic_in_byte }}
+
+# Functions worker (disabled for minimal setup)
+functionsWorkerEnabled=false

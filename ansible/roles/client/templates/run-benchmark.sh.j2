@@ -1,0 +1,32 @@
+#!/bin/bash
+# OpenMessaging Benchmark Wrapper Script
+
+set -e
+
+BENCHMARK_HOME="/opt/openmessaging-benchmark"
+DRIVER_CONFIG="/opt/benchmark-configs/pulsar-driver.yaml"
+RESULTS_DIR="/opt/benchmark-results"
+
+# Check arguments
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <workload-file> [output-name]"
+    echo "Example: $0 workloads/1-topic-16-partitions-1kb.yaml test-run-1"
+    exit 1
+fi
+
+WORKLOAD_FILE="$1"
+OUTPUT_NAME="${2:-$(date +%Y%m%d-%H%M%S)}"
+
+# Run benchmark
+cd "$BENCHMARK_HOME/benchmark-framework"
+
+echo "Running benchmark with workload: $WORKLOAD_FILE"
+echo "Results will be saved to: $RESULTS_DIR/$OUTPUT_NAME"
+
+bin/benchmark \
+    --drivers "$DRIVER_CONFIG" \
+    "$WORKLOAD_FILE" \
+    --output "$RESULTS_DIR/$OUTPUT_NAME.json"
+
+echo "Benchmark complete!"
+echo "Results: $RESULTS_DIR/$OUTPUT_NAME.json"

@@ -1,0 +1,5 @@
+---
+# Client Default Variables
+
+pulsar_version: "3.0.0"
+broker_managed_ledger_default_write_quorum: 3

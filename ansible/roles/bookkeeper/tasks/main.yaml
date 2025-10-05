@@ -1,0 +1,104 @@
+---
+# BookKeeper Installation and Configuration
+
+- name: Create Pulsar directory
+  file:
+    path: /opt/pulsar
+    state: directory
+    mode: '0755'
+
+- name: Download Pulsar binary
+  get_url:
+    url: "https://archive.apache.org/dist/pulsar/pulsar-{{ pulsar_version }}/apache-pulsar-{{ pulsar_version }}-bin.tar.gz"
+    dest: "/tmp/apache-pulsar-{{ pulsar_version }}-bin.tar.gz"
+    timeout: 300
+
+- name: Extract Pulsar binary
+  unarchive:
+    src: "/tmp/apache-pulsar-{{ pulsar_version }}-bin.tar.gz"
+    dest: /opt/pulsar
+    remote_src: yes
+    extra_opts: [--strip-components=1]
+    creates: /opt/pulsar/bin/pulsar
+
+- name: Check if EBS volume is attached
+  stat:
+    path: /dev/xvdf
+  register: ebs_volume
+
+- name: Create filesystem on EBS volume
+  filesystem:
+    fstype: xfs
+    dev: /dev/xvdf
+  when: ebs_volume.stat.exists
+
+- name: Create mount point
+  file:
+    path: /mnt/bookkeeper
+    state: directory
+    mode: '0755'
+
+- name: Mount EBS volume
+  mount:
+    path: /mnt/bookkeeper
+    src: /dev/xvdf
+    fstype: xfs
+    state: mounted
+  when: ebs_volume.stat.exists
+
+- name: Create BookKeeper directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ bookkeeper_journal_dir }}"
+    - "{{ bookkeeper_ledger_dirs[0] }}"
+
+- name: Configure BookKeeper
+  template:
+    src: bookkeeper.conf.j2
+    dest: /opt/pulsar/conf/bookkeeper.conf
+    mode: '0644'
+  notify: restart bookkeeper
+
+- name: Configure BookKeeper environment
+  template:
+    src: bookkeeper_env.sh.j2
+    dest: /opt/pulsar/conf/bookkeeper_env.sh
+    mode: '0755'
+  notify: restart bookkeeper
+
+- name: Create BookKeeper systemd service
+  template:
+    src: bookkeeper.service.j2
+    dest: /etc/systemd/system/bookkeeper.service
+    mode: '0644'
+  notify:
+    - reload systemd
+    - restart bookkeeper
+
+- name: Wait for ZooKeeper to be ready
+  wait_for:
+    host: "{{ groups['zookeeper'][0] }}"
+    port: 2181
+    timeout: 300
+
+- name: Format BookKeeper metadata (first bookie only)
+  shell: /opt/pulsar/bin/bookkeeper shell metaformat -nonInteractive
+  args:
+    creates: /var/lib/bookkeeper-formatted
+  when: bk_id == "1"
+  run_once: true
+
+- name: Mark BookKeeper as formatted
+  file:
+    path: /var/lib/bookkeeper-formatted
+    state: touch
+  when: bk_id == "1"
+
+- name: Enable and start BookKeeper
+  systemd:
+    name: bookkeeper
+    enabled: yes
+    state: started

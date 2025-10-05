@@ -1,0 +1,19 @@
+# Latency Test Workload - Low load for latency characterization
+name: latency-test
+
+topics: 1
+partitionsPerTopic: 1
+messageSize: 1024  # 1 KB
+payloadFile: ""
+
+subscriptionsPerTopic: 1
+consumerPerSubscription: 1
+producersPerTopic: 1
+
+consumerBacklogSizeGB: 0
+
+testDurationMinutes: 5
+warmupDurationMinutes: 1
+
+# Low rate to measure minimal latency - 1k msgs/sec
+producerRate: 1000

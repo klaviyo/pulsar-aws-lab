@@ -1,0 +1,8 @@
+#!/bin/bash
+# BookKeeper Environment Configuration
+
+BOOKIE_MEM="-Xms{{ bookkeeper_heap_size }} -Xmx{{ bookkeeper_heap_size }}"
+BOOKIE_GC="-XX:+UseG1GC -XX:MaxGCPauseMillis=10"
+BOOKIE_EXTRA_OPTS="-XX:MaxDirectMemorySize={{ bookkeeper_direct_memory_size }}"
+
+export BOOKIE_MEM BOOKIE_GC BOOKIE_EXTRA_OPTS
