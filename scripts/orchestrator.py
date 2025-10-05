@@ -334,9 +334,114 @@ class Orchestrator:
 
         test_plan = self.load_config(test_plan_file)
 
-        # TODO: Implement test execution
-        # This will be implemented with the test runner module
-        logger.warning("Test execution not yet implemented")
+        # Get client node SSH info
+        client_ips = self.get_terraform_output("client_instances")
+        client_data = json.loads(client_ips)
+        client_ip = client_data['public_ips'][0]
+
+        ssh_key_name = self.infrastructure_config['compute']['ssh_key_name']
+        ssh_key_path = Path.home() / ".ssh" / f"{ssh_key_name}.pem"
+
+        logger.info(f"Running tests on client node: {client_ip}")
+
+        # Create results directory
+        results_dir = self.experiment_dir / "benchmark_results"
+        results_dir.mkdir(exist_ok=True)
+
+        # Run each test in the test plan
+        for idx, test_run in enumerate(test_plan['test_runs']):
+            test_name = test_run['name']
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Running test: {test_name} ({idx + 1}/{len(test_plan['test_runs'])})")
+            logger.info(f"{'='*60}\n")
+
+            # Generate workload file from test plan
+            workload = self._generate_workload(test_plan['base_workload'], test_run)
+            workload_file = self.experiment_dir / f"workload_{test_name}.yaml"
+
+            with open(workload_file, 'w') as f:
+                yaml.dump(workload, f)
+
+            # Copy workload to client
+            self._ssh_copy(str(workload_file), f"/tmp/workload_{test_name}.yaml", client_ip, ssh_key_path)
+
+            # Run benchmark
+            result_file = f"/opt/benchmark-results/{test_name}.json"
+            benchmark_cmd = f"cd /opt/openmessaging-benchmark/benchmark-framework && " \
+                          f"sudo bin/benchmark --drivers /opt/benchmark-configs/pulsar-driver.yaml " \
+                          f"/tmp/workload_{test_name}.yaml --output {result_file}"
+
+            logger.info(f"Executing benchmark: {test_name}")
+            self._ssh_exec(benchmark_cmd, client_ip, ssh_key_path)
+
+            # Download results
+            local_result = results_dir / f"{test_name}.json"
+            self._ssh_copy(f"ec2-user@{client_ip}:{result_file}", str(local_result), client_ip, ssh_key_path, download=True)
+
+            logger.info(f"✓ Test '{test_name}' completed. Results saved to {local_result}")
+
+        logger.info(f"\n{'='*60}")
+        logger.info(f"All tests completed! Results: {results_dir}")
+        logger.info(f"{'='*60}\n")
+
+    def _generate_workload(self, base: Dict, overrides: Dict) -> Dict:
+        """Generate OpenMessaging Benchmark workload from test plan"""
+        workload = {
+            'name': overrides.get('name', base['name']),
+            'topics': overrides.get('workload_overrides', {}).get('topics', base['topics']),
+            'partitionsPerTopic': overrides.get('workload_overrides', {}).get('partitions_per_topic', base['partitions_per_topic']),
+            'messageSize': overrides.get('workload_overrides', {}).get('message_size', base['message_size']),
+            'subscriptionsPerTopic': base.get('subscriptions_per_topic', 1),
+            'consumerPerSubscription': overrides.get('workload_overrides', {}).get('consumers_per_topic', base.get('consumers_per_topic', 1)),
+            'producersPerTopic': overrides.get('workload_overrides', {}).get('producers_per_topic', base.get('producers_per_topic', 1)),
+            'consumerBacklogSizeGB': base.get('consumer_backlog_size_gb', 0),
+            'testDurationMinutes': overrides.get('workload_overrides', {}).get('test_duration_minutes', base.get('test_duration_minutes', 5)),
+            'warmupDurationMinutes': overrides.get('workload_overrides', {}).get('warmup_duration_minutes', base.get('warmup_duration_minutes', 1)),
+        }
+
+        # Add producer rate if specified
+        if overrides['type'] == 'fixed_rate' and 'producer_rate' in overrides:
+            workload['producerRate'] = overrides['producer_rate']
+
+        return workload
+
+    def _ssh_exec(self, command: str, host: str, key_path: Path) -> None:
+        """Execute command via SSH"""
+        ssh_cmd = [
+            "ssh",
+            "-i", str(key_path),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            f"ec2-user@{host}",
+            command
+        ]
+
+        result = subprocess.run(ssh_cmd, check=True)
+
+    def _ssh_copy(self, source: str, dest: str, host: str, key_path: Path, download: bool = False) -> None:
+        """Copy file via SCP"""
+        if download:
+            # Download from remote
+            scp_cmd = [
+                "scp",
+                "-i", str(key_path),
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                source,
+                dest
+            ]
+        else:
+            # Upload to remote
+            scp_cmd = [
+                "scp",
+                "-i", str(key_path),
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                source,
+                f"ec2-user@{host}:{dest}"
+            ]
+
+        subprocess.run(scp_cmd, check=True)
 
     def generate_report(self) -> None:
         """Generate experiment report"""
@@ -353,22 +458,15 @@ class Orchestrator:
         # Setup infrastructure
         self.setup(config_file)
 
-        # Run tests (not yet implemented)
-        logger.warning("\n" + "="*60)
-        logger.warning("NOTE: Test execution is not yet implemented!")
-        logger.warning("Infrastructure will remain running for manual testing.")
-        logger.warning("To teardown manually, run:")
-        logger.warning(f"  python scripts/orchestrator.py teardown --experiment-id {self.experiment_id}")
-        logger.warning("="*60 + "\n")
+        # Run tests and generate report, ensuring teardown happens
+        try:
+            self.run_tests(test_plan_file)
+            self.generate_report()
+        finally:
+            logger.info("Tearing down infrastructure...")
+            self.teardown()
 
-        # Uncomment when tests are implemented:
-        # try:
-        #     self.run_tests(test_plan_file)
-        #     self.generate_report()
-        # finally:
-        #     self.teardown()
-
-        logger.info("Setup completed - infrastructure is running")
+        logger.info("Full lifecycle completed successfully")
 
     @staticmethod
     def resolve_experiment_id(experiment_id: str) -> str:
