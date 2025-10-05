@@ -225,6 +225,10 @@ class Orchestrator:
             "-e", f"@{CONFIG_DIR / 'pulsar-cluster.yaml'}"
         ]
 
+        # Set ANSIBLE_CONFIG to use our ansible.cfg
+        env = os.environ.copy()
+        env['ANSIBLE_CONFIG'] = str(ANSIBLE_DIR / "ansible.cfg")
+
         # Override pulsar_version from infrastructure config if available
         if self.infrastructure_config and 'pulsar_version' in self.infrastructure_config:
             cmd.extend(["-e", f"pulsar_version={self.infrastructure_config['pulsar_version']}"])
@@ -232,7 +236,7 @@ class Orchestrator:
 
         try:
             # Stream output to console in real-time
-            result = subprocess.run(cmd, check=True)
+            result = subprocess.run(cmd, check=True, env=env)
             logger.info("Ansible playbook completed successfully")
         except subprocess.CalledProcessError as e:
             logger.error(f"Ansible playbook failed with exit code {e.returncode}")
