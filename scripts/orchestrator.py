@@ -242,12 +242,19 @@ class Orchestrator:
             logger.error(f"Ansible playbook failed with exit code {e.returncode}")
             raise OrchestratorError("Ansible playbook failed") from e
 
-    def setup(self, config_file: Path) -> None:
+    def setup(self, config_file: Path, runtime_tags: Optional[Dict[str, str]] = None) -> None:
         """Setup infrastructure and deploy Pulsar cluster"""
         logger.info("Starting setup phase")
 
         # Load infrastructure config
         self.infrastructure_config = self.load_config(config_file)
+
+        # Merge runtime tags with config tags
+        if runtime_tags:
+            config_tags = self.infrastructure_config.get('experiment', {}).get('tags', {})
+            merged_tags = {**config_tags, **runtime_tags}  # Runtime tags override config tags
+            self.infrastructure_config.setdefault('experiment', {})['tags'] = merged_tags
+            logger.info(f"Merged tags: {merged_tags}")
 
         # Ensure SSH key exists
         ssh_key_name = self.infrastructure_config['compute']['ssh_key_name']
@@ -455,12 +462,12 @@ class Orchestrator:
         # This will be implemented with the reporting module
         logger.warning("Report generation not yet implemented")
 
-    def full_lifecycle(self, config_file: Path, test_plan_file: Path) -> None:
+    def full_lifecycle(self, config_file: Path, test_plan_file: Path, runtime_tags: Optional[Dict[str, str]] = None) -> None:
         """Execute full lifecycle: setup -> test -> report -> teardown"""
         logger.info("Starting full lifecycle")
 
         # Setup infrastructure
-        self.setup(config_file)
+        self.setup(config_file, runtime_tags=runtime_tags)
 
         # Run tests and generate report, ensuring teardown happens
         try:
@@ -526,6 +533,7 @@ def main():
     setup_parser = subparsers.add_parser("setup", help="Setup infrastructure and deploy cluster")
     setup_parser.add_argument("--config", type=Path, required=True, help="Infrastructure config file")
     setup_parser.add_argument("--experiment-id", help="Experiment ID (auto-generated if not provided)")
+    setup_parser.add_argument("--tag", action="append", metavar="KEY=VALUE", help="Additional tags (can be used multiple times)")
 
     # Teardown command
     teardown_parser = subparsers.add_parser("teardown", help="Destroy infrastructure")
@@ -548,6 +556,7 @@ def main():
     full_parser.add_argument("--config", type=Path, default=CONFIG_DIR / "infrastructure.yaml", help="Infrastructure config file")
     full_parser.add_argument("--test-plan", type=Path, required=True, help="Test plan file")
     full_parser.add_argument("--experiment-id", help="Experiment ID (auto-generated if not provided)")
+    full_parser.add_argument("--tag", action="append", metavar="KEY=VALUE", help="Additional tags (can be used multiple times)")
 
     args = parser.parse_args()
 
@@ -568,8 +577,18 @@ def main():
 
         orchestrator = Orchestrator(experiment_id)
 
+        # Parse runtime tags if provided
+        runtime_tags = {}
+        if hasattr(args, 'tag') and args.tag:
+            for tag in args.tag:
+                if '=' not in tag:
+                    raise OrchestratorError(f"Invalid tag format: {tag}. Expected KEY=VALUE")
+                key, value = tag.split('=', 1)
+                runtime_tags[key] = value
+            logger.info(f"Runtime tags: {runtime_tags}")
+
         if args.command == "setup":
-            orchestrator.setup(args.config)
+            orchestrator.setup(args.config, runtime_tags=runtime_tags)
         elif args.command == "teardown":
             orchestrator.teardown()
         elif args.command == "run":
@@ -577,7 +596,7 @@ def main():
         elif args.command == "report":
             orchestrator.generate_report()
         elif args.command == "full":
-            orchestrator.full_lifecycle(args.config, args.test_plan)
+            orchestrator.full_lifecycle(args.config, args.test_plan, runtime_tags=runtime_tags)
 
     except OrchestratorError as e:
         logger.error(f"Orchestrator error: {e}")

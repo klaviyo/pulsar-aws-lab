@@ -100,6 +100,16 @@ python scripts/orchestrator.py full \
   --test-plan config/test-plans/poc.yaml
 ```
 
+**Add custom tags** to identify resources in a shared AWS account:
+
+```bash
+python scripts/orchestrator.py full \
+  --test-plan config/test-plans/poc.yaml \
+  --tag team=data-platform \
+  --tag owner=john.doe \
+  --tag cost-center=engineering
+```
+
 This will:
 1. Deploy AWS infrastructure
 2. Install and configure Pulsar cluster
@@ -151,6 +161,11 @@ Edit `config/infrastructure.yaml` to customize:
 experiment:
   id: "my-experiment"
   name: "My Pulsar Test"
+  # Optional: Add tags to all resources (useful for shared accounts)
+  tags:
+    team: "data-platform"
+    owner: "john.doe"
+    cost_center: "engineering"
 
 # Pulsar version to install (e.g., "3.0.0", "3.1.0", "3.2.0")
 pulsar_version: "3.0.0"
@@ -180,6 +195,35 @@ compute:
     count: 1
     instance_type: "t3.small"
 ```
+
+### Resource Tagging
+
+**All AWS resources are automatically tagged with:**
+- `Project`: "pulsar-aws-lab"
+- `ExperimentID`: Auto-generated ID (e.g., "exp-20251005-143056")
+- `Experiment`: Your experiment name from config
+- `ManagedBy`: "terraform"
+
+**Add custom tags in two ways:**
+
+1. **Config file** (`config/infrastructure.yaml`):
+   ```yaml
+   experiment:
+     tags:
+       team: "data-platform"
+       owner: "john.doe"
+       cost_center: "engineering"
+   ```
+
+2. **Command line** (overrides config tags):
+   ```bash
+   python scripts/orchestrator.py full \
+     --test-plan config/test-plans/poc.yaml \
+     --tag team=data-platform \
+     --tag owner=john.doe
+   ```
+
+Tags help identify resources in shared AWS accounts and enable cost tracking per team/owner.
 
 ### Pulsar Cluster Configuration
 
