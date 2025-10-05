@@ -145,7 +145,7 @@ class Orchestrator:
     def _generate_tfvars(self, config: Dict, output_file: Path) -> None:
         """Generate Terraform variables file from YAML config"""
         tfvars = {
-            "experiment_id": config["experiment"]["id"],
+            "experiment_id": self.experiment_id,  # Use orchestrator's ID, not config file
             "experiment_name": config["experiment"]["name"],
             "aws_region": config["aws"]["region"],
             "vpc_cidr": config["network"]["vpc_cidr"],
