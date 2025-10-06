@@ -112,7 +112,7 @@ class Orchestrator:
             raise OrchestratorError(error_msg)
 
     def verify_ssm_connectivity(self, region: str, max_wait: int = 300, check_interval: int = 10) -> None:
-        """Verify EC2 instances are registered with SSM and ready for SSH sessions"""
+        """Verify EC2 instances are registered with SSM and wait for SSH readiness"""
         logger.info("Verifying SSM connectivity to instances...")
 
         ssm_client = boto3.client('ssm', region_name=region)
@@ -134,34 +134,18 @@ class Orchestrator:
                     logger.info(f"Found {len(online_instances)}/{len(managed_instances)} instances online with SSM")
 
                     if len(online_instances) == len(managed_instances):
-                        # All instances online - wait a bit for SSH daemon and Session Manager to fully initialize
-                        logger.info("All instances online. Waiting 15 seconds for SSH daemon initialization...")
-                        time.sleep(15)
-
-                        # Now verify SSH session capability for ALL instances
-                        logger.info("Verifying SSH session capability for all instances...")
-
-                        # Test all instances, not just one
-                        ready_count = 0
+                        # All instances online - list them
+                        logger.info("All instances online with SSM:")
                         for instance in managed_instances:
-                            if self._verify_ssh_session_capability(ssm_client, instance['InstanceId'], region):
-                                ready_count += 1
+                            instance_id = instance['InstanceId']
+                            ping_status = instance.get('PingStatus', 'Unknown')
+                            logger.info(f"  {instance_id}: {ping_status}")
 
-                        logger.info(f"SSH ready: {ready_count}/{len(managed_instances)} instances")
-
-                        if ready_count == len(managed_instances):
-                            logger.info("All SSM SSH sessions ready")
-                            for instance in managed_instances:
-                                instance_id = instance['InstanceId']
-                                ping_status = instance.get('PingStatus', 'Unknown')
-                                logger.info(f"  {instance_id}: {ping_status}")
-
-                            # Add stabilization delay - wait longer to ensure SSH connections remain stable
-                            logger.info("Waiting 45 seconds for SSH connection stabilization...")
-                            time.sleep(45)
-                            return
-                        else:
-                            logger.info(f"Waiting for remaining instances, retrying in {check_interval}s...")
+                        # Fixed delay for SSH daemon initialization (empirically determined for AL2023)
+                        logger.info("Waiting 90 seconds for SSH daemon and Session Manager to be fully ready...")
+                        time.sleep(90)
+                        logger.info("SSH readiness wait complete, proceeding to Ansible")
+                        return
                     else:
                         logger.info(f"Waiting for all instances to come online, retrying in {check_interval}s...")
                 else:
@@ -178,46 +162,6 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"SSM connectivity check failed: {e}")
             raise
-
-    def _verify_ssh_session_capability(self, ssm_client, instance_id: str, region: str) -> bool:
-        """Test actual SSH connectivity through Session Manager ProxyCommand (what Ansible uses)"""
-        try:
-            ssh_key = self.infrastructure_config['ssh']['key_name']
-            ssh_key_path = Path.home() / ".ssh" / f"{ssh_key}.pem"
-
-            # Test the EXACT SSH method that Ansible will use
-            ssh_cmd = [
-                "ssh",
-                "-i", str(ssh_key_path),
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=5",
-                "-o", f"ProxyCommand=aws ssm start-session --target {instance_id} --document-name AWS-StartSSHSession --parameters portNumber=%p --region {region}",
-                f"ec2-user@{instance_id}",
-                "echo ssh_test_ok"
-            ]
-
-            result = subprocess.run(
-                ssh_cmd,
-                capture_output=True,
-                timeout=10,
-                check=False
-            )
-
-            # Verify SSH worked and command executed
-            if result.returncode == 0 and b"ssh_test_ok" in result.stdout:
-                logger.debug(f"Instance {instance_id} SSH verified successfully")
-                return True
-            else:
-                logger.debug(f"Instance {instance_id} SSH test failed: rc={result.returncode}")
-                return False
-
-        except subprocess.TimeoutExpired:
-            logger.debug(f"SSH test timeout for {instance_id}")
-            return False
-        except Exception as e:
-            logger.debug(f"SSH test error for {instance_id}: {e}")
-            return False
 
     def run_terraform(self, action: str, var_file: Optional[Path] = None) -> None:
         """Execute Terraform commands"""
@@ -409,11 +353,11 @@ class Orchestrator:
             # Apply infrastructure
             self.run_terraform("apply", config_file)
 
-            # Wait for instances to be registered with SSM and ready for SSH
+            # Wait for instances to be registered with SSM, then wait for SSH readiness
             aws_region = self.infrastructure_config['aws']['region']
-            logger.info("Waiting for instances to register with SSM and become ready for SSH sessions...")
+            logger.info("Waiting for instances to register with SSM...")
 
-            # Verify SSM connectivity with health check polling
+            # Poll for SSM Online status, then wait 90s for SSH daemon
             self.verify_ssm_connectivity(aws_region, max_wait=300, check_interval=10)
 
             # Deploy Pulsar cluster via Ansible (using SSM)
