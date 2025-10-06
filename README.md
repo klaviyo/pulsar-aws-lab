@@ -21,6 +21,28 @@ A reproducible, ephemeral Apache Pulsar testing framework on AWS with automated 
 - **Broker**: Message routing and serving (default: 2 brokers)
 - **Client**: OpenMessaging Benchmark execution (default: 1 node)
 
+### Network Architecture
+
+**Public Access:**
+- All EC2 instances have **public IPs** for SSH access from your local machine
+- Ansible uses public IPs to deploy and configure the cluster
+- Security group restricts SSH to allowed CIDR blocks (default: 0.0.0.0/0)
+
+**Internal Communication:**
+- Pulsar components use **private IPs** within the VPC
+- ZooKeeper connect string: `10.0.1.x:2181,10.0.1.y:2181,...`
+- Broker service URL: `pulsar://10.0.1.z:6650`
+- All inter-cluster traffic stays within the private network
+
+**Architecture Diagram:**
+```
+Your Machine → [SSH via Public IP] → EC2 Instances
+                                       ↓
+                                  [Internal VPC]
+                                  Private IPs
+                                  ZK ↔ BK ↔ Broker
+```
+
 ### Directory Structure
 
 ```
