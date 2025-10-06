@@ -8,6 +8,7 @@ experiment:
   tags:
     environment: "test"
     cost_center: "engineering"
+    owner: "fkh"
     project: "pulsar-aws-lab"
 
 # Pulsar version to install (see https://pulsar.apache.org/download/)
