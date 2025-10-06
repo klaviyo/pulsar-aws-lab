@@ -9,7 +9,6 @@ experiment:
     environment: "test"
     cost_center: "engineering"
     owner: "fkh"
-    project: "pulsar-aws-lab"
 
 # Pulsar version to install (see https://pulsar.apache.org/download/)
 pulsar_version: "3.0.0"
