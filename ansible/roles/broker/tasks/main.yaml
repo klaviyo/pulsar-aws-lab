@@ -45,16 +45,28 @@
     - restart broker
 
 - name: Wait for ZooKeeper to be ready
-  wait_for:
-    host: "{{ hostvars[groups['zookeeper'][0]]['private_ip'] }}"
-    port: 2181
-    timeout: 300
+  shell: |
+    for i in {1..60}; do
+      if echo ruok | nc -w 2 {{ hostvars[groups['zookeeper'][0]]['private_ip'] }} 2181 | grep -q imok; then
+        exit 0
+      fi
+      sleep 5
+    done
+    exit 1
+  register: zk_check
+  changed_when: false
 
 - name: Wait for BookKeeper to be ready
-  wait_for:
-    host: "{{ hostvars[groups['bookkeeper'][0]]['private_ip'] }}"
-    port: 3181
-    timeout: 300
+  shell: |
+    for i in {1..60}; do
+      if nc -zv {{ hostvars[groups['bookkeeper'][0]]['private_ip'] }} 3181 2>&1 | grep -q succeeded; then
+        exit 0
+      fi
+      sleep 5
+    done
+    exit 1
+  register: bk_check
+  changed_when: false
 
 - name: Enable and start Broker
   systemd:

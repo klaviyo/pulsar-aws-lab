@@ -17,6 +17,7 @@
           - htop
           - sysstat
           - net-tools
+          - nmap-ncat  # provides 'nc' command for port checks
         state: present
 
     - name: Disable SELinux
