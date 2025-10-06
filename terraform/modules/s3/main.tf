@@ -51,6 +51,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "ansible_ssm" {
     id     = "cleanup-old-files"
     status = "Enabled"
 
+    filter {}  # Apply to all objects
+
     expiration {
       days = 1
     }
