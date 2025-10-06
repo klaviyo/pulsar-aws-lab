@@ -225,9 +225,10 @@ class Orchestrator:
             "-e", f"@{CONFIG_DIR / 'pulsar-cluster.yaml'}"
         ]
 
-        # Set ANSIBLE_CONFIG to use our ansible.cfg
+        # Set ANSIBLE_CONFIG to use our ansible.cfg and roles path
         env = os.environ.copy()
         env['ANSIBLE_CONFIG'] = str(ANSIBLE_DIR / "ansible.cfg")
+        env['ANSIBLE_ROLES_PATH'] = f"{ANSIBLE_DIR / 'roles'}:~/.ansible/roles:/usr/share/ansible/roles:/etc/ansible/roles"
 
         # Override pulsar_version from infrastructure config if available
         if self.infrastructure_config and 'pulsar_version' in self.infrastructure_config:
