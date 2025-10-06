@@ -101,7 +101,7 @@ def cleanup_resources(resources: dict, region: str, dry_run: bool = True):
             waiter.wait(InstanceIds=resources['instances'])
             print("Instances terminated.")
 
-    # 2. Delete volumes
+    # 2. Delete volumes (skip if already deleted with instances)
     if resources['volumes']:
         print(f"Volumes to delete: {resources['volumes']}")
         if not dry_run:
@@ -109,8 +109,11 @@ def cleanup_resources(resources: dict, region: str, dry_run: bool = True):
                 try:
                     ec2.delete_volume(VolumeId=volume_id)
                     print(f"  Deleted volume: {volume_id}")
-                except Exception as e:
-                    print(f"  Error deleting volume {volume_id}: {e}")
+                except ec2.exceptions.ClientError as e:
+                    if 'InvalidVolume.NotFound' in str(e):
+                        print(f"  Volume {volume_id} already deleted (auto-deleted with instance)")
+                    else:
+                        print(f"  Error deleting volume {volume_id}: {e}")
 
     # 3. Detach and delete internet gateways
     if resources['internet_gateways']:
@@ -119,34 +122,18 @@ def cleanup_resources(resources: dict, region: str, dry_run: bool = True):
             if not dry_run:
                 for attachment in attachments:
                     vpc_id = attachment['VpcId']
-                    ec2.detach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
-                    print(f"  Detached from VPC: {vpc_id}")
-                ec2.delete_internet_gateway(InternetGatewayId=igw_id)
-                print(f"  Deleted IGW: {igw_id}")
-
-    # 4. Delete route tables
-    if resources['route_tables']:
-        print(f"Route tables to delete: {resources['route_tables']}")
-        if not dry_run:
-            for rt_id in resources['route_tables']:
+                    try:
+                        ec2.detach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+                        print(f"  Detached from VPC: {vpc_id}")
+                    except Exception as e:
+                        print(f"  Error detaching IGW: {e}")
                 try:
-                    ec2.delete_route_table(RouteTableId=rt_id)
-                    print(f"  Deleted route table: {rt_id}")
+                    ec2.delete_internet_gateway(InternetGatewayId=igw_id)
+                    print(f"  Deleted IGW: {igw_id}")
                 except Exception as e:
-                    print(f"  Error deleting route table {rt_id}: {e}")
+                    print(f"  Error deleting IGW: {e}")
 
-    # 5. Delete security groups
-    if resources['security_groups']:
-        print(f"Security groups to delete: {resources['security_groups']}")
-        if not dry_run:
-            for sg_id in resources['security_groups']:
-                try:
-                    ec2.delete_security_group(GroupId=sg_id)
-                    print(f"  Deleted security group: {sg_id}")
-                except Exception as e:
-                    print(f"  Error deleting security group {sg_id}: {e}")
-
-    # 6. Delete subnets
+    # 4. Delete subnets (must be before route tables - removes associations)
     if resources['subnets']:
         print(f"Subnets to delete: {resources['subnets']}")
         if not dry_run:
@@ -157,7 +144,29 @@ def cleanup_resources(resources: dict, region: str, dry_run: bool = True):
                 except Exception as e:
                     print(f"  Error deleting subnet {subnet_id}: {e}")
 
-    # 7. Delete VPCs
+    # 5. Delete route tables (after subnets are removed)
+    if resources['route_tables']:
+        print(f"Route tables to delete: {resources['route_tables']}")
+        if not dry_run:
+            for rt_id in resources['route_tables']:
+                try:
+                    ec2.delete_route_table(RouteTableId=rt_id)
+                    print(f"  Deleted route table: {rt_id}")
+                except Exception as e:
+                    print(f"  Error deleting route table {rt_id}: {e}")
+
+    # 6. Delete security groups
+    if resources['security_groups']:
+        print(f"Security groups to delete: {resources['security_groups']}")
+        if not dry_run:
+            for sg_id in resources['security_groups']:
+                try:
+                    ec2.delete_security_group(GroupId=sg_id)
+                    print(f"  Deleted security group: {sg_id}")
+                except Exception as e:
+                    print(f"  Error deleting security group {sg_id}: {e}")
+
+    # 7. Delete VPCs (must be last)
     if resources['vpcs']:
         print(f"VPCs to delete: {resources['vpcs']}")
         if not dry_run:
