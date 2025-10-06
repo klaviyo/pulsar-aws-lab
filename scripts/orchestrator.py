@@ -19,6 +19,9 @@ from typing import Dict, List, Optional
 import boto3
 import yaml
 
+# Import cleanup functions
+from cleanup_by_tag import get_resources_by_experiment_id, cleanup_resources
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -247,38 +250,74 @@ class Orchestrator:
         """Setup infrastructure and deploy Pulsar cluster"""
         logger.info("Starting setup phase")
 
-        # Load infrastructure config
-        self.infrastructure_config = self.load_config(config_file)
+        try:
+            # Load infrastructure config
+            self.infrastructure_config = self.load_config(config_file)
 
-        # Merge runtime tags with config tags
-        if runtime_tags:
-            config_tags = self.infrastructure_config.get('experiment', {}).get('tags', {})
-            merged_tags = {**config_tags, **runtime_tags}  # Runtime tags override config tags
-            self.infrastructure_config.setdefault('experiment', {})['tags'] = merged_tags
-            logger.info(f"Merged tags: {merged_tags}")
+            # Merge runtime tags with config tags
+            if runtime_tags:
+                config_tags = self.infrastructure_config.get('experiment', {}).get('tags', {})
+                merged_tags = {**config_tags, **runtime_tags}  # Runtime tags override config tags
+                self.infrastructure_config.setdefault('experiment', {})['tags'] = merged_tags
+                logger.info(f"Merged tags: {merged_tags}")
 
-        # Ensure SSH key exists
-        ssh_key_name = self.infrastructure_config['compute']['ssh_key_name']
-        aws_region = self.infrastructure_config['aws']['region']
-        self.ensure_ssh_key(ssh_key_name, aws_region)
+            # Ensure SSH key exists
+            ssh_key_name = self.infrastructure_config['compute']['ssh_key_name']
+            aws_region = self.infrastructure_config['aws']['region']
+            self.ensure_ssh_key(ssh_key_name, aws_region)
 
-        # Initialize Terraform
-        self.run_terraform("init")
+            # Initialize Terraform
+            self.run_terraform("init")
 
-        # Plan infrastructure
-        self.run_terraform("plan", config_file)
+            # Plan infrastructure
+            self.run_terraform("plan", config_file)
 
-        # Apply infrastructure
-        self.run_terraform("apply", config_file)
+            # Apply infrastructure
+            self.run_terraform("apply", config_file)
 
-        # Wait for instances to be ready
-        logger.info("Waiting for instances to be ready...")
-        time.sleep(30)
+            # Wait for instances to be ready
+            logger.info("Waiting for instances to be ready...")
+            time.sleep(30)
 
-        # Deploy Pulsar cluster
-        self.run_ansible("deploy.yaml")
+            # Deploy Pulsar cluster
+            self.run_ansible("deploy.yaml")
 
-        logger.info("Setup phase completed successfully")
+            logger.info("Setup phase completed successfully")
+
+        except Exception as e:
+            logger.error(f"Setup failed: {e}")
+            logger.warning("Initiating automatic cleanup of resources...")
+            self.emergency_cleanup()
+            raise
+
+    def emergency_cleanup(self, region: str = None) -> None:
+        """Emergency cleanup using tag-based resource discovery (doesn't need Terraform state)"""
+        logger.warning("=" * 60)
+        logger.warning("EMERGENCY CLEANUP: Finding resources by ExperimentID tag")
+        logger.warning("=" * 60)
+
+        if not region:
+            region = self.infrastructure_config.get('aws', {}).get('region', 'us-west-2') if self.infrastructure_config else 'us-west-2'
+
+        logger.info(f"Searching for resources with ExperimentID: {self.experiment_id} in {region}")
+
+        try:
+            resources = get_resources_by_experiment_id(self.experiment_id, region)
+
+            # Check if any resources found
+            total_resources = sum(len(v) if isinstance(v, list) else 0 for v in resources.values())
+
+            if total_resources == 0:
+                logger.info("No resources found to cleanup")
+                return
+
+            logger.warning(f"Found {total_resources} resources to cleanup")
+            cleanup_resources(resources, region, dry_run=False)
+            logger.info("Emergency cleanup completed")
+
+        except Exception as e:
+            logger.error(f"Emergency cleanup failed: {e}")
+            logger.error("You may need to manually cleanup resources from AWS console")
 
     def teardown(self) -> None:
         """Destroy infrastructure"""
@@ -289,10 +328,9 @@ class Orchestrator:
         if not state_file.exists():
             logger.error("Terraform state file not found!")
             logger.error(f"Expected: {state_file}")
-            logger.error("Cannot destroy infrastructure without state file.")
-            logger.error("\nTo manually cleanup, use AWS console or CLI:")
-            logger.error(f"  aws ec2 describe-instances --filters 'Name=tag:ExperimentID,Values={self.experiment_id}'")
-            raise OrchestratorError("Terraform state file not found")
+            logger.error("Attempting emergency cleanup by tags...")
+            self.emergency_cleanup()
+            return
 
         # Get AWS region from config or default
         region = self.infrastructure_config.get('aws', {}).get('region', 'us-west-2') if self.infrastructure_config else 'us-west-2'
@@ -467,18 +505,24 @@ class Orchestrator:
         """Execute full lifecycle: setup -> test -> report -> teardown"""
         logger.info("Starting full lifecycle")
 
-        # Setup infrastructure
-        self.setup(config_file, runtime_tags=runtime_tags)
-
-        # Run tests and generate report, ensuring teardown happens
         try:
-            self.run_tests(test_plan_file)
-            self.generate_report()
-        finally:
-            logger.info("Tearing down infrastructure...")
-            self.teardown()
+            # Setup infrastructure (has its own error handling)
+            self.setup(config_file, runtime_tags=runtime_tags)
 
-        logger.info("Full lifecycle completed successfully")
+            # Run tests and generate report, ensuring teardown happens
+            try:
+                self.run_tests(test_plan_file)
+                self.generate_report()
+            finally:
+                logger.info("Tearing down infrastructure...")
+                self.teardown()
+
+            logger.info("Full lifecycle completed successfully")
+
+        except Exception as e:
+            logger.error(f"Full lifecycle failed: {e}")
+            logger.warning("Resources should have been cleaned up automatically")
+            raise
 
     @staticmethod
     def resolve_experiment_id(experiment_id: str) -> str:
