@@ -1,12 +1,12 @@
 # BookKeeper Configuration
 
 # Metadata service URI
-zkServers={{ groups['zookeeper'] | map('extract', hostvars, ['ansible_host']) | join(':2181,') }}:2181
+zkServers={{ groups['zookeeper'] | map('extract', hostvars, ['private_ip']) | join(':2181,') }}:2181
 zkLedgersRootPath=/ledgers
 
 # Bookie settings
 bookiePort=3181
-advertisedAddress={{ ansible_host }}
+advertisedAddress={{ private_ip }}
 
 # Journal settings
 journalDirectory={{ bookkeeper_journal_dir }}

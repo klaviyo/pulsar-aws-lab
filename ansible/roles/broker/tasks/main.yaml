@@ -46,13 +46,13 @@
 
 - name: Wait for ZooKeeper to be ready
   wait_for:
-    host: "{{ groups['zookeeper'][0] }}"
+    host: "{{ hostvars[groups['zookeeper'][0]]['private_ip'] }}"
     port: 2181
     timeout: 300
 
 - name: Wait for BookKeeper to be ready
   wait_for:
-    host: "{{ groups['bookkeeper'][0] }}"
+    host: "{{ hostvars[groups['bookkeeper'][0]]['private_ip'] }}"
     port: 3181
     timeout: 300
 

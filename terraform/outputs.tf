@@ -61,17 +61,17 @@ output "ansible_inventory" {
   value       = <<-EOT
     [zookeeper]
     %{for idx, id in module.compute.zookeeper_instance_ids~}
-    zk-${idx + 1} ansible_host=${id} ansible_user=ec2-user zk_id=${idx + 1}
+    zk-${idx + 1} ansible_host=${id} ansible_user=ec2-user zk_id=${idx + 1} private_ip=${module.compute.zookeeper_private_ips[idx]}
     %{endfor~}
 
     [bookkeeper]
     %{for idx, id in module.compute.bookkeeper_instance_ids~}
-    bk-${idx + 1} ansible_host=${id} ansible_user=ec2-user bk_id=${idx + 1}
+    bk-${idx + 1} ansible_host=${id} ansible_user=ec2-user bk_id=${idx + 1} private_ip=${module.compute.bookkeeper_private_ips[idx]}
     %{endfor~}
 
     [broker]
     %{for idx, id in module.compute.broker_instance_ids~}
-    broker-${idx + 1} ansible_host=${id} ansible_user=ec2-user
+    broker-${idx + 1} ansible_host=${id} ansible_user=ec2-user private_ip=${module.compute.broker_private_ips[idx]}
     %{endfor~}
 
     [client]

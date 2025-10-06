@@ -7,8 +7,8 @@ driverClass: io.openmessaging.benchmark.driver.pulsar.PulsarBenchmarkDriver
 # Pulsar client configuration
 client:
   # Service URLs
-  serviceUrl: pulsar://{{ groups['broker'] | map('extract', hostvars, ['ansible_host']) | join(',pulsar://') }}:6650
-  httpUrl: http://{{ groups['broker'][0] }}:8080
+  serviceUrl: pulsar://{{ groups['broker'] | map('extract', hostvars, ['private_ip']) | join(',pulsar://') }}:6650
+  httpUrl: http://{{ hostvars[groups['broker'][0]]['private_ip'] }}:8080
 
   # Producer settings
   producerConfig:

@@ -60,10 +60,10 @@
       shell: |
         /opt/pulsar/bin/pulsar initialize-cluster-metadata \
           --cluster {{ pulsar_cluster_name }} \
-          --zookeeper {{ groups['zookeeper'] | map('extract', hostvars, ['ansible_host']) | join(':2181,') }}:2181 \
-          --configuration-store {{ groups['zookeeper'] | map('extract', hostvars, ['ansible_host']) | join(':2181,') }}:2181 \
-          --web-service-url http://{{ groups['broker'][0] }}:8080 \
-          --broker-service-url pulsar://{{ groups['broker'][0] }}:6650
+          --zookeeper {{ groups['zookeeper'] | map('extract', hostvars, ['private_ip']) | join(':2181,') }}:2181 \
+          --configuration-store {{ groups['zookeeper'] | map('extract', hostvars, ['private_ip']) | join(':2181,') }}:2181 \
+          --web-service-url http://{{ hostvars[groups['broker'][0]]['private_ip'] }}:8080 \
+          --broker-service-url pulsar://{{ hostvars[groups['broker'][0]]['private_ip'] }}:6650
       args:
         creates: /var/lib/pulsar/cluster-initialized
 
