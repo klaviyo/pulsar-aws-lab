@@ -83,64 +83,141 @@ class Orchestrator:
         logger.info("Verifying AWS Session Manager plugin installation...")
 
         try:
-            result = subprocess.run(
-                ["session-manager-plugin"],
+            # Try using which to find the plugin first
+            which_result = subprocess.run(
+                ["which", "session-manager-plugin"],
                 capture_output=True,
-                text=True
+                text=True,
+                check=False
             )
-            logger.info("AWS Session Manager plugin is installed")
-        except FileNotFoundError:
+
+            if which_result.returncode == 0:
+                plugin_path = which_result.stdout.strip()
+                result = subprocess.run(
+                    [plugin_path],
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                logger.info("AWS Session Manager plugin is installed")
+            else:
+                raise FileNotFoundError("session-manager-plugin not found in PATH")
+        except (FileNotFoundError, PermissionError) as e:
             error_msg = (
-                "AWS Session Manager plugin not found!\n"
-                "Install it from: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
+                "AWS Session Manager plugin not found or not executable!\n"
+                "Install it from: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html\n"
+                f"Error: {e}"
             )
             logger.error(error_msg)
             raise OrchestratorError(error_msg)
 
-    def verify_ssm_connectivity(self, region: str) -> None:
-        """Verify EC2 instances are registered with SSM"""
+    def verify_ssm_connectivity(self, region: str, max_wait: int = 300, check_interval: int = 10) -> None:
+        """Verify EC2 instances are registered with SSM and ready for SSH sessions"""
         logger.info("Verifying SSM connectivity to instances...")
 
         ssm_client = boto3.client('ssm', region_name=region)
+        start_time = time.time()
 
         try:
-            # Get list of managed instances
-            response = ssm_client.describe_instance_information(
-                Filters=[
-                    {'Key': 'tag:ExperimentID', 'Values': [self.experiment_id]}
-                ]
-            )
-
-            managed_instances = response.get('InstanceInformationList', [])
-
-            if not managed_instances:
-                logger.warning("No instances registered with SSM yet. Waiting 30 seconds...")
-                time.sleep(30)
-
-                # Try again
+            # Poll for instance registration
+            while time.time() - start_time < max_wait:
                 response = ssm_client.describe_instance_information(
                     Filters=[
                         {'Key': 'tag:ExperimentID', 'Values': [self.experiment_id]}
                     ]
                 )
+
                 managed_instances = response.get('InstanceInformationList', [])
 
-            logger.info(f"Found {len(managed_instances)} instances registered with SSM")
+                if managed_instances:
+                    online_instances = [i for i in managed_instances if i.get('PingStatus') == 'Online']
+                    logger.info(f"Found {len(online_instances)}/{len(managed_instances)} instances online with SSM")
 
-            for instance in managed_instances:
-                instance_id = instance['InstanceId']
-                ping_status = instance.get('PingStatus', 'Unknown')
-                logger.info(f"  {instance_id}: {ping_status}")
+                    if len(online_instances) == len(managed_instances):
+                        # All instances online - wait a bit for SSH daemon and Session Manager to fully initialize
+                        logger.info("All instances online. Waiting 15 seconds for SSH daemon initialization...")
+                        time.sleep(15)
 
-            if not managed_instances:
-                raise OrchestratorError(
-                    "No instances registered with SSM. "
-                    "Ensure instances have IAM role with SSMManagedInstanceCore policy."
-                )
+                        # Now verify SSH session capability for ALL instances
+                        logger.info("Verifying SSH session capability for all instances...")
+
+                        # Test all instances, not just one
+                        ready_count = 0
+                        for instance in managed_instances:
+                            if self._verify_ssh_session_capability(ssm_client, instance['InstanceId'], region):
+                                ready_count += 1
+
+                        logger.info(f"SSH ready: {ready_count}/{len(managed_instances)} instances")
+
+                        if ready_count == len(managed_instances):
+                            logger.info("All SSM SSH sessions ready")
+                            for instance in managed_instances:
+                                instance_id = instance['InstanceId']
+                                ping_status = instance.get('PingStatus', 'Unknown')
+                                logger.info(f"  {instance_id}: {ping_status}")
+
+                            # Add stabilization delay - wait longer to ensure SSH connections remain stable
+                            logger.info("Waiting 45 seconds for SSH connection stabilization...")
+                            time.sleep(45)
+                            return
+                        else:
+                            logger.info(f"Waiting for remaining instances, retrying in {check_interval}s...")
+                    else:
+                        logger.info(f"Waiting for all instances to come online, retrying in {check_interval}s...")
+                else:
+                    elapsed = int(time.time() - start_time)
+                    logger.info(f"No instances registered with SSM yet ({elapsed}s elapsed), retrying in {check_interval}s...")
+
+                time.sleep(check_interval)
+
+            raise OrchestratorError(
+                f"Timeout waiting for SSM connectivity after {max_wait}s. "
+                "Ensure instances have IAM role with SSMManagedInstanceCore policy."
+            )
 
         except Exception as e:
             logger.error(f"SSM connectivity check failed: {e}")
             raise
+
+    def _verify_ssh_session_capability(self, ssm_client, instance_id: str, region: str) -> bool:
+        """Test actual SSH connectivity through Session Manager ProxyCommand (what Ansible uses)"""
+        try:
+            ssh_key = self.infrastructure_config['ssh']['key_name']
+            ssh_key_path = Path.home() / ".ssh" / f"{ssh_key}.pem"
+
+            # Test the EXACT SSH method that Ansible will use
+            ssh_cmd = [
+                "ssh",
+                "-i", str(ssh_key_path),
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=5",
+                "-o", f"ProxyCommand=aws ssm start-session --target {instance_id} --document-name AWS-StartSSHSession --parameters portNumber=%p --region {region}",
+                f"ec2-user@{instance_id}",
+                "echo ssh_test_ok"
+            ]
+
+            result = subprocess.run(
+                ssh_cmd,
+                capture_output=True,
+                timeout=10,
+                check=False
+            )
+
+            # Verify SSH worked and command executed
+            if result.returncode == 0 and b"ssh_test_ok" in result.stdout:
+                logger.debug(f"Instance {instance_id} SSH verified successfully")
+                return True
+            else:
+                logger.debug(f"Instance {instance_id} SSH test failed: rc={result.returncode}")
+                return False
+
+        except subprocess.TimeoutExpired:
+            logger.debug(f"SSH test timeout for {instance_id}")
+            return False
+        except Exception as e:
+            logger.debug(f"SSH test error for {instance_id}: {e}")
+            return False
 
     def run_terraform(self, action: str, var_file: Optional[Path] = None) -> None:
         """Execute Terraform commands"""
@@ -227,13 +304,34 @@ class Orchestrator:
         """Execute Ansible playbook"""
         logger.info(f"Running Ansible playbook: {playbook}")
 
-        # Check if ansible-playbook is available
-        ansible_path = shutil.which("ansible-playbook")
+        # Check if ansible-playbook is available (try pyenv first)
+        ansible_path = None
+
+        # Try pyenv environments (using pyenv prefix)
+        try:
+            result = subprocess.run(
+                ["pyenv", "prefix", "pulsar"],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if result.returncode == 0:
+                pyenv_prefix = result.stdout.strip()
+                candidate_path = Path(pyenv_prefix) / "bin" / "ansible-playbook"
+                if candidate_path.exists():
+                    ansible_path = str(candidate_path)
+        except FileNotFoundError:
+            pass
+
+        # Fallback to system PATH
+        if not ansible_path:
+            ansible_path = shutil.which("ansible-playbook")
+
         if not ansible_path:
             raise OrchestratorError(
-                "ansible-playbook not found in PATH.\n"
-                "Please install Ansible: pip install ansible\n"
-                "Or: apt-get install ansible (Ubuntu) / brew install ansible (macOS)"
+                "ansible-playbook not found in PATH or pyenv pulsar environment.\n"
+                "Please install Ansible in pyenv pulsar environment: pyenv activate pulsar && pip install ansible\n"
+                "Or install system-wide: pip install ansible"
             )
 
         # Get inventory from Terraform if not provided
@@ -271,11 +369,17 @@ class Orchestrator:
             logger.info(f"Using Pulsar version: {self.infrastructure_config['pulsar_version']}")
 
         try:
-            # Stream output to console in real-time
-            result = subprocess.run(cmd, check=True, env=env)
+            # Capture output for debugging
+            result = subprocess.run(cmd, check=True, env=env, capture_output=True, text=True)
             logger.info("Ansible playbook completed successfully")
+            if result.stdout:
+                logger.debug(f"Ansible stdout: {result.stdout}")
         except subprocess.CalledProcessError as e:
             logger.error(f"Ansible playbook failed with exit code {e.returncode}")
+            if e.stdout:
+                logger.error(f"Ansible stdout:\n{e.stdout}")
+            if e.stderr:
+                logger.error(f"Ansible stderr:\n{e.stderr}")
             raise OrchestratorError("Ansible playbook failed") from e
 
     def setup(self, config_file: Path, runtime_tags: Optional[Dict[str, str]] = None) -> None:
@@ -305,13 +409,12 @@ class Orchestrator:
             # Apply infrastructure
             self.run_terraform("apply", config_file)
 
-            # Wait for instances to be registered with SSM
+            # Wait for instances to be registered with SSM and ready for SSH
             aws_region = self.infrastructure_config['aws']['region']
-            logger.info("Waiting for instances to register with SSM...")
-            time.sleep(60)  # SSM agent needs time to register
+            logger.info("Waiting for instances to register with SSM and become ready for SSH sessions...")
 
-            # Verify SSM connectivity
-            self.verify_ssm_connectivity(aws_region)
+            # Verify SSM connectivity with health check polling
+            self.verify_ssm_connectivity(aws_region, max_wait=300, check_interval=10)
 
             # Deploy Pulsar cluster via Ansible (using SSM)
             self.run_ansible("deploy.yaml")
@@ -424,15 +527,11 @@ class Orchestrator:
         client_data = json.loads(client_data_str)
         client_instance_id = client_data['ids'][0]
 
-        # Get SSM bucket for file transfers
-        ssm_bucket = self.get_terraform_output("ssm_bucket_name")
-
         logger.info(f"Running tests on client instance: {client_instance_id}")
-        logger.info(f"Using SSM bucket for file transfers: {ssm_bucket}")
+        logger.info("Using SSH-over-SSM for file transfers")
 
-        # Initialize AWS clients
+        # Initialize AWS client
         ssm_client = boto3.client('ssm', region_name=aws_region)
-        s3_client = boto3.client('s3', region_name=aws_region)
 
         # Create results directory
         results_dir = self.experiment_dir / "benchmark_results"
@@ -452,27 +551,17 @@ class Orchestrator:
             with open(workload_file, 'w') as f:
                 yaml.dump(workload, f)
 
-            # Upload workload file to S3
-            s3_key = f"{self.experiment_id}/workloads/workload_{test_name}.yaml"
-            logger.info(f"Uploading workload to S3: s3://{ssm_bucket}/{s3_key}")
-            s3_client.upload_file(str(workload_file), ssm_bucket, s3_key)
-
-            # Download workload from S3 to client instance
-            logger.info(f"Downloading workload to client instance: /tmp/workload_{test_name}.yaml")
-            download_cmd = f"aws s3 cp s3://{ssm_bucket}/{s3_key} /tmp/workload_{test_name}.yaml"
-            self._ssm_run_command(
-                ssm_client,
-                client_instance_id,
-                [download_cmd],
-                f"Download workload {test_name}"
-            )
+            # Upload workload file to client instance via SCP
+            remote_workload_path = f"/tmp/workload_{test_name}.yaml"
+            logger.info(f"Uploading workload to client instance: {remote_workload_path}")
+            self._scp_upload(client_instance_id, str(workload_file), remote_workload_path, aws_region)
 
             # Run benchmark
             result_file = f"/opt/benchmark-results/{test_name}.json"
             benchmark_cmd = (
                 f"cd /opt/openmessaging-benchmark/benchmark-framework && "
                 f"sudo bin/benchmark --drivers /opt/benchmark-configs/pulsar-driver.yaml "
-                f"/tmp/workload_{test_name}.yaml --output {result_file}"
+                f"{remote_workload_path} --output {result_file}"
             )
 
             logger.info(f"Executing benchmark: {test_name}")
@@ -483,21 +572,10 @@ class Orchestrator:
                 f"Run benchmark {test_name}"
             )
 
-            # Upload results to S3
-            s3_result_key = f"{self.experiment_id}/results/{test_name}.json"
-            logger.info(f"Uploading results to S3: s3://{ssm_bucket}/{s3_result_key}")
-            upload_result_cmd = f"aws s3 cp {result_file} s3://{ssm_bucket}/{s3_result_key}"
-            self._ssm_run_command(
-                ssm_client,
-                client_instance_id,
-                [upload_result_cmd],
-                f"Upload results {test_name}"
-            )
-
-            # Download results from S3 to local
+            # Download results from client instance via SCP
             local_result = results_dir / f"{test_name}.json"
-            logger.info(f"Downloading results from S3 to: {local_result}")
-            s3_client.download_file(ssm_bucket, s3_result_key, str(local_result))
+            logger.info(f"Downloading results to: {local_result}")
+            self._scp_download(client_instance_id, result_file, str(local_result), aws_region)
 
             logger.info(f"Test '{test_name}' completed. Results saved to {local_result}")
 
@@ -613,6 +691,70 @@ class Orchestrator:
                 raise
             logger.error(f"SSM command execution failed: {e}")
             raise OrchestratorError(f"SSM command failed: {e}") from e
+
+    def _scp_upload(self, instance_id: str, local_path: str, remote_path: str, region: str) -> None:
+        """
+        Upload a file to an instance using SCP over SSM tunnel
+
+        Args:
+            instance_id: EC2 instance ID
+            local_path: Local file path
+            remote_path: Remote file path on instance
+            region: AWS region
+        """
+        ssh_key = self.infrastructure_config['ssh']['key_name']
+        ssh_key_path = Path.home() / ".ssh" / f"{ssh_key}.pem"
+
+        # Use ProxyCommand to tunnel SSH through SSM
+        scp_cmd = [
+            "scp",
+            "-i", str(ssh_key_path),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", f"ProxyCommand=aws ssm start-session --target {instance_id} --document-name AWS-StartSSHSession --parameters portNumber=%p --region {region}",
+            local_path,
+            f"ec2-user@{instance_id}:{remote_path}"
+        ]
+
+        try:
+            result = subprocess.run(scp_cmd, capture_output=True, text=True, check=True)
+            logger.info(f"File uploaded successfully: {local_path} -> {remote_path}")
+        except subprocess.CalledProcessError as e:
+            error_msg = f"SCP upload failed: {e.stderr}"
+            logger.error(error_msg)
+            raise OrchestratorError(error_msg) from e
+
+    def _scp_download(self, instance_id: str, remote_path: str, local_path: str, region: str) -> None:
+        """
+        Download a file from an instance using SCP over SSM tunnel
+
+        Args:
+            instance_id: EC2 instance ID
+            remote_path: Remote file path on instance
+            local_path: Local file path
+            region: AWS region
+        """
+        ssh_key = self.infrastructure_config['ssh']['key_name']
+        ssh_key_path = Path.home() / ".ssh" / f"{ssh_key}.pem"
+
+        # Use ProxyCommand to tunnel SSH through SSM
+        scp_cmd = [
+            "scp",
+            "-i", str(ssh_key_path),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", f"ProxyCommand=aws ssm start-session --target {instance_id} --document-name AWS-StartSSHSession --parameters portNumber=%p --region {region}",
+            f"ec2-user@{instance_id}:{remote_path}",
+            local_path
+        ]
+
+        try:
+            result = subprocess.run(scp_cmd, capture_output=True, text=True, check=True)
+            logger.info(f"File downloaded successfully: {remote_path} -> {local_path}")
+        except subprocess.CalledProcessError as e:
+            error_msg = f"SCP download failed: {e.stderr}"
+            logger.error(error_msg)
+            raise OrchestratorError(error_msg) from e
 
     def generate_report(self) -> None:
         """Generate experiment report"""
