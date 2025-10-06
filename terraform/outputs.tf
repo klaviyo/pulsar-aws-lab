@@ -55,28 +55,28 @@ output "client_instances" {
   }
 }
 
-# Ansible inventory format
+# Ansible inventory format (SSM-based)
 output "ansible_inventory" {
-  description = "Ansible inventory in INI format"
+  description = "Ansible inventory in INI format with SSM connection"
   value       = <<-EOT
     [zookeeper]
-    %{for idx, ip in module.compute.zookeeper_public_ips~}
-    zk-${idx + 1} ansible_host=${ip} ansible_user=ec2-user zk_id=${idx + 1}
+    %{for idx, id in module.compute.zookeeper_instance_ids~}
+    zk-${idx + 1} ansible_host=${id} ansible_user=ec2-user zk_id=${idx + 1}
     %{endfor~}
 
     [bookkeeper]
-    %{for idx, ip in module.compute.bookkeeper_public_ips~}
-    bk-${idx + 1} ansible_host=${ip} ansible_user=ec2-user bk_id=${idx + 1}
+    %{for idx, id in module.compute.bookkeeper_instance_ids~}
+    bk-${idx + 1} ansible_host=${id} ansible_user=ec2-user bk_id=${idx + 1}
     %{endfor~}
 
     [broker]
-    %{for idx, ip in module.compute.broker_public_ips~}
-    broker-${idx + 1} ansible_host=${ip} ansible_user=ec2-user
+    %{for idx, id in module.compute.broker_instance_ids~}
+    broker-${idx + 1} ansible_host=${id} ansible_user=ec2-user
     %{endfor~}
 
     [client]
-    %{for idx, ip in module.compute.client_public_ips~}
-    client-${idx + 1} ansible_host=${ip} ansible_user=ec2-user
+    %{for idx, id in module.compute.client_instance_ids~}
+    client-${idx + 1} ansible_host=${id} ansible_user=ec2-user
     %{endfor~}
 
     [pulsar:children]
@@ -85,9 +85,21 @@ output "ansible_inventory" {
     broker
 
     [all:vars]
-    ansible_ssh_private_key_file=~/.ssh/${var.ssh_key_name}.pem
-    ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+    ansible_connection=amazon.aws.aws_ssm
+    ansible_aws_ssm_bucket_name=${module.s3.bucket_name}
+    ansible_aws_ssm_region=${var.aws_region}
   EOT
+}
+
+# SSM Configuration
+output "ssm_bucket_name" {
+  description = "S3 bucket for Ansible SSM file transfers"
+  value       = module.s3.bucket_name
+}
+
+output "ssm_bucket_region" {
+  description = "S3 bucket region"
+  value       = module.s3.bucket_region
 }
 
 # Connection info
@@ -95,6 +107,7 @@ output "connection_info" {
   description = "Connection information"
   value = {
     ssh_key            = var.ssh_key_name
+    ssm_bucket         = module.s3.bucket_name
     zookeeper_connect  = join(",", [for ip in module.compute.zookeeper_private_ips : "${ip}:2181"])
     broker_service_url = length(module.compute.broker_private_ips) > 0 ? "pulsar://${module.compute.broker_private_ips[0]}:6650" : ""
     broker_http_url    = length(module.compute.broker_private_ips) > 0 ? "http://${module.compute.broker_private_ips[0]}:8080" : ""

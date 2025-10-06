@@ -99,14 +99,7 @@ resource "aws_security_group" "pulsar" {
   description = "Security group for Pulsar cluster"
   vpc_id      = aws_vpc.main.id
 
-  # SSH access
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = var.allowed_ssh_cidrs
-    description = "SSH access"
-  }
+  # SSH removed - using AWS Systems Manager Session Manager instead
 
   # ZooKeeper client port
   ingress {

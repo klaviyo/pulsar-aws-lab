@@ -64,6 +64,22 @@ module "network" {
   allowed_ssh_cidrs   = var.allowed_ssh_cidrs
 }
 
+# S3 Module (for Ansible SSM file transfers)
+module "s3" {
+  source = "./modules/s3"
+
+  experiment_id = var.experiment_id
+  aws_region    = var.aws_region
+}
+
+# IAM Module (for SSM access)
+module "iam" {
+  source = "./modules/iam"
+
+  experiment_id  = var.experiment_id
+  ssm_bucket_arn = module.s3.bucket_arn
+}
+
 # Storage Module (BookKeeper volumes)
 module "storage" {
   source = "./modules/storage"
@@ -81,14 +97,15 @@ module "storage" {
 module "compute" {
   source = "./modules/compute"
 
-  experiment_id       = var.experiment_id
-  ami_id              = local.ami_id
-  ssh_key_name        = var.ssh_key_name
-  vpc_id              = module.network.vpc_id
-  subnet_id           = module.network.public_subnet_id
-  security_group_id   = module.network.security_group_id
-  use_spot_instances  = var.use_spot_instances
-  spot_max_price      = var.spot_max_price
+  experiment_id        = var.experiment_id
+  ami_id               = local.ami_id
+  ssh_key_name         = var.ssh_key_name
+  iam_instance_profile = module.iam.instance_profile_name
+  vpc_id               = module.network.vpc_id
+  subnet_id            = module.network.public_subnet_id
+  security_group_id    = module.network.security_group_id
+  use_spot_instances   = var.use_spot_instances
+  spot_max_price       = var.spot_max_price
 
   # ZooKeeper
   zookeeper_count         = var.zookeeper_count

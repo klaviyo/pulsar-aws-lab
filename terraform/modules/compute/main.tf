@@ -15,6 +15,11 @@ variable "ssh_key_name" {
   type        = string
 }
 
+variable "iam_instance_profile" {
+  description = "IAM instance profile name for SSM"
+  type        = string
+}
+
 variable "vpc_id" {
   description = "VPC ID"
   type        = string
@@ -93,6 +98,7 @@ resource "aws_instance" "zookeeper" {
   ami                    = var.ami_id
   instance_type          = var.zookeeper_instance_type
   key_name               = var.ssh_key_name
+  iam_instance_profile   = var.iam_instance_profile
   subnet_id              = var.subnet_id
   vpc_security_group_ids = [var.security_group_id]
 
@@ -128,6 +134,7 @@ resource "aws_instance" "bookkeeper" {
   ami                    = var.ami_id
   instance_type          = var.bookkeeper_instance_type
   key_name               = var.ssh_key_name
+  iam_instance_profile   = var.iam_instance_profile
   subnet_id              = var.subnet_id
   vpc_security_group_ids = [var.security_group_id]
 
@@ -172,6 +179,7 @@ resource "aws_instance" "broker" {
   ami                    = var.ami_id
   instance_type          = var.broker_instance_type
   key_name               = var.ssh_key_name
+  iam_instance_profile   = var.iam_instance_profile
   subnet_id              = var.subnet_id
   vpc_security_group_ids = [var.security_group_id]
 
@@ -206,6 +214,7 @@ resource "aws_instance" "client" {
   ami                    = var.ami_id
   instance_type          = var.client_instance_type
   key_name               = var.ssh_key_name
+  iam_instance_profile   = var.iam_instance_profile
   subnet_id              = var.subnet_id
   vpc_security_group_ids = [var.security_group_id]
 
