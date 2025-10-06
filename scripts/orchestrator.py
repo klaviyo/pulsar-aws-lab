@@ -217,6 +217,11 @@ class Orchestrator:
                 f.write(ansible_inventory)
             inventory = str(inventory_file)
 
+            # Log inventory for debugging
+            logger.info("Generated Ansible inventory:")
+            for line in ansible_inventory.strip().split('\n'):
+                logger.info(f"  {line}")
+
         # Load Pulsar cluster config
         pulsar_config = self.load_config(CONFIG_DIR / "pulsar-cluster.yaml")
 

@@ -60,22 +60,22 @@ output "ansible_inventory" {
   description = "Ansible inventory in INI format"
   value       = <<-EOT
     [zookeeper]
-    %{for idx, ip in module.compute.zookeeper_private_ips~}
+    %{for idx, ip in module.compute.zookeeper_public_ips~}
     zk-${idx + 1} ansible_host=${ip} ansible_user=ec2-user zk_id=${idx + 1}
     %{endfor~}
 
     [bookkeeper]
-    %{for idx, ip in module.compute.bookkeeper_private_ips~}
+    %{for idx, ip in module.compute.bookkeeper_public_ips~}
     bk-${idx + 1} ansible_host=${ip} ansible_user=ec2-user bk_id=${idx + 1}
     %{endfor~}
 
     [broker]
-    %{for idx, ip in module.compute.broker_private_ips~}
+    %{for idx, ip in module.compute.broker_public_ips~}
     broker-${idx + 1} ansible_host=${ip} ansible_user=ec2-user
     %{endfor~}
 
     [client]
-    %{for idx, ip in module.compute.client_private_ips~}
+    %{for idx, ip in module.compute.client_public_ips~}
     client-${idx + 1} ansible_host=${ip} ansible_user=ec2-user
     %{endfor~}
 
