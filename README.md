@@ -23,10 +23,16 @@ A reproducible, ephemeral Apache Pulsar testing framework on AWS with automated 
 
 ### Network Architecture
 
+**Zero-SSH Design with AWS Systems Manager:**
+- **No SSH ports exposed** - Enhanced security with IAM-based authentication
+- Uses **AWS Systems Manager Session Manager** for all remote operations
+- Ansible connects via SSM plugin (amazon.aws.aws_ssm)
+- File transfers via S3 bucket (no SCP needed)
+
 **Public Access:**
-- All EC2 instances have **public IPs** for SSH access from your local machine
-- Ansible uses public IPs to deploy and configure the cluster
-- Security group restricts SSH to allowed CIDR blocks (default: 0.0.0.0/0)
+- EC2 instances have public IPs for outbound internet access (AWS APIs, package downloads)
+- No inbound SSH port 22 in security groups
+- All remote access via SSM endpoints
 
 **Internal Communication:**
 - Pulsar components use **private IPs** within the VPC
@@ -34,14 +40,25 @@ A reproducible, ephemeral Apache Pulsar testing framework on AWS with automated 
 - Broker service URL: `pulsar://10.0.1.z:6650`
 - All inter-cluster traffic stays within the private network
 
-**Architecture Diagram:**
+**SSM Architecture:**
 ```
-Your Machine → [SSH via Public IP] → EC2 Instances
+Your Machine → [AWS SSM API] → Systems Manager
+                                       ↓
+                                  [SSM Agent on EC2]
                                        ↓
                                   [Internal VPC]
                                   Private IPs
                                   ZK ↔ BK ↔ Broker
+
+File Transfers:
+Your Machine → S3 Bucket ← EC2 Instances (via AWS CLI)
 ```
+
+**IAM Permissions:**
+- EC2 instances have IAM role with:
+  - `AmazonSSMManagedInstanceCore` policy (SSM access)
+  - S3 bucket permissions for file transfers
+- Local AWS credentials need SSM permissions to start sessions
 
 ### Directory Structure
 
@@ -73,6 +90,10 @@ pulsar-aws-lab/
 # AWS CLI
 aws --version  # >= 2.0
 
+# AWS Session Manager Plugin (REQUIRED for SSM)
+session-manager-plugin
+# Install from: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html
+
 # Terraform
 terraform --version  # >= 1.0
 
@@ -94,14 +115,24 @@ python3 --version  # >= 3.8
    export AWS_DEFAULT_REGION=us-west-2
    ```
 
-2. **SSH Key Setup** (automatic):
-   The orchestrator will automatically create the SSH key pair if it doesn't exist.
-   Default key name: `pulsar-lab-key` (saved to `~/.ssh/pulsar-lab-key.pem`)
+2. **IAM Permissions** (for your AWS credentials):
+   Your AWS user/role needs permissions for:
+   - EC2 (create instances, security groups, VPCs)
+   - SSM (start sessions, send commands)
+   - S3 (create bucket, upload/download files)
+   - IAM (create roles for EC2 instances)
 
-   To use a different key, edit `config/infrastructure.yaml`:
-   ```yaml
-   compute:
-     ssh_key_name: "your-key-name"
+3. **Install Session Manager Plugin**:
+   ```bash
+   # macOS
+   brew install --cask session-manager-plugin
+
+   # Ubuntu/Debian
+   curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+   sudo dpkg -i session-manager-plugin.deb
+
+   # Verify installation
+   session-manager-plugin
    ```
 
 ### Python Dependencies
@@ -109,6 +140,9 @@ python3 --version  # >= 3.8
 ```bash
 cd scripts
 pip install -r requirements.txt
+
+# Install Ansible collections
+ansible-galaxy collection install -r ansible/requirements.yml
 ```
 
 ## Quick Start
@@ -412,15 +446,37 @@ python scripts/orchestrator.py teardown --experiment-id exp-20251005-123456
 - Each experiment has its own directory with logs and configs
 - The `latest` symlink always points to the most recent experiment
 
-### SSH Connection Issues
+### SSM Connection Issues
 
+**Check Session Manager Plugin:**
 ```bash
-# Verify SSH key permissions
-chmod 400 ~/.ssh/pulsar-lab-key.pem
-
-# Test SSH access
-ssh -i ~/.ssh/pulsar-lab-key.pem ec2-user@<instance-ip>
+session-manager-plugin
+# Should show usage information
 ```
+
+**Verify EC2 instances are registered with SSM:**
+```bash
+aws ssm describe-instance-information \
+  --filters "Key=tag:ExperimentID,Values=exp-20251005-143056"
+```
+
+**Test SSM connectivity manually:**
+```bash
+# Get instance ID from orchestrator output
+aws ssm start-session --target i-1234567890abcdef0
+```
+
+**Common SSM issues:**
+- **"TargetNotConnected"**: Instance not registered with SSM
+  - Wait 2-3 minutes after instance launch
+  - Check IAM instance profile is attached
+  - Verify SSM agent is running: `systemctl status amazon-ssm-agent`
+
+- **"AccessDenied"**: Your IAM user lacks SSM permissions
+  - Add `AmazonSSMManagedInstanceCore` policy to your user
+
+- **Session Manager plugin not found**:
+  - Install from AWS documentation link above
 
 ### Terraform State Issues
 
