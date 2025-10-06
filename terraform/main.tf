@@ -64,20 +64,11 @@ module "network" {
   allowed_ssh_cidrs   = var.allowed_ssh_cidrs
 }
 
-# S3 Module (for Ansible SSM file transfers)
-module "s3" {
-  source = "./modules/s3"
-
-  experiment_id = var.experiment_id
-  aws_region    = var.aws_region
-}
-
 # IAM Module (for SSM access)
 module "iam" {
   source = "./modules/iam"
 
-  experiment_id  = var.experiment_id
-  ssm_bucket_arn = module.s3.bucket_arn
+  experiment_id = var.experiment_id
 }
 
 # Storage Module (BookKeeper volumes)
