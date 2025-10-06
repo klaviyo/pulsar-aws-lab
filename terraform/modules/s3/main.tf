@@ -12,7 +12,8 @@ variable "aws_region" {
 
 # S3 bucket for Ansible file transfers via SSM
 resource "aws_s3_bucket" "ansible_ssm" {
-  bucket = "pulsar-lab-ansible-ssm-${var.experiment_id}"
+  bucket        = "pulsar-lab-ansible-ssm-${var.experiment_id}"
+  force_destroy = true  # Allow deletion even if bucket contains objects
 
   tags = {
     Name    = "pulsar-lab-ansible-ssm-${var.experiment_id}"
