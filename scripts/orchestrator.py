@@ -78,42 +78,69 @@ class Orchestrator:
         with open(config_file, 'r') as f:
             return yaml.safe_load(f)
 
-    def ensure_ssh_key(self, key_name: str, region: str) -> None:
-        """Ensure SSH key pair exists in AWS, create if not"""
-        logger.info(f"Checking SSH key pair: {key_name}")
-
-        ec2_client = boto3.client('ec2', region_name=region)
-        ssh_dir = Path.home() / ".ssh"
-        ssh_dir.mkdir(mode=0o700, exist_ok=True)
-        private_key_path = ssh_dir / f"{key_name}.pem"
+    def verify_ssm_plugin(self) -> None:
+        """Verify AWS Session Manager plugin is installed"""
+        logger.info("Verifying AWS Session Manager plugin installation...")
 
         try:
-            # Check if key exists in AWS
-            ec2_client.describe_key_pairs(KeyNames=[key_name])
-            logger.info(f"SSH key pair '{key_name}' already exists in AWS")
+            result = subprocess.run(
+                ["session-manager-plugin"],
+                capture_output=True,
+                text=True
+            )
+            logger.info("AWS Session Manager plugin is installed")
+        except FileNotFoundError:
+            error_msg = (
+                "AWS Session Manager plugin not found!\n"
+                "Install it from: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
+            )
+            logger.error(error_msg)
+            raise OrchestratorError(error_msg)
 
-            # Verify local private key exists
-            if not private_key_path.exists():
-                logger.warning(f"Private key not found locally at {private_key_path}")
-                logger.warning("You may need to download it from AWS or create a new key pair")
+    def verify_ssm_connectivity(self, region: str) -> None:
+        """Verify EC2 instances are registered with SSM"""
+        logger.info("Verifying SSM connectivity to instances...")
 
-        except ec2_client.exceptions.ClientError as e:
-            if 'InvalidKeyPair.NotFound' in str(e):
-                logger.info(f"Creating SSH key pair: {key_name}")
+        ssm_client = boto3.client('ssm', region_name=region)
 
-                # Create key pair
-                response = ec2_client.create_key_pair(KeyName=key_name)
+        try:
+            # Get list of managed instances
+            response = ssm_client.describe_instance_information(
+                Filters=[
+                    {'Key': 'tag:ExperimentID', 'Values': [self.experiment_id]}
+                ]
+            )
 
-                # Save private key
-                with open(private_key_path, 'w') as f:
-                    f.write(response['KeyMaterial'])
+            managed_instances = response.get('InstanceInformationList', [])
 
-                # Set correct permissions
-                private_key_path.chmod(0o400)
+            if not managed_instances:
+                logger.warning("No instances registered with SSM yet. Waiting 30 seconds...")
+                time.sleep(30)
 
-                logger.info(f"SSH key pair created and saved to {private_key_path}")
-            else:
-                raise OrchestratorError(f"Error checking SSH key: {e}") from e
+                # Try again
+                response = ssm_client.describe_instance_information(
+                    Filters=[
+                        {'Key': 'tag:ExperimentID', 'Values': [self.experiment_id]}
+                    ]
+                )
+                managed_instances = response.get('InstanceInformationList', [])
+
+            logger.info(f"Found {len(managed_instances)} instances registered with SSM")
+
+            for instance in managed_instances:
+                instance_id = instance['InstanceId']
+                ping_status = instance.get('PingStatus', 'Unknown')
+                logger.info(f"  {instance_id}: {ping_status}")
+
+            if not managed_instances:
+                raise OrchestratorError(
+                    "No instances registered with SSM. "
+                    "Ensure instances have IAM role with SSMManagedInstanceCore policy."
+                )
+
+        except Exception as e:
+            logger.error(f"SSM connectivity check failed: {e}")
+            raise
 
     def run_terraform(self, action: str, var_file: Optional[Path] = None) -> None:
         """Execute Terraform commands"""
@@ -266,10 +293,8 @@ class Orchestrator:
                 self.infrastructure_config.setdefault('experiment', {})['tags'] = merged_tags
                 logger.info(f"Merged tags: {merged_tags}")
 
-            # Ensure SSH key exists
-            ssh_key_name = self.infrastructure_config['compute']['ssh_key_name']
-            aws_region = self.infrastructure_config['aws']['region']
-            self.ensure_ssh_key(ssh_key_name, aws_region)
+            # Verify Session Manager plugin is installed
+            self.verify_ssm_plugin()
 
             # Initialize Terraform
             self.run_terraform("init")
@@ -280,11 +305,15 @@ class Orchestrator:
             # Apply infrastructure
             self.run_terraform("apply", config_file)
 
-            # Wait for instances to be ready
-            logger.info("Waiting for instances to be ready...")
-            time.sleep(30)
+            # Wait for instances to be registered with SSM
+            aws_region = self.infrastructure_config['aws']['region']
+            logger.info("Waiting for instances to register with SSM...")
+            time.sleep(60)  # SSM agent needs time to register
 
-            # Deploy Pulsar cluster
+            # Verify SSM connectivity
+            self.verify_ssm_connectivity(aws_region)
+
+            # Deploy Pulsar cluster via Ansible (using SSM)
             self.run_ansible("deploy.yaml")
 
             logger.info("Setup phase completed successfully")
@@ -384,20 +413,26 @@ class Orchestrator:
         logger.info("Teardown phase completed")
 
     def run_tests(self, test_plan_file: Path) -> None:
-        """Execute test plan"""
+        """Execute test plan using AWS SSM SendCommand"""
         logger.info(f"Running tests from plan: {test_plan_file}")
 
         test_plan = self.load_config(test_plan_file)
 
-        # Get client node SSH info
-        client_ips = self.get_terraform_output("client_instances")
-        client_data = json.loads(client_ips)
-        client_ip = client_data['public_ips'][0]
+        # Get AWS region and client instance ID
+        aws_region = self.infrastructure_config['aws']['region']
+        client_data_str = self.get_terraform_output("client_instances")
+        client_data = json.loads(client_data_str)
+        client_instance_id = client_data['ids'][0]
 
-        ssh_key_name = self.infrastructure_config['compute']['ssh_key_name']
-        ssh_key_path = Path.home() / ".ssh" / f"{ssh_key_name}.pem"
+        # Get SSM bucket for file transfers
+        ssm_bucket = self.get_terraform_output("ssm_bucket_name")
 
-        logger.info(f"Running tests on client node: {client_ip}")
+        logger.info(f"Running tests on client instance: {client_instance_id}")
+        logger.info(f"Using SSM bucket for file transfers: {ssm_bucket}")
+
+        # Initialize AWS clients
+        ssm_client = boto3.client('ssm', region_name=aws_region)
+        s3_client = boto3.client('s3', region_name=aws_region)
 
         # Create results directory
         results_dir = self.experiment_dir / "benchmark_results"
@@ -417,23 +452,54 @@ class Orchestrator:
             with open(workload_file, 'w') as f:
                 yaml.dump(workload, f)
 
-            # Copy workload to client
-            self._ssh_copy(str(workload_file), f"/tmp/workload_{test_name}.yaml", client_ip, ssh_key_path)
+            # Upload workload file to S3
+            s3_key = f"{self.experiment_id}/workloads/workload_{test_name}.yaml"
+            logger.info(f"Uploading workload to S3: s3://{ssm_bucket}/{s3_key}")
+            s3_client.upload_file(str(workload_file), ssm_bucket, s3_key)
+
+            # Download workload from S3 to client instance
+            logger.info(f"Downloading workload to client instance: /tmp/workload_{test_name}.yaml")
+            download_cmd = f"aws s3 cp s3://{ssm_bucket}/{s3_key} /tmp/workload_{test_name}.yaml"
+            self._ssm_run_command(
+                ssm_client,
+                client_instance_id,
+                [download_cmd],
+                f"Download workload {test_name}"
+            )
 
             # Run benchmark
             result_file = f"/opt/benchmark-results/{test_name}.json"
-            benchmark_cmd = f"cd /opt/openmessaging-benchmark/benchmark-framework && " \
-                          f"sudo bin/benchmark --drivers /opt/benchmark-configs/pulsar-driver.yaml " \
-                          f"/tmp/workload_{test_name}.yaml --output {result_file}"
+            benchmark_cmd = (
+                f"cd /opt/openmessaging-benchmark/benchmark-framework && "
+                f"sudo bin/benchmark --drivers /opt/benchmark-configs/pulsar-driver.yaml "
+                f"/tmp/workload_{test_name}.yaml --output {result_file}"
+            )
 
             logger.info(f"Executing benchmark: {test_name}")
-            self._ssh_exec(benchmark_cmd, client_ip, ssh_key_path)
+            self._ssm_run_command(
+                ssm_client,
+                client_instance_id,
+                [benchmark_cmd],
+                f"Run benchmark {test_name}"
+            )
 
-            # Download results
+            # Upload results to S3
+            s3_result_key = f"{self.experiment_id}/results/{test_name}.json"
+            logger.info(f"Uploading results to S3: s3://{ssm_bucket}/{s3_result_key}")
+            upload_result_cmd = f"aws s3 cp {result_file} s3://{ssm_bucket}/{s3_result_key}"
+            self._ssm_run_command(
+                ssm_client,
+                client_instance_id,
+                [upload_result_cmd],
+                f"Upload results {test_name}"
+            )
+
+            # Download results from S3 to local
             local_result = results_dir / f"{test_name}.json"
-            self._ssh_copy(f"ec2-user@{client_ip}:{result_file}", str(local_result), client_ip, ssh_key_path, download=True)
+            logger.info(f"Downloading results from S3 to: {local_result}")
+            s3_client.download_file(ssm_bucket, s3_result_key, str(local_result))
 
-            logger.info(f"✓ Test '{test_name}' completed. Results saved to {local_result}")
+            logger.info(f"Test '{test_name}' completed. Results saved to {local_result}")
 
         logger.info(f"\n{'='*60}")
         logger.info(f"All tests completed! Results: {results_dir}")
@@ -460,43 +526,93 @@ class Orchestrator:
 
         return workload
 
-    def _ssh_exec(self, command: str, host: str, key_path: Path) -> None:
-        """Execute command via SSH"""
-        ssh_cmd = [
-            "ssh",
-            "-i", str(key_path),
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            f"ec2-user@{host}",
-            command
-        ]
+    def _ssm_run_command(self, ssm_client, instance_id: str, commands: List[str], description: str) -> Dict:
+        """
+        Execute commands on an instance using SSM SendCommand and wait for completion
 
-        result = subprocess.run(ssh_cmd, check=True)
+        Args:
+            ssm_client: Boto3 SSM client
+            instance_id: EC2 instance ID
+            commands: List of shell commands to execute
+            description: Human-readable description for logging
 
-    def _ssh_copy(self, source: str, dest: str, host: str, key_path: Path, download: bool = False) -> None:
-        """Copy file via SCP"""
-        if download:
-            # Download from remote
-            scp_cmd = [
-                "scp",
-                "-i", str(key_path),
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                source,
-                dest
-            ]
-        else:
-            # Upload to remote
-            scp_cmd = [
-                "scp",
-                "-i", str(key_path),
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                source,
-                f"ec2-user@{host}:{dest}"
-            ]
+        Returns:
+            Command invocation response with output
 
-        subprocess.run(scp_cmd, check=True)
+        Raises:
+            OrchestratorError: If command fails or times out
+        """
+        logger.info(f"SSM Command: {description}")
+
+        try:
+            # Send command
+            response = ssm_client.send_command(
+                InstanceIds=[instance_id],
+                DocumentName='AWS-RunShellScript',
+                Parameters={'commands': commands},
+                Comment=description,
+                TimeoutSeconds=3600,  # 1 hour timeout
+            )
+
+            command_id = response['Command']['CommandId']
+            logger.info(f"Command ID: {command_id}")
+
+            # Wait for command to complete
+            max_attempts = 360  # 30 minutes (5 second intervals)
+            attempt = 0
+
+            while attempt < max_attempts:
+                time.sleep(5)
+                attempt += 1
+
+                try:
+                    # Get command invocation status
+                    invocation = ssm_client.get_command_invocation(
+                        CommandId=command_id,
+                        InstanceId=instance_id
+                    )
+
+                    status = invocation['Status']
+
+                    if status == 'Success':
+                        logger.info(f"Command completed successfully")
+                        if invocation.get('StandardOutputContent'):
+                            logger.debug(f"Output: {invocation['StandardOutputContent'][:500]}")
+                        return invocation
+
+                    elif status in ['Failed', 'Cancelled', 'TimedOut']:
+                        error_msg = f"Command {description} failed with status: {status}"
+                        if invocation.get('StandardErrorContent'):
+                            error_msg += f"\nError: {invocation['StandardErrorContent']}"
+                        logger.error(error_msg)
+                        raise OrchestratorError(error_msg)
+
+                    elif status in ['Pending', 'InProgress', 'Delayed']:
+                        # Still running, continue waiting
+                        if attempt % 12 == 0:  # Log every minute
+                            logger.info(f"Command still running... (status: {status})")
+                        continue
+
+                    else:
+                        logger.warning(f"Unknown command status: {status}")
+                        continue
+
+                except ssm_client.exceptions.InvocationDoesNotExist:
+                    # Command not yet registered, keep waiting
+                    if attempt % 12 == 0:
+                        logger.info("Waiting for command to be registered...")
+                    continue
+
+            # Timeout reached
+            raise OrchestratorError(
+                f"Command {description} timed out after {max_attempts * 5} seconds"
+            )
+
+        except Exception as e:
+            if isinstance(e, OrchestratorError):
+                raise
+            logger.error(f"SSM command execution failed: {e}")
+            raise OrchestratorError(f"SSM command failed: {e}") from e
 
     def generate_report(self) -> None:
         """Generate experiment report"""
