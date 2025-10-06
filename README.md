@@ -340,6 +340,37 @@ Reports are generated in `~/.pulsar-aws-lab/<experiment-id>/report/`:
 - **Errors**: Publish/consume failures
 - **Costs**: Total cost, cost per million messages
 
+## Error Handling & Automatic Cleanup
+
+**Automatic Resource Cleanup**: If any error occurs during setup or testing, the orchestrator will **automatically clean up all AWS resources** to prevent unexpected costs.
+
+How it works:
+- On error, finds resources by `ExperimentID` tag (doesn't need Terraform state)
+- Deletes resources in correct order: instances → volumes → network → VPC
+- Logs cleanup progress
+- Re-raises the original error for visibility
+
+Example error flow:
+```
+2025-10-05 20:43:54 - ERROR - Ansible playbook failed
+2025-10-05 20:43:54 - WARNING - Initiating automatic cleanup of resources...
+============================================================
+EMERGENCY CLEANUP: Finding resources by ExperimentID tag
+============================================================
+Found 9 resources to cleanup
+Instances to terminate: ['i-abc123', 'i-def456', ...]
+Waiting for instances to terminate...
+Instances terminated.
+Volumes to delete: ['vol-123', 'vol-456']
+...
+Emergency cleanup completed
+```
+
+You can also manually trigger emergency cleanup:
+```bash
+python scripts/cleanup_by_tag.py --experiment-id exp-20251005-143056 --execute
+```
+
 ## Troubleshooting
 
 ### Managing Experiments
