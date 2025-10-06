@@ -102,6 +102,11 @@ resource "aws_instance" "zookeeper" {
   subnet_id              = var.subnet_id
   vpc_security_group_ids = [var.security_group_id]
 
+  root_block_device {
+    volume_size = 20  # GB - Pulsar binary + OS + working space
+    volume_type = "gp3"
+  }
+
   # Spot instance configuration
   instance_market_options {
     market_type = var.use_spot_instances ? "spot" : null
@@ -137,6 +142,11 @@ resource "aws_instance" "bookkeeper" {
   iam_instance_profile   = var.iam_instance_profile
   subnet_id              = var.subnet_id
   vpc_security_group_ids = [var.security_group_id]
+
+  root_block_device {
+    volume_size = 20  # GB - Pulsar binary + OS + working space
+    volume_type = "gp3"
+  }
 
   # Spot instance configuration
   instance_market_options {
@@ -183,6 +193,11 @@ resource "aws_instance" "broker" {
   subnet_id              = var.subnet_id
   vpc_security_group_ids = [var.security_group_id]
 
+  root_block_device {
+    volume_size = 20  # GB - Pulsar binary + OS + working space
+    volume_type = "gp3"
+  }
+
   # Spot instance configuration
   instance_market_options {
     market_type = var.use_spot_instances ? "spot" : null
@@ -217,6 +232,11 @@ resource "aws_instance" "client" {
   iam_instance_profile   = var.iam_instance_profile
   subnet_id              = var.subnet_id
   vpc_security_group_ids = [var.security_group_id]
+
+  root_block_device {
+    volume_size = 20  # GB - Pulsar binary + OS + working space
+    volume_type = "gp3"
+  }
 
   # Spot instance configuration
   instance_market_options {
