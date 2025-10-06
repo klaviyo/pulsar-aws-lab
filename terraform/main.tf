@@ -32,14 +32,14 @@ provider "aws" {
   }
 }
 
-# Data source for latest Amazon Linux 2 AMI
-data "aws_ami" "amazon_linux_2" {
+# Data source for latest Amazon Linux 2023 AMI
+data "aws_ami" "amazon_linux_2023" {
   most_recent = true
   owners      = ["amazon"]
 
   filter {
     name   = "name"
-    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+    values = ["al2023-ami-2023.*-x86_64"]
   }
 
   filter {
@@ -49,7 +49,7 @@ data "aws_ami" "amazon_linux_2" {
 }
 
 locals {
-  ami_id = var.ami_id != null ? var.ami_id : data.aws_ami.amazon_linux_2.id
+  ami_id = var.ami_id != null ? var.ami_id : data.aws_ami.amazon_linux_2023.id
   az     = var.availability_zone != null ? var.availability_zone : "${var.aws_region}a"
 }
 
