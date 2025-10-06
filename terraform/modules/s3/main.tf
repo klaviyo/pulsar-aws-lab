@@ -25,15 +25,6 @@ resource "aws_s3_bucket" "ansible_ssm" {
   }
 }
 
-# Enable versioning
-resource "aws_s3_bucket_versioning" "ansible_ssm" {
-  bucket = aws_s3_bucket.ansible_ssm.id
-
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
 # Block all public access
 resource "aws_s3_bucket_public_access_block" "ansible_ssm" {
   bucket = aws_s3_bucket.ansible_ssm.id
@@ -56,10 +47,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "ansible_ssm" {
 
     expiration {
       days = 1
-    }
-
-    noncurrent_version_expiration {
-      noncurrent_days = 1
     }
   }
 }
