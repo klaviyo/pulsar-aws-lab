@@ -4,7 +4,8 @@
 
 ```bash
 # Install Packer
-brew install packer  # macOS
+brew tap hashicorp/tap
+brew install hashicorp/tap/packer
 # or download from https://www.packer.io/downloads
 
 # Configure AWS credentials
@@ -184,11 +185,12 @@ aws ec2 describe-snapshots \
 
 ## 9. Next Steps
 
-1. Build multiple AMI versions for different Pulsar releases
-2. Update Ansible playbooks to skip Pulsar installation (already in AMI)
-3. Create separate AMIs for different components (optional optimization)
-4. Set up automated AMI builds in CI/CD pipeline
-5. Implement AMI versioning and lifecycle management
+1. **Validate your AMI**: `python scripts/build-ami.py validate --ami-id <ami-id>`
+2. **Deploy cluster**: `python scripts/orchestrator.py setup --config config/infrastructure.yaml`
+3. **Run benchmarks**: `python scripts/orchestrator.py full --test-plan config/test-plans/poc.yaml`
+4. **Build multiple versions**: Create AMIs for different Pulsar releases as needed
+5. **Automate builds**: Set up CI/CD pipeline for automated AMI builds
+6. **Manage lifecycle**: Use `build-ami.py` to list, validate, and delete old AMIs
 
 ## Estimated Costs
 

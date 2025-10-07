@@ -6,10 +6,10 @@ This directory contains Packer templates and scripts to build a base AMI for Apa
 
 The base AMI includes:
 - Amazon Linux 2023
-- Java 11 (Amazon Corretto)
+- Java 17 (Amazon Corretto) - LTS version with better performance
 - Apache Pulsar 3.0.0 (configurable)
 - OpenMessaging Benchmark framework
-- System utilities (wget, tar, vim, htop, sysstat, net-tools, nmap-ncat, git, maven)
+- System utilities (wget, tar, vim, htop, sysstat, net-tools, nmap-ncat, git, jq, etc.)
 - Optimized system configuration for Pulsar workloads
 - Generic systemd service templates
 
@@ -180,11 +180,12 @@ To use the built AMI with Terraform:
 
 ## Benefits of Using Pre-built AMI
 
-1. **Faster Deployment**: Skip Pulsar/Java installation during provisioning
+1. **Faster Deployment**: Skip Pulsar/Java installation during provisioning (2-3 minutes vs 15-20 minutes)
 2. **Consistency**: Same base image across all instances
-3. **Reduced Ansible Complexity**: Less to configure at runtime
+3. **Simplified Infrastructure**: No runtime configuration management needed
 4. **Cost Savings**: Faster instance startup = lower costs
 5. **Reproducibility**: Version-tagged AMIs for consistent deployments
+6. **Immutable Infrastructure**: Changes require rebuilding AMI, preventing configuration drift
 
 ## Estimated Build Time
 
@@ -248,8 +249,28 @@ aws ec2 describe-snapshots \
 
 ## Next Steps
 
-1. Build the AMI
-2. Update Terraform configuration to use the AMI
-3. Reduce Ansible playbook complexity (remove Pulsar installation tasks)
-4. Test deployment with new AMI
-5. Create multiple AMI versions for different Pulsar versions/configurations
+1. Build the AMI: `python scripts/build-ami.py build --version 3.0.0`
+2. Validate the AMI: `python scripts/build-ami.py validate --ami-id <ami-id>`
+3. Deploy with Terraform (automatically discovers latest AMI)
+4. Run tests with orchestrator: `python scripts/orchestrator.py full --test-plan config/test-plans/poc.yaml`
+5. Create multiple AMI versions for different Pulsar versions as needed
+
+## AMI Management
+
+Use the provided Python CLI tool for AMI lifecycle management:
+
+```bash
+# Build new AMI
+python scripts/build-ami.py build --version 3.0.0 --region us-west-2
+
+# List all AMIs
+python scripts/build-ami.py list --region us-west-2
+
+# Validate AMI (launches test instance)
+python scripts/build-ami.py validate --ami-id ami-xxxxx
+
+# Delete old AMI
+python scripts/build-ami.py delete --ami-id ami-xxxxx --region us-west-2
+```
+
+The orchestrator automatically discovers and uses the latest Pulsar AMI by version tag.

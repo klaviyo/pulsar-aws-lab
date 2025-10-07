@@ -31,8 +31,8 @@ Key Files:
    - Includes validation and cleanup steps
 
 2. scripts/configure-system.sh
-   - Installs system utilities (wget, tar, vim, htop, etc.)
-   - Installs Java 11 (Amazon Corretto)
+   - Installs system utilities (wget, tar, vim, htop, jq, nmap-ncat, etc.)
+   - Installs Java 17 (Amazon Corretto) - LTS version with better performance
    - Disables SELinux, sets timezone to UTC
    - Configures system limits (file descriptors, processes)
    - Sets up sysctl tuning for network performance
@@ -53,7 +53,7 @@ Key Files:
 
 5. files/systemd/*.service.tpl
    - Generic systemd service templates
-   - Can be customized at runtime by Ansible
+   - Customized at runtime by Terraform user-data scripts
    - Include proper resource limits and restart policies
    - Stored in /opt/pulsar-templates/systemd/ on AMI
 
@@ -98,16 +98,17 @@ What Gets Installed:
 
 Benefits:
 ---------
-- Faster deployments (no need to download/install Pulsar)
+- Faster deployments (2-3 min vs 15-20 min - no need to download/install Pulsar)
 - Consistent base across all instances
-- Reduced Ansible complexity
+- Immutable infrastructure (no configuration drift)
 - Version-tagged AMIs for reproducibility
 - Cost savings (faster instance startup)
+- Simplified deployment (no runtime configuration management)
 
 Next Steps:
 -----------
-1. Build the AMI
-2. Update Terraform to use the AMI
-3. Simplify Ansible playbooks (skip Pulsar installation)
-4. Test deployment with new AMI
-5. Create AMI versioning strategy
+1. Build the AMI: `python scripts/build-ami.py build --version 3.0.0`
+2. Validate AMI: `python scripts/build-ami.py validate --ami-id <ami-id>`
+3. Deploy with orchestrator: `python scripts/orchestrator.py full --test-plan config/test-plans/poc.yaml`
+4. Create AMI versioning strategy for different Pulsar releases
+5. Set up automated AMI builds in CI/CD
