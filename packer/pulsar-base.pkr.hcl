@@ -144,8 +144,9 @@ build {
   provisioner "shell" {
     inline = [
       "sudo mkdir -p /opt/pulsar-templates/systemd",
-      "sudo mv /tmp/systemd-templates/* /opt/pulsar-templates/systemd/",
-      "sudo chmod 644 /opt/pulsar-templates/systemd/*.service.tpl"
+      "find /tmp/systemd-templates -name '*.tpl' -exec sudo cp {} /opt/pulsar-templates/systemd/ \\;",
+      "sudo chmod 644 /opt/pulsar-templates/systemd/*.service.tpl",
+      "sudo rm -rf /tmp/systemd-templates"
     ]
   }
 

@@ -192,7 +192,7 @@ class AMIManager:
 
         console.print("[bold green]All prerequisites validated successfully![/bold green]\n")
 
-    def build(self, pulsar_version: str, instance_type: str = "t3.small") -> str:
+    def build(self, pulsar_version: str, instance_type: str = "t3.small", force: bool = False) -> str:
         """
         Build a new Pulsar AMI using Packer.
 
@@ -202,6 +202,7 @@ class AMIManager:
         Args:
             pulsar_version: Apache Pulsar version to install (e.g., "3.0.0")
             instance_type: EC2 instance type for build (default: t3.small)
+            force: Force rebuild even if AMI already exists (default: False)
 
         Returns:
             AMI ID of the newly created image
@@ -223,7 +224,23 @@ class AMIManager:
             console.print(f"  Pulsar Version: {pulsar_version}")
             console.print(f"  Instance Type: {instance_type}")
             console.print(f"  Region: {self.region}")
+            console.print(f"  Force: {force}")
             return "ami-dryrun123456789"
+
+        # Check if AMI already exists (unless force is True)
+        if not force:
+            existing_ami = self.find_ami_by_version(pulsar_version)
+            if existing_ami:
+                console.print(Panel.fit(
+                    f"[bold yellow]AMI Already Exists[/bold yellow]\n\n"
+                    f"AMI ID: [bold]{existing_ami['ami_id']}[/bold]\n"
+                    f"Name: [bold]{existing_ami['name']}[/bold]\n"
+                    f"Created: {existing_ami['creation_date']}\n\n"
+                    f"Use --force to rebuild anyway",
+                    box=box.ROUNDED
+                ))
+                logger.info(f"Skipping build - AMI already exists: {existing_ami['ami_id']}")
+                return existing_ami['ami_id']
 
         # Validate prerequisites (only for real builds)
         self.validate_prerequisites()
@@ -314,6 +331,28 @@ class AMIManager:
             raise AMIBuildError(f"Packer build process failed: {e}") from e
         except Exception as e:
             raise AMIBuildError(f"Unexpected error during build: {e}") from e
+
+    def find_ami_by_version(self, pulsar_version: str) -> Optional[Dict]:
+        """
+        Find an existing AMI for the specified Pulsar version.
+
+        Args:
+            pulsar_version: Pulsar version to search for (e.g., "3.0.0")
+
+        Returns:
+            AMI info dictionary if found, None otherwise
+
+        Example:
+            >>> manager = AMIManager(region="us-west-2")
+            >>> ami = manager.find_ami_by_version("3.0.0")
+            >>> if ami:
+            ...     print(f"Found existing AMI: {ami['ami_id']}")
+        """
+        amis = self.list_amis(use_cache=True)
+        for ami in amis:
+            if ami['pulsar_version'] == pulsar_version and ami['state'] == 'available':
+                return ami
+        return None
 
     def list_amis(self, use_cache: bool = True) -> List[Dict]:
         """
@@ -1056,6 +1095,9 @@ Examples:
   # Build a new AMI
   %(prog)s build --version 3.0.0 --region us-west-2
 
+  # Force rebuild an existing AMI
+  %(prog)s build --version 3.0.0 --force --region us-west-2
+
   # List all AMIs
   %(prog)s list --region us-west-2
 
@@ -1076,6 +1118,7 @@ Examples:
     build_parser = subparsers.add_parser('build', parents=[parent_parser], help='Build a new Pulsar AMI')
     build_parser.add_argument('--version', required=True, help='Pulsar version to install (e.g., 3.0.0)')
     build_parser.add_argument('--instance-type', default='t3.small', help='Instance type for build (default: t3.small)')
+    build_parser.add_argument('--force', action='store_true', help='Force rebuild even if AMI already exists')
 
     # List command
     list_parser = subparsers.add_parser('list', parents=[parent_parser], help='List all Pulsar AMIs')
@@ -1132,7 +1175,8 @@ def main() -> int:
         if args.command == 'build':
             ami_id = manager.build(
                 pulsar_version=args.version,
-                instance_type=args.instance_type
+                instance_type=args.instance_type,
+                force=args.force
             )
             console.print(f"[bold green]AMI ID:[/bold green] {ami_id}")
             return 0

@@ -66,8 +66,8 @@ if [[ "$MAVEN_VERSION" < "$REQUIRED_VERSION" ]]; then
     sudo tar -xzf "$MAVEN_TARBALL" -C /opt/
     sudo mv /opt/apache-maven-${MAVEN_BINARY_VERSION} ${MAVEN_HOME}
 
-    # Add to PATH
-    export PATH=${MAVEN_HOME}/bin:$PATH
+    # Set Maven command to use installed version
+    MAVEN_CMD="${MAVEN_HOME}/bin/mvn"
 
     # Clean up
     rm -f "$MAVEN_TARBALL"
@@ -75,11 +75,13 @@ if [[ "$MAVEN_VERSION" < "$REQUIRED_VERSION" ]]; then
     echo "Installed Maven to ${MAVEN_HOME}"
 else
     echo "System Maven $MAVEN_VERSION meets requirements"
+    # Use system Maven
+    MAVEN_CMD="mvn"
 fi
 
 # Verify final Maven version
 echo "Final Maven version:"
-mvn --version
+${MAVEN_CMD} --version
 
 # Clone OpenMessaging Benchmark repository
 echo "Cloning OpenMessaging Benchmark from ${BENCHMARK_REPO}..."
@@ -100,7 +102,7 @@ cd ${BENCHMARK_DIR}
 # Use Maven with appropriate memory settings for t3.small instances
 export MAVEN_OPTS="-Xmx1024m -XX:MaxMetaspaceSize=512m"
 
-sudo -E mvn clean install -DskipTests -q
+sudo -E ${MAVEN_CMD} clean install -DskipTests -q
 
 # Verify build
 if [ ! -d "${BENCHMARK_DIR}/benchmark-framework/target" ]; then
