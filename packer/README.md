@@ -40,7 +40,44 @@ The base AMI includes:
    - Create/describe/delete EC2 instances
    - Create/describe/deregister AMIs
    - Create/delete EBS snapshots
-   - Create/delete security groups (temporary)
+   - Systems Manager Session Manager access
+   - Pass IAM role (for SSMManagedInstanceCore)
+
+4. **SSM Session Manager Plugin** (required):
+   ```bash
+   # macOS
+   brew install --cask session-manager-plugin
+
+   # Linux/Windows
+   # See: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html
+   ```
+
+5. **IAM Instance Profile**: Ensure `SSMManagedInstanceCore` IAM role exists:
+   ```bash
+   # Check if role exists
+   aws iam get-role --role-name SSMManagedInstanceCore
+
+   # If not, create it
+   aws iam create-role --role-name SSMManagedInstanceCore \
+     --assume-role-policy-document '{
+       "Version": "2012-10-17",
+       "Statement": [{
+         "Effect": "Allow",
+         "Principal": {"Service": "ec2.amazonaws.com"},
+         "Action": "sts:AssumeRole"
+       }]
+     }'
+
+   # Attach SSM managed policy
+   aws iam attach-role-policy --role-name SSMManagedInstanceCore \
+     --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+   # Create instance profile
+   aws iam create-instance-profile --instance-profile-name SSMManagedInstanceCore
+   aws iam add-role-to-instance-profile \
+     --instance-profile-name SSMManagedInstanceCore \
+     --role-name SSMManagedInstanceCore
+   ```
 
 ## Usage
 
@@ -186,6 +223,7 @@ To use the built AMI with Terraform:
 4. **Cost Savings**: Faster instance startup = lower costs
 5. **Reproducibility**: Version-tagged AMIs for consistent deployments
 6. **Immutable Infrastructure**: Changes require rebuilding AMI, preventing configuration drift
+7. **Secure Builds**: Uses AWS SSM instead of SSH (no open ports, IAM-based authentication)
 
 ## Estimated Build Time
 
@@ -204,10 +242,12 @@ Building the AMI incurs minimal costs:
 
 ## Troubleshooting
 
-### Build Fails with "timeout waiting for SSH"
-- Check your AWS credentials and region
-- Verify security group allows SSH (port 22)
-- Check subnet has internet access
+### Build Fails with "timeout waiting for SSM"
+- Verify AWS Session Manager plugin is installed: `session-manager-plugin`
+- Check IAM role `SSMManagedInstanceCore` exists and has correct permissions
+- Ensure instance has internet access (for SSM endpoints)
+- Verify VPC has SSM endpoints configured (if using private subnets)
+- Check AWS region is correct
 
 ### Maven Build Out of Memory
 - Increase `instance_type` to t3.medium or larger

@@ -8,12 +8,22 @@ brew tap hashicorp/tap
 brew install hashicorp/tap/packer
 # or download from https://www.packer.io/downloads
 
+# Install AWS Session Manager plugin (required for SSM communication)
+brew install --cask session-manager-plugin
+# or see: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html
+
 # Configure AWS credentials
 aws configure
 # OR
 export AWS_ACCESS_KEY_ID="your-key"
 export AWS_SECRET_ACCESS_KEY="your-secret"
 export AWS_DEFAULT_REGION="us-west-2"
+
+# Ensure SSMManagedInstanceCore IAM role exists
+aws iam get-role --role-name SSMManagedInstanceCore || {
+  echo "Creating SSMManagedInstanceCore role..."
+  # See packer/README.md for full setup instructions
+}
 ```
 
 ## 2. Build the AMI

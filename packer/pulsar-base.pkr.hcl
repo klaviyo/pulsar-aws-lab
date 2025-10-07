@@ -52,8 +52,16 @@ source "amazon-ebs" "pulsar_base" {
   region        = var.region
   source_ami    = data.amazon-ami.amazon_linux_2023.id
   instance_type = var.instance_type
-  ssh_username  = "ec2-user"
   ami_name      = local.ami_name
+
+  # Use SSM instead of SSH for communication
+  communicator                 = "ssh"
+  ssh_username                 = "ec2-user"
+  ssh_interface                = "session_manager"
+  iam_instance_profile         = "SSMManagedInstanceCore"
+
+  # Temporary security group for SSM (no SSH port needed)
+  temporary_security_group_source_public_ip = false
 
   # Tags for the final AMI
   tags = {

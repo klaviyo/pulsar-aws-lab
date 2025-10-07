@@ -61,6 +61,9 @@ Pulsar AWS Lab is an **AMI-based ephemeral testing framework** for Apache Pulsar
 
 **Key Patterns**:
 - Uses Amazon Linux 2023 as base
+- **SSM-based communication**: Uses AWS Systems Manager instead of SSH for build instance access
+- Requires `SSMManagedInstanceCore` IAM instance profile
+- No SSH ports opened during build (more secure)
 - Installs Pulsar to `/opt/pulsar`
 - Installs OpenMessaging Benchmark to `/opt/openmessaging-benchmark`
 - Places systemd templates in `/opt/pulsar-templates/systemd/`
