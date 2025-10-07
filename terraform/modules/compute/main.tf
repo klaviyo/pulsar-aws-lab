@@ -15,11 +15,6 @@ variable "ssh_key_name" {
   type        = string
 }
 
-variable "iam_instance_profile" {
-  description = "IAM instance profile name for SSM"
-  type        = string
-}
-
 variable "vpc_id" {
   description = "VPC ID"
   type        = string
@@ -46,6 +41,16 @@ variable "spot_max_price" {
   default     = null
 }
 
+variable "pulsar_version" {
+  description = "Apache Pulsar version"
+  type        = string
+}
+
+variable "cluster_name" {
+  description = "Pulsar cluster name"
+  type        = string
+}
+
 variable "zookeeper_count" {
   description = "Number of ZooKeeper instances"
   type        = number
@@ -53,6 +58,11 @@ variable "zookeeper_count" {
 
 variable "zookeeper_instance_type" {
   description = "ZooKeeper instance type"
+  type        = string
+}
+
+variable "zookeeper_heap_size" {
+  description = "ZooKeeper JVM heap size"
   type        = string
 }
 
@@ -71,6 +81,16 @@ variable "bookkeeper_volume_ids" {
   type        = list(string)
 }
 
+variable "bookkeeper_heap_size" {
+  description = "BookKeeper JVM heap size"
+  type        = string
+}
+
+variable "bookkeeper_direct_memory_size" {
+  description = "BookKeeper JVM direct memory size"
+  type        = string
+}
+
 variable "broker_count" {
   description = "Number of Broker instances"
   type        = number
@@ -78,6 +98,16 @@ variable "broker_count" {
 
 variable "broker_instance_type" {
   description = "Broker instance type"
+  type        = string
+}
+
+variable "broker_heap_size" {
+  description = "Broker JVM heap size"
+  type        = string
+}
+
+variable "broker_direct_memory_size" {
+  description = "Broker JVM direct memory size"
   type        = string
 }
 
@@ -95,12 +125,21 @@ variable "client_instance_type" {
 resource "aws_instance" "zookeeper" {
   count = var.zookeeper_count
 
-  ami                    = var.ami_id
-  instance_type          = var.zookeeper_instance_type
-  key_name               = var.ssh_key_name
-  iam_instance_profile   = var.iam_instance_profile
-  subnet_id              = var.subnet_id
-  vpc_security_group_ids = [var.security_group_id]
+  ami                         = var.ami_id
+  instance_type               = var.zookeeper_instance_type
+  key_name                    = var.ssh_key_name
+  subnet_id                   = var.subnet_id
+  vpc_security_group_ids      = [var.security_group_id]
+  associate_public_ip_address = true
+
+  # User data for ZooKeeper configuration
+  user_data = base64encode(templatefile("${path.module}/../../user-data/zookeeper.sh.tpl", {
+    cluster_name   = var.cluster_name
+    pulsar_version = var.pulsar_version
+    zk_heap_size   = var.zookeeper_heap_size
+    zk_id          = count.index + 1
+    zk_servers     = join(",", [for i in range(var.zookeeper_count) : "${cidrhost(data.aws_subnet.selected.cidr_block, 10 + i)}:2888:3888"])
+  }))
 
   root_block_device {
     volume_size = 20  # GB - Pulsar binary + OS + working space
@@ -132,16 +171,30 @@ resource "aws_instance" "zookeeper" {
   }
 }
 
+# Data source to get subnet info for IP calculations
+data "aws_subnet" "selected" {
+  id = var.subnet_id
+}
+
 # BookKeeper Instances
 resource "aws_instance" "bookkeeper" {
   count = var.bookkeeper_count
 
-  ami                    = var.ami_id
-  instance_type          = var.bookkeeper_instance_type
-  key_name               = var.ssh_key_name
-  iam_instance_profile   = var.iam_instance_profile
-  subnet_id              = var.subnet_id
-  vpc_security_group_ids = [var.security_group_id]
+  ami                         = var.ami_id
+  instance_type               = var.bookkeeper_instance_type
+  key_name                    = var.ssh_key_name
+  subnet_id                   = var.subnet_id
+  vpc_security_group_ids      = [var.security_group_id]
+  associate_public_ip_address = true
+
+  # User data for BookKeeper configuration
+  user_data = base64encode(templatefile("${path.module}/../../user-data/bookkeeper.sh.tpl", {
+    cluster_name           = var.cluster_name
+    pulsar_version         = var.pulsar_version
+    bk_heap_size           = var.bookkeeper_heap_size
+    bk_direct_memory_size  = var.bookkeeper_direct_memory_size
+    zk_servers             = join(",", [for i in range(var.zookeeper_count) : "${aws_instance.zookeeper[i].private_ip}:2181"])
+  }))
 
   root_block_device {
     volume_size = 20  # GB - Pulsar binary + OS + working space
@@ -171,6 +224,8 @@ resource "aws_instance" "bookkeeper" {
   lifecycle {
     ignore_changes = [tags_all]
   }
+
+  depends_on = [aws_instance.zookeeper]
 }
 
 # Attach EBS volumes to BookKeeper instances
@@ -186,12 +241,21 @@ resource "aws_volume_attachment" "bookkeeper" {
 resource "aws_instance" "broker" {
   count = var.broker_count
 
-  ami                    = var.ami_id
-  instance_type          = var.broker_instance_type
-  key_name               = var.ssh_key_name
-  iam_instance_profile   = var.iam_instance_profile
-  subnet_id              = var.subnet_id
-  vpc_security_group_ids = [var.security_group_id]
+  ami                         = var.ami_id
+  instance_type               = var.broker_instance_type
+  key_name                    = var.ssh_key_name
+  subnet_id                   = var.subnet_id
+  vpc_security_group_ids      = [var.security_group_id]
+  associate_public_ip_address = true
+
+  # User data for Broker configuration
+  user_data = base64encode(templatefile("${path.module}/../../user-data/broker.sh.tpl", {
+    cluster_name             = var.cluster_name
+    pulsar_version           = var.pulsar_version
+    broker_heap_size         = var.broker_heap_size
+    broker_direct_memory_size = var.broker_direct_memory_size
+    zk_servers               = join(",", [for i in range(var.zookeeper_count) : "${aws_instance.zookeeper[i].private_ip}:2181"])
+  }))
 
   root_block_device {
     volume_size = 20  # GB - Pulsar binary + OS + working space
@@ -220,18 +284,28 @@ resource "aws_instance" "broker" {
   lifecycle {
     ignore_changes = [tags_all]
   }
+
+  depends_on = [aws_instance.zookeeper, aws_instance.bookkeeper]
 }
 
 # Client Instances
 resource "aws_instance" "client" {
   count = var.client_count
 
-  ami                    = var.ami_id
-  instance_type          = var.client_instance_type
-  key_name               = var.ssh_key_name
-  iam_instance_profile   = var.iam_instance_profile
-  subnet_id              = var.subnet_id
-  vpc_security_group_ids = [var.security_group_id]
+  ami                         = var.ami_id
+  instance_type               = var.client_instance_type
+  key_name                    = var.ssh_key_name
+  subnet_id                   = var.subnet_id
+  vpc_security_group_ids      = [var.security_group_id]
+  associate_public_ip_address = true
+
+  # User data for Client configuration
+  user_data = base64encode(templatefile("${path.module}/../../user-data/client.sh.tpl", {
+    cluster_name   = var.cluster_name
+    pulsar_version = var.pulsar_version
+    broker_urls    = join(",", [for i in range(var.broker_count) : "pulsar://${aws_instance.broker[i].private_ip}:6650"])
+    http_urls      = join(",", [for i in range(var.broker_count) : "http://${aws_instance.broker[i].private_ip}:8080"])
+  }))
 
   root_block_device {
     volume_size = 20  # GB - Pulsar binary + OS + working space
@@ -260,6 +334,8 @@ resource "aws_instance" "client" {
   lifecycle {
     ignore_changes = [tags_all]
   }
+
+  depends_on = [aws_instance.broker]
 }
 
 # Outputs

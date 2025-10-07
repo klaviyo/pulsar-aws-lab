@@ -2,15 +2,18 @@
 
 A reproducible, ephemeral Apache Pulsar testing framework on AWS with automated infrastructure deployment, load testing using OpenMessaging Benchmark, comprehensive reporting, and cost tracking.
 
+**🚀 New to Pulsar AWS Lab? Start with the [Quick Start Guide](docs/QUICKSTART.md)!**
+
 ## Features
 
 - ✅ **Automated Infrastructure**: Terraform-based EC2 provisioning with cost optimization
-- ✅ **Pulsar Deployment**: Ansible playbooks for complete cluster setup
+- ✅ **Immutable AMI Deployment**: Pre-baked Pulsar AMIs with Packer for fast, consistent deployments
 - ✅ **Load Testing**: Integration with OpenMessaging Benchmark framework
 - ✅ **Cost Tracking**: AWS Cost Explorer integration with detailed reporting
 - ✅ **Comprehensive Reports**: HTML/CSV/JSON export with all metrics
 - ✅ **Systematic Testing**: Test plan matrices for exploring parameter spaces
 - ✅ **Full Lifecycle**: Automated setup → test → report → teardown
+- ✅ **Fast Deployment**: 60-120 seconds cluster startup (vs 5-10 minutes with runtime provisioning)
 
 ## Architecture
 
@@ -21,44 +24,40 @@ A reproducible, ephemeral Apache Pulsar testing framework on AWS with automated 
 - **Broker**: Message routing and serving (default: 2 brokers)
 - **Client**: OpenMessaging Benchmark execution (default: 1 node)
 
-### Network Architecture
+### Deployment Architecture
 
-**Zero-SSH Design with AWS Systems Manager:**
-- **No SSH ports exposed** - Enhanced security with IAM-based authentication
-- Uses **AWS Systems Manager Session Manager** for all remote operations
-- Ansible connects via SSM plugin (amazon.aws.aws_ssm)
-- File transfers via S3 bucket (no SCP needed)
+**AMI-Based Immutable Infrastructure:**
+- **Pre-baked AMIs** - Pulsar binaries and dependencies installed via Packer
+- **User-data scripts** - Runtime configuration at boot time
+- **Fast deployment** - Cluster ready in 60-120 seconds
+- **Consistent environments** - Same AMI every time
 
-**Public Access:**
-- EC2 instances have public IPs for outbound internet access (AWS APIs, package downloads)
-- No inbound SSH port 22 in security groups
-- All remote access via SSM endpoints
+**Deployment Flow:**
+```
+1. Build Phase (one-time):
+   Packer → Amazon Linux 2023 + Pulsar 3.0.0 → AMI
 
-**Internal Communication:**
-- Pulsar components use **private IPs** within the VPC
+2. Deploy Phase (per experiment):
+   Terraform → Launch EC2 from AMI → User-data configures:
+      - ZooKeeper: myid, zoo.cfg, starts service
+      - BookKeeper: formats ledgers, bookkeeper.conf, starts service
+      - Broker: broker.conf, initializes metadata, starts service
+      - Client: configures benchmark framework
+
+3. Ready in 60-120 seconds (vs 5-10 minutes with Ansible)
+```
+
+**Network Design:**
+- EC2 instances have **public IPs** for AWS API access and package downloads
+- Pulsar components communicate via **private IPs** within VPC
 - ZooKeeper connect string: `10.0.1.x:2181,10.0.1.y:2181,...`
 - Broker service URL: `pulsar://10.0.1.z:6650`
-- All inter-cluster traffic stays within the private network
+- All inter-cluster traffic stays private
 
-**SSM Architecture:**
-```
-Your Machine → [AWS SSM API] → Systems Manager
-                                       ↓
-                                  [SSM Agent on EC2]
-                                       ↓
-                                  [Internal VPC]
-                                  Private IPs
-                                  ZK ↔ BK ↔ Broker
-
-File Transfers:
-Your Machine → S3 Bucket ← EC2 Instances (via AWS CLI)
-```
-
-**IAM Permissions:**
-- EC2 instances have IAM role with:
-  - `AmazonSSMManagedInstanceCore` policy (SSM access)
-  - S3 bucket permissions for file transfers
-- Local AWS credentials need SSM permissions to start sessions
+**Security:**
+- SSH access via key pair (optional, for debugging)
+- Security groups restrict inter-component traffic
+- IAM roles for AWS API access
 
 ### Directory Structure
 
@@ -70,16 +69,19 @@ pulsar-aws-lab/
 │   ├── schema/          # JSON schemas
 │   └── test-plans/      # Test scenario definitions
 ├── terraform/           # Infrastructure as Code
-│   └── modules/         # Modular components
-├── ansible/             # Configuration management
-│   ├── playbooks/
-│   └── roles/           # Component roles
+│   ├── modules/         # Modular components
+│   └── user-data/       # Boot-time configuration scripts
+├── packer/              # AMI building
+│   ├── pulsar-base.pkr.hcl
+│   └── scripts/         # Installation scripts
 ├── scripts/             # Orchestration scripts
-│   ├── orchestrator.py
+│   ├── orchestrator.py  # Main orchestration
+│   ├── build-ami.py     # AMI management
 │   ├── cost_tracker.py
 │   └── report_generator.py
 ├── workloads/           # Benchmark workloads
-└── reporting/           # Report templates
+├── reporting/           # Report templates
+└── docs/                # Documentation
 ```
 
 ## Prerequisites
@@ -90,19 +92,20 @@ pulsar-aws-lab/
 # AWS CLI
 aws --version  # >= 2.0
 
-# AWS Session Manager Plugin (REQUIRED for SSM)
-session-manager-plugin
-# Install from: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html
-
 # Terraform
 terraform --version  # >= 1.0
 
-# Ansible
-ansible --version  # >= 2.9
-
 # Python
 python3 --version  # >= 3.8
+
+# Packer (only for building custom AMIs)
+packer --version  # >= 1.8
+# Install: https://www.packer.io/downloads
+# macOS: brew install packer
+# Linux: see Packer website
 ```
+
+**Note**: Packer is only required if you want to build custom AMIs. The project can use pre-built AMIs from your AWS account.
 
 ### AWS Setup
 
@@ -117,32 +120,26 @@ python3 --version  # >= 3.8
 
 2. **IAM Permissions** (for your AWS credentials):
    Your AWS user/role needs permissions for:
-   - EC2 (create instances, security groups, VPCs)
-   - SSM (start sessions, send commands)
-   - S3 (create bucket, upload/download files)
-   - IAM (create roles for EC2 instances)
+   - EC2 (create instances, AMIs, security groups, VPCs, snapshots)
+   - Cost Explorer (for cost tracking)
+   - IAM (create roles for EC2 instances - optional)
 
-3. **Install Session Manager Plugin**:
+3. **Build Pulsar AMI** (first-time setup):
    ```bash
-   # macOS
-   brew install --cask session-manager-plugin
+   # Build the base Pulsar AMI (takes ~10-15 minutes)
+   python scripts/build-ami.py build --version 3.0.0 --region us-west-2
 
-   # Ubuntu/Debian
-   curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
-   sudo dpkg -i session-manager-plugin.deb
-
-   # Verify installation
-   session-manager-plugin
+   # Validate the AMI (optional but recommended)
+   AMI_ID=$(python scripts/build-ami.py latest --region us-west-2)
+   python scripts/build-ami.py validate --ami-id $AMI_ID
    ```
+
+   See [AMI Build Guide](docs/BUILD-AMI-GUIDE.md) for detailed instructions.
 
 ### Python Dependencies
 
 ```bash
-cd scripts
-pip install -r requirements.txt
-
-# Install Ansible collections
-ansible-galaxy collection install -r ansible/requirements.yml
+pip install -r scripts/requirements.txt
 ```
 
 ## Quick Start
@@ -446,37 +443,35 @@ python scripts/orchestrator.py teardown --experiment-id exp-20251005-123456
 - Each experiment has its own directory with logs and configs
 - The `latest` symlink always points to the most recent experiment
 
-### SSM Connection Issues
+### AMI Issues
 
-**Check Session Manager Plugin:**
+**No AMI found:**
 ```bash
-session-manager-plugin
-# Should show usage information
+# Check if AMI exists in your region
+python scripts/build-ami.py list --region us-west-2
+
+# Build a new AMI if needed
+python scripts/build-ami.py build --version 3.0.0 --region us-west-2
 ```
 
-**Verify EC2 instances are registered with SSM:**
+**AMI validation fails:**
 ```bash
-aws ssm describe-instance-information \
-  --filters "Key=tag:ExperimentID,Values=exp-20251005-143056"
+# Validate the AMI to diagnose issues
+python scripts/build-ami.py validate --ami-id ami-xxxxx
+
+# Check user-data scripts in terraform/user-data/
+# Check cloud-init logs on a test instance:
+# /var/log/cloud-init-output.log
 ```
 
-**Test SSM connectivity manually:**
+**Wrong AMI being used:**
 ```bash
-# Get instance ID from orchestrator output
-aws ssm start-session --target i-1234567890abcdef0
+# List all AMIs to see which one will be used
+python scripts/build-ami.py list
+
+# The orchestrator uses the latest AMI matching the filter pattern
+# Update terraform/variables.tf if you need to change the filter
 ```
-
-**Common SSM issues:**
-- **"TargetNotConnected"**: Instance not registered with SSM
-  - Wait 2-3 minutes after instance launch
-  - Check IAM instance profile is attached
-  - Verify SSM agent is running: `systemctl status amazon-ssm-agent`
-
-- **"AccessDenied"**: Your IAM user lacks SSM permissions
-  - Add `AmazonSSMManagedInstanceCore` policy to your user
-
-- **Session Manager plugin not found**:
-  - Install from AWS documentation link above
 
 ### Terraform State Issues
 
@@ -534,20 +529,26 @@ terraform apply -var-file=../config/infrastructure.tfvars
 terraform destroy -var-file=../config/infrastructure.tfvars
 ```
 
-### Manual Ansible Operations
+### Manual AMI Operations
 
 ```bash
-cd ansible
+# Build a new AMI
+python scripts/build-ami.py build --version 3.0.0 --region us-west-2
 
-# Deploy cluster
-ansible-playbook -i inventory/terraform-inventory \
-  playbooks/deploy.yaml \
-  -e @../config/pulsar-cluster.yaml
+# List available AMIs
+python scripts/build-ami.py list --region us-west-2
 
-# Check cluster health
-ansible all -i inventory/terraform-inventory \
-  -m shell -a "systemctl status broker"
+# Validate an AMI
+python scripts/build-ami.py validate --ami-id ami-xxxxx
+
+# Delete old AMIs
+python scripts/build-ami.py delete --ami-id ami-xxxxx
+
+# Get latest AMI ID (useful for scripting)
+AMI_ID=$(python scripts/build-ami.py latest --region us-west-2)
 ```
+
+See [AMI Build Guide](docs/BUILD-AMI-GUIDE.md) for complete documentation.
 
 ### Run Individual Benchmarks
 
@@ -610,10 +611,16 @@ MIT License - see LICENSE file
 
 ## Resources
 
+### Documentation
+- [Quick Start Guide](docs/QUICKSTART.md) - Get started in 30 minutes
+- [AMI Build Guide](docs/BUILD-AMI-GUIDE.md) - Complete guide to building and managing Pulsar AMIs
+- [AMI Quick Reference](docs/AMI-QUICK-REFERENCE.md) - Cheat sheet for common AMI commands
+
+### External Resources
 - [Apache Pulsar Documentation](https://pulsar.apache.org/docs/)
 - [OpenMessaging Benchmark](https://openmessaging.cloud/docs/benchmarks/)
 - [Terraform AWS Provider](https://registry.terraform.io/providers/hashicorp/aws/latest/docs)
-- [Ansible Documentation](https://docs.ansible.com/)
+- [Packer Documentation](https://www.packer.io/docs)
 
 ## Support
 

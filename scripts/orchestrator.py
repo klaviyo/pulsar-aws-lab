@@ -2,19 +2,20 @@
 """
 Pulsar AWS Lab Orchestrator
 Main workflow controller for infrastructure, deployment, testing, and teardown
+
+REFACTORED: Removed Ansible dependency, now works with pre-baked AMIs
 """
 
 import argparse
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Tuple
 
 import boto3
 import yaml
@@ -33,7 +34,6 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
 TERRAFORM_DIR = PROJECT_ROOT / "terraform"
-ANSIBLE_DIR = PROJECT_ROOT / "ansible"
 RESULTS_DIR = Path.home() / ".pulsar-aws-lab"
 
 
@@ -43,10 +43,15 @@ class OrchestratorError(Exception):
 
 
 class Orchestrator:
-    """Main orchestrator class"""
+    """Main orchestrator class for AMI-based deployments"""
 
     def __init__(self, experiment_id: Optional[str] = None):
-        """Initialize orchestrator"""
+        """
+        Initialize orchestrator with experiment tracking.
+
+        Args:
+            experiment_id: Unique experiment identifier (auto-generated if not provided)
+        """
         self.experiment_id = experiment_id or f"exp-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         self.experiment_dir = RESULTS_DIR / self.experiment_id
         self.experiment_dir.mkdir(parents=True, exist_ok=True)
@@ -73,150 +78,91 @@ class Orchestrator:
         print(f"{'='*60}\n")
 
     def load_config(self, config_file: Path) -> Dict:
-        """Load YAML configuration file"""
+        """
+        Load YAML configuration file.
+
+        Args:
+            config_file: Path to YAML configuration
+
+        Returns:
+            Parsed configuration dictionary
+        """
         logger.info(f"Loading configuration from {config_file}")
         with open(config_file, 'r') as f:
             return yaml.safe_load(f)
 
-    def verify_ssm_plugin(self) -> None:
-        """Verify AWS Session Manager plugin is installed"""
-        logger.info("Verifying AWS Session Manager plugin installation...")
+    def validate_ami_exists(self, region: str, ami_name_pattern: str = "pulsar-base-*") -> Optional[str]:
+        """
+        Validate that the required AMI exists in the region.
+
+        Args:
+            region: AWS region to check
+            ami_name_pattern: AMI name pattern to search for
+
+        Returns:
+            AMI ID if found, None otherwise
+
+        Raises:
+            OrchestratorError: If AMI not found or validation fails
+        """
+        logger.info(f"Validating AMI availability in {region}...")
+        logger.info(f"Searching for AMI with pattern: {ami_name_pattern}")
+
+        ec2_client = boto3.client('ec2', region_name=region)
 
         try:
-            # Try using which to find the plugin first
-            which_result = subprocess.run(
-                ["which", "session-manager-plugin"],
-                capture_output=True,
-                text=True,
-                check=False
+            # Search for AMI by name pattern (owned by self)
+            response = ec2_client.describe_images(
+                Filters=[
+                    {'Name': 'name', 'Values': [ami_name_pattern]},
+                    {'Name': 'state', 'Values': ['available']}
+                ],
+                Owners=['self']  # Only search AMIs owned by this account
             )
 
-            if which_result.returncode == 0:
-                plugin_path = which_result.stdout.strip()
-                result = subprocess.run(
-                    [plugin_path],
-                    capture_output=True,
-                    text=True,
-                    check=False
+            images = response.get('Images', [])
+
+            if not images:
+                # CHANGED: Provide detailed error message with troubleshooting steps
+                error_msg = (
+                    f"No AMI found matching pattern '{ami_name_pattern}' in {region}.\n"
+                    f"Please ensure you have built the Pulsar base AMI using Packer.\n"
+                    f"Run: cd packer && packer build pulsar-base.pkr.hcl\n"
+                    f"Or check that the AMI exists in region {region}"
                 )
-                logger.info("AWS Session Manager plugin is installed")
-            else:
-                raise FileNotFoundError("session-manager-plugin not found in PATH")
-        except (FileNotFoundError, PermissionError) as e:
-            error_msg = (
-                "AWS Session Manager plugin not found or not executable!\n"
-                "Install it from: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html\n"
-                f"Error: {e}"
-            )
-            logger.error(error_msg)
-            raise OrchestratorError(error_msg)
+                logger.error(error_msg)
+                raise OrchestratorError(error_msg)
 
-    def verify_ssm_connectivity(
-        self,
-        region: str,
-        expected_instance_ids: Optional[List[str]] = None,
-        max_wait: int = 300,
-        check_interval: int = 10,
-    ) -> None:
-        """Verify EC2 instances are registered with SSM and wait for SSH readiness"""
-        logger.info("Verifying SSM connectivity to instances...")
+            # Sort by creation date (newest first)
+            images.sort(key=lambda x: x['CreationDate'], reverse=True)
+            latest_ami = images[0]
+            ami_id = latest_ami['ImageId']
+            ami_name = latest_ami['Name']
+            creation_date = latest_ami['CreationDate']
 
-        ssm_client = boto3.client('ssm', region_name=region)
-        start_time = time.time()
-        expected_set: Set[str] = set(expected_instance_ids or [])
-        expected_count = len(expected_set) if expected_set else None
+            logger.info(f"✓ Found AMI: {ami_name} ({ami_id})")
+            logger.info(f"  Created: {creation_date}")
+            logger.info(f"  State: {latest_ami['State']}")
 
-        try:
-            # Poll for instance registration
-            while time.time() - start_time < max_wait:
-                managed_instances: List[Dict] = []
-                next_token = None
+            if len(images) > 1:
+                logger.info(f"  Note: Found {len(images)} matching AMIs, using the latest")
 
-                while True:
-                    request_kwargs = {
-                        'Filters': [
-                            {'Key': 'tag:ExperimentID', 'Values': [self.experiment_id]}
-                        ],
-                        'MaxResults': 50,
-                    }
-                    if next_token:
-                        request_kwargs['NextToken'] = next_token
-
-                    response = ssm_client.describe_instance_information(**request_kwargs)
-                    managed_instances.extend(response.get('InstanceInformationList', []))
-                    next_token = response.get('NextToken')
-
-                    if not next_token:
-                        break
-
-                if managed_instances:
-                    online_instances = [i for i in managed_instances if i.get('PingStatus') == 'Online']
-                    found_ids = {instance['InstanceId'] for instance in managed_instances}
-                    missing_ids = expected_set - found_ids if expected_set else set()
-
-                    expected_msg = f" (expected {expected_count})" if expected_count is not None else ""
-                    logger.info(
-                        f"Found {len(online_instances)}/{len(managed_instances)} instances online with SSM{expected_msg}"
-                    )
-
-                    if missing_ids:
-                        logger.info(
-                            "Instances not yet registered with SSM: %s",
-                            ", ".join(sorted(missing_ids)),
-                        )
-
-                    if expected_set:
-                        if missing_ids:
-                            logger.info(
-                                f"Waiting for remaining {len(missing_ids)} instances to register, retrying in {check_interval}s..."
-                            )
-                        elif len(online_instances) < len(expected_set):
-                            logger.info(
-                                f"Waiting for all instances to report Online, retrying in {check_interval}s..."
-                            )
-                        else:
-                            logger.info("All instances online with SSM:")
-                            for instance in managed_instances:
-                                instance_id = instance['InstanceId']
-                                ping_status = instance.get('PingStatus', 'Unknown')
-                                logger.info(f"  {instance_id}: {ping_status}")
-
-                            logger.info(
-                                "Waiting 90 seconds for SSH daemon and Session Manager to be fully ready..."
-                            )
-                            time.sleep(90)
-                            logger.info("SSH readiness wait complete, proceeding to Ansible")
-                            return
-                    elif len(online_instances) == len(managed_instances):
-                        logger.info("All instances online with SSM:")
-                        for instance in managed_instances:
-                            instance_id = instance['InstanceId']
-                            ping_status = instance.get('PingStatus', 'Unknown')
-                            logger.info(f"  {instance_id}: {ping_status}")
-
-                        logger.info("Waiting 90 seconds for SSH daemon and Session Manager to be fully ready...")
-                        time.sleep(90)
-                        logger.info("SSH readiness wait complete, proceeding to Ansible")
-                        return
-                    else:
-                        logger.info(f"Waiting for all instances to come online, retrying in {check_interval}s...")
-                else:
-                    elapsed = int(time.time() - start_time)
-                    logger.info(f"No instances registered with SSM yet ({elapsed}s elapsed), retrying in {check_interval}s...")
-
-                time.sleep(check_interval)
-
-            raise OrchestratorError(
-                f"Timeout waiting for SSM connectivity after {max_wait}s. "
-                "Ensure instances have IAM role with SSMManagedInstanceCore policy."
-            )
+            return ami_id
 
         except Exception as e:
-            logger.error(f"SSM connectivity check failed: {e}")
-            raise
+            if isinstance(e, OrchestratorError):
+                raise
+            logger.error(f"AMI validation failed: {e}")
+            raise OrchestratorError(f"Failed to validate AMI: {e}") from e
 
     def run_terraform(self, action: str, var_file: Optional[Path] = None) -> None:
-        """Execute Terraform commands"""
+        """
+        Execute Terraform commands.
+
+        Args:
+            action: Terraform action (init, plan, apply, destroy)
+            var_file: Optional path to variables file
+        """
         logger.info(f"Running Terraform {action}")
 
         cmd = ["terraform", "-chdir=" + str(TERRAFORM_DIR), action]
@@ -246,7 +192,13 @@ class Orchestrator:
             raise OrchestratorError(f"Terraform {action} failed") from e
 
     def _generate_tfvars(self, config: Dict, output_file: Path) -> None:
-        """Generate Terraform variables file from YAML config"""
+        """
+        Generate Terraform variables file from YAML config.
+
+        Args:
+            config: Parsed infrastructure configuration
+            output_file: Path to output tfvars.json file
+        """
         tfvars = {
             "experiment_id": self.experiment_id,  # Use orchestrator's ID, not config file
             "experiment_name": config["experiment"]["name"],
@@ -291,7 +243,15 @@ class Orchestrator:
         logger.info(f"Generated Terraform variables: {output_file}")
 
     def _discover_instance_ids(self, region: str) -> List[str]:
-        """Return the list of EC2 instance IDs tagged with the experiment"""
+        """
+        Discover EC2 instance IDs tagged with the experiment.
+
+        Args:
+            region: AWS region
+
+        Returns:
+            List of instance IDs
+        """
         ec2_client = boto3.client('ec2', region_name=region)
 
         instance_ids: List[str] = []
@@ -324,104 +284,402 @@ class Orchestrator:
         return sorted(instance_ids)
 
     def get_terraform_output(self, output_name: str) -> str:
-        """Get Terraform output value"""
+        """
+        Get Terraform output value.
+
+        Args:
+            output_name: Name of Terraform output
+
+        Returns:
+            Output value as string
+        """
         cmd = ["terraform", "-chdir=" + str(TERRAFORM_DIR), "output", "-raw", output_name]
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         return result.stdout.strip()
 
-    def run_ansible(self, playbook: str, inventory: Optional[str] = None) -> None:
-        """Execute Ansible playbook"""
-        logger.info(f"Running Ansible playbook: {playbook}")
+    # REMOVED: run_ansible() method (lines 332-420)
+    # Ansible is no longer used - AMI contains pre-configured services
 
-        # Check if ansible-playbook is available (try pyenv first)
-        ansible_path = None
+    # REMOVED: verify_ssm_plugin() method
+    # REMOVED: verify_ssm_connectivity() method (lines 81-217)
+    # SSM connectivity checks replaced with wait_for_cluster()
 
-        # Try pyenv environments (using pyenv prefix)
-        try:
-            result = subprocess.run(
-                ["pyenv", "prefix", "pulsar"],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            if result.returncode == 0:
-                pyenv_prefix = result.stdout.strip()
-                candidate_path = Path(pyenv_prefix) / "bin" / "ansible-playbook"
-                if candidate_path.exists():
-                    ansible_path = str(candidate_path)
-        except FileNotFoundError:
-            pass
+    def wait_for_cluster(self, region: str, timeout_seconds: int = 600) -> None:
+        """
+        Wait for all cluster instances to be ready with exponential backoff.
 
-        # Fallback to system PATH
-        if not ansible_path:
-            ansible_path = shutil.which("ansible-playbook")
+        CHANGED: New method to replace Ansible deployment and SSM connectivity checks.
+        Uses AWS SSM RunCommand for health checks (no interactive sessions needed).
 
-        if not ansible_path:
+        Args:
+            region: AWS region
+            timeout_seconds: Maximum time to wait (default: 10 minutes)
+
+        Raises:
+            OrchestratorError: If cluster doesn't become ready within timeout
+        """
+        logger.info("="*60)
+        logger.info("WAITING FOR CLUSTER TO BE READY")
+        logger.info("="*60)
+
+        ssm_client = boto3.client('ssm', region_name=region)
+        ec2_client = boto3.client('ec2', region_name=region)
+
+        start_time = time.time()
+        backoff_seconds = 5  # Initial backoff
+        max_backoff = 30
+
+        # Step 1: Wait for all instances to be in 'running' state
+        logger.info("Step 1/3: Waiting for EC2 instances to reach 'running' state...")
+        instance_ids = []
+
+        while time.time() - start_time < timeout_seconds:
+            instance_ids = self._discover_instance_ids(region)
+
+            if not instance_ids:
+                logger.warning("No instances found yet, retrying...")
+                time.sleep(backoff_seconds)
+                continue
+
+            # Check instance states
+            response = ec2_client.describe_instances(InstanceIds=instance_ids)
+            all_running = True
+            instance_states = {}
+
+            for reservation in response['Reservations']:
+                for instance in reservation['Instances']:
+                    instance_id = instance['InstanceId']
+                    state = instance['State']['Name']
+                    instance_states[instance_id] = state
+                    if state != 'running':
+                        all_running = False
+
+            logger.info(f"Found {len(instance_ids)} instances:")
+            for instance_id, state in instance_states.items():
+                logger.info(f"  {instance_id}: {state}")
+
+            if all_running:
+                logger.info("✓ All instances are running")
+                break
+
+            elapsed = int(time.time() - start_time)
+            logger.info(f"Waiting for instances to start... ({elapsed}s elapsed)")
+            time.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 1.5, max_backoff)
+
+        if time.time() - start_time >= timeout_seconds:
             raise OrchestratorError(
-                "ansible-playbook not found in PATH or pyenv pulsar environment.\n"
-                "Please install Ansible in pyenv pulsar environment: pyenv activate pulsar && pip install ansible\n"
-                "Or install system-wide: pip install ansible"
+                f"Timeout waiting for instances to reach 'running' state after {timeout_seconds}s"
             )
 
-        # Get inventory from Terraform if not provided
-        if not inventory:
-            ansible_inventory = self.get_terraform_output("ansible_inventory")
-            inventory_file = self.experiment_dir / "inventory.ini"
-            with open(inventory_file, 'w') as f:
-                f.write(ansible_inventory)
-            inventory = str(inventory_file)
+        # Step 2: Wait for SSM agent registration
+        logger.info("\nStep 2/3: Waiting for SSM agent registration...")
+        backoff_seconds = 5
 
-            # Log inventory for debugging
-            logger.info("Generated Ansible inventory:")
-            for line in ansible_inventory.strip().split('\n'):
-                logger.info(f"  {line}")
+        while time.time() - start_time < timeout_seconds:
+            response = ssm_client.describe_instance_information(
+                Filters=[
+                    {'Key': 'tag:ExperimentID', 'Values': [self.experiment_id]}
+                ]
+            )
 
-        # Load Pulsar cluster config
-        pulsar_config = self.load_config(CONFIG_DIR / "pulsar-cluster.yaml")
+            managed_instances = response.get('InstanceInformationList', [])
+            online_instances = [i for i in managed_instances if i.get('PingStatus') == 'Online']
 
-        # Build ansible command
-        cmd = [
-            ansible_path,  # Use full path
-            "-i", inventory,
-            str(ANSIBLE_DIR / "playbooks" / playbook),
-            "-e", f"@{CONFIG_DIR / 'pulsar-cluster.yaml'}"
-        ]
+            logger.info(f"SSM status: {len(online_instances)}/{len(instance_ids)} instances online")
 
-        # Set ANSIBLE_CONFIG to use our ansible.cfg and roles path
-        env = os.environ.copy()
-        env['ANSIBLE_CONFIG'] = str(ANSIBLE_DIR / "ansible.cfg")
-        env['ANSIBLE_ROLES_PATH'] = f"{ANSIBLE_DIR / 'roles'}:~/.ansible/roles:/usr/share/ansible/roles:/etc/ansible/roles"
+            if len(online_instances) == len(instance_ids):
+                logger.info("✓ All instances registered with SSM")
+                for instance in managed_instances:
+                    logger.info(f"  {instance['InstanceId']}: {instance.get('PingStatus')}")
+                break
 
-        aws_region = None
-        if self.infrastructure_config:
-            aws_region = self.infrastructure_config.get('aws', {}).get('region')
+            elapsed = int(time.time() - start_time)
+            logger.info(f"Waiting for SSM registration... ({elapsed}s elapsed)")
+            time.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 1.5, max_backoff)
 
-        if aws_region:
-            env.setdefault('AWS_REGION', aws_region)
-            env.setdefault('AWS_DEFAULT_REGION', aws_region)
+        if time.time() - start_time >= timeout_seconds:
+            raise OrchestratorError(
+                f"Timeout waiting for SSM agent registration after {timeout_seconds}s"
+            )
 
-        # Override pulsar_version from infrastructure config if available
-        if self.infrastructure_config and 'pulsar_version' in self.infrastructure_config:
-            cmd.extend(["-e", f"pulsar_version={self.infrastructure_config['pulsar_version']}"])
-            logger.info(f"Using Pulsar version: {self.infrastructure_config['pulsar_version']}")
+        # Step 3: Wait for systemd services to be active
+        logger.info("\nStep 3/3: Waiting for Pulsar services to be active...")
 
+        # Get instance details by component
+        component_instances = self._get_instances_by_component(region)
+
+        # Define service checks by component
+        service_checks = {
+            'zookeeper': ['zookeeper.service'],
+            'bookkeeper': ['bookkeeper.service'],
+            'broker': ['pulsar-broker.service'],
+            'client': []  # No critical services on client nodes
+        }
+
+        backoff_seconds = 10
+
+        while time.time() - start_time < timeout_seconds:
+            all_services_ready = True
+
+            for component, instances in component_instances.items():
+                services = service_checks.get(component, [])
+
+                if not services:
+                    logger.info(f"Component '{component}': No service checks required")
+                    continue
+
+                for instance_id in instances:
+                    for service_name in services:
+                        # Check if service is active using SSM RunCommand
+                        is_active, status_msg = self._check_service_status(
+                            ssm_client, instance_id, service_name
+                        )
+
+                        if is_active:
+                            logger.info(f"✓ {instance_id} ({component}): {service_name} is active")
+                        else:
+                            logger.warning(
+                                f"✗ {instance_id} ({component}): {service_name} not active ({status_msg})"
+                            )
+                            all_services_ready = False
+
+            if all_services_ready:
+                logger.info("\n✓ All Pulsar services are active and ready!")
+                break
+
+            elapsed = int(time.time() - start_time)
+            logger.info(f"Waiting for services to start... ({elapsed}s elapsed)")
+            time.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 1.5, max_backoff)
+
+        if time.time() - start_time >= timeout_seconds:
+            raise OrchestratorError(
+                f"Timeout waiting for Pulsar services to be ready after {timeout_seconds}s"
+            )
+
+        # Step 4: Verify service health endpoints
+        logger.info("\nVerifying service health endpoints...")
+        self._verify_health_endpoints(region, component_instances)
+
+        total_time = int(time.time() - start_time)
+        logger.info("="*60)
+        logger.info(f"CLUSTER READY! (Total time: {total_time}s)")
+        logger.info("="*60)
+
+    def _get_instances_by_component(self, region: str) -> Dict[str, List[str]]:
+        """
+        Get instance IDs organized by component type.
+
+        Args:
+            region: AWS region
+
+        Returns:
+            Dictionary mapping component names to lists of instance IDs
+        """
+        ec2_client = boto3.client('ec2', region_name=region)
+
+        response = ec2_client.describe_instances(
+            Filters=[
+                {'Name': 'tag:ExperimentID', 'Values': [self.experiment_id]},
+                {'Name': 'instance-state-name', 'Values': ['running']}
+            ]
+        )
+
+        component_instances = {
+            'zookeeper': [],
+            'bookkeeper': [],
+            'broker': [],
+            'client': []
+        }
+
+        for reservation in response['Reservations']:
+            for instance in reservation['Instances']:
+                instance_id = instance['InstanceId']
+                # Find Component tag
+                component = None
+                for tag in instance.get('Tags', []):
+                    if tag['Key'] == 'Component':
+                        component = tag['Value'].lower()
+                        break
+
+                if component in component_instances:
+                    component_instances[component].append(instance_id)
+
+        return component_instances
+
+    def _check_service_status(
+        self,
+        ssm_client,
+        instance_id: str,
+        service_name: str,
+        timeout_seconds: int = 30
+    ) -> Tuple[bool, str]:
+        """
+        Check if a systemd service is active using SSM RunCommand.
+
+        CHANGED: Uses SSM RunCommand instead of interactive sessions for better reliability.
+
+        Args:
+            ssm_client: Boto3 SSM client
+            instance_id: EC2 instance ID
+            service_name: Systemd service name
+            timeout_seconds: Command timeout
+
+        Returns:
+            Tuple of (is_active: bool, status_message: str)
+        """
         try:
-            # Capture output for debugging
-            result = subprocess.run(cmd, check=True, env=env, capture_output=True, text=True)
-            logger.info("Ansible playbook completed successfully")
-            if result.stdout:
-                logger.debug(f"Ansible stdout: {result.stdout}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Ansible playbook failed with exit code {e.returncode}")
-            if e.stdout:
-                logger.error(f"Ansible stdout:\n{e.stdout}")
-            if e.stderr:
-                logger.error(f"Ansible stderr:\n{e.stderr}")
-            raise OrchestratorError("Ansible playbook failed") from e
+            # Send command to check service status
+            response = ssm_client.send_command(
+                InstanceIds=[instance_id],
+                DocumentName='AWS-RunShellScript',
+                Parameters={
+                    'commands': [f'systemctl is-active {service_name}']
+                },
+                TimeoutSeconds=timeout_seconds
+            )
+
+            command_id = response['Command']['CommandId']
+
+            # Wait for command to complete (short timeout for health checks)
+            max_attempts = 10  # 10 attempts * 2 seconds = 20 seconds
+            for attempt in range(max_attempts):
+                time.sleep(2)
+
+                try:
+                    invocation = ssm_client.get_command_invocation(
+                        CommandId=command_id,
+                        InstanceId=instance_id
+                    )
+
+                    status = invocation['Status']
+
+                    if status == 'Success':
+                        output = invocation.get('StandardOutputContent', '').strip()
+                        return (output == 'active', output)
+
+                    elif status in ['Failed', 'Cancelled', 'TimedOut']:
+                        error = invocation.get('StandardErrorContent', 'Unknown error')
+                        return (False, f"{status}: {error}")
+
+                    # Still running, wait for next attempt
+                    continue
+
+                except ssm_client.exceptions.InvocationDoesNotExist:
+                    # Command not yet registered
+                    continue
+
+            return (False, "Timeout waiting for status check")
+
+        except Exception as e:
+            logger.warning(f"Service status check failed for {instance_id}/{service_name}: {e}")
+            return (False, str(e))
+
+    def _verify_health_endpoints(
+        self,
+        region: str,
+        component_instances: Dict[str, List[str]]
+    ) -> None:
+        """
+        Verify service health endpoints are responding.
+
+        Args:
+            region: AWS region
+            component_instances: Dictionary mapping components to instance IDs
+        """
+        ssm_client = boto3.client('ssm', region_name=region)
+
+        # Define health checks by component
+        health_checks = {
+            'zookeeper': ('localhost', 2181, 'ruok'),  # ZooKeeper four-letter word
+            'bookkeeper': ('localhost', 3181, None),    # BookKeeper client port (TCP check)
+            'broker': ('localhost', 8080, '/admin/v2/brokers/health'),  # Broker HTTP endpoint
+        }
+
+        for component, instances in component_instances.items():
+            if component not in health_checks:
+                continue
+
+            host, port, path = health_checks[component]
+
+            for instance_id in instances:
+                logger.info(f"Checking health endpoint for {instance_id} ({component})...")
+
+                # Build health check command based on component
+                if component == 'zookeeper':
+                    # ZooKeeper: send "ruok" via netcat
+                    cmd = f"echo {path} | nc {host} {port}"
+                elif component == 'bookkeeper':
+                    # BookKeeper: simple TCP connection test
+                    cmd = f"timeout 5 nc -zv {host} {port} 2>&1"
+                else:
+                    # HTTP endpoints: use curl
+                    cmd = f"curl -f -s -o /dev/null -w '%{{http_code}}' http://{host}:{port}{path}"
+
+                try:
+                    response = ssm_client.send_command(
+                        InstanceIds=[instance_id],
+                        DocumentName='AWS-RunShellScript',
+                        Parameters={'commands': [cmd]},
+                        TimeoutSeconds=30
+                    )
+
+                    command_id = response['Command']['CommandId']
+
+                    # Wait for result
+                    for attempt in range(10):
+                        time.sleep(2)
+
+                        try:
+                            invocation = ssm_client.get_command_invocation(
+                                CommandId=command_id,
+                                InstanceId=instance_id
+                            )
+
+                            if invocation['Status'] == 'Success':
+                                output = invocation.get('StandardOutputContent', '').strip()
+
+                                # Validate response
+                                if component == 'zookeeper' and 'imok' in output:
+                                    logger.info(f"  ✓ ZooKeeper health check passed")
+                                elif component == 'bookkeeper' and 'succeeded' in output:
+                                    logger.info(f"  ✓ BookKeeper port check passed")
+                                elif component == 'broker' and output == '200':
+                                    logger.info(f"  ✓ Broker health endpoint returned 200")
+                                else:
+                                    logger.warning(f"  ✗ Unexpected health check response: {output}")
+
+                                break
+
+                            elif invocation['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
+                                logger.warning(
+                                    f"  ✗ Health check failed: {invocation.get('StandardErrorContent', 'Unknown')}"
+                                )
+                                break
+
+                        except ssm_client.exceptions.InvocationDoesNotExist:
+                            continue
+
+                except Exception as e:
+                    logger.warning(f"  ✗ Health check error: {e}")
 
     def setup(self, config_file: Path, runtime_tags: Optional[Dict[str, str]] = None) -> None:
-        """Setup infrastructure and deploy Pulsar cluster"""
-        logger.info("Starting setup phase")
+        """
+        Setup infrastructure using Terraform and wait for AMI-based cluster to be ready.
+
+        CHANGED: Removed Ansible deployment. Now only runs Terraform and waits for
+        AMI-based instances to initialize.
+
+        Args:
+            config_file: Path to infrastructure configuration YAML
+            runtime_tags: Optional additional tags to apply
+
+        Raises:
+            OrchestratorError: If setup fails
+        """
+        logger.info("Starting setup phase (AMI-based deployment)")
 
         try:
             # Load infrastructure config
@@ -434,8 +692,10 @@ class Orchestrator:
                 self.infrastructure_config.setdefault('experiment', {})['tags'] = merged_tags
                 logger.info(f"Merged tags: {merged_tags}")
 
-            # Verify Session Manager plugin is installed
-            self.verify_ssm_plugin()
+            # CHANGED: Validate AMI exists before Terraform
+            aws_region = self.infrastructure_config['aws']['region']
+            ami_id = self.validate_ami_exists(aws_region, ami_name_pattern="pulsar-base-*")
+            logger.info(f"Using AMI: {ami_id}")
 
             # Initialize Terraform
             self.run_terraform("init")
@@ -444,36 +704,16 @@ class Orchestrator:
             self.run_terraform("plan", config_file)
 
             # Apply infrastructure
+            logger.info("Provisioning infrastructure with Terraform...")
             self.run_terraform("apply", config_file)
 
-            # Wait for instances to be registered with SSM, then wait for SSH readiness
-            aws_region = self.infrastructure_config['aws']['region']
-            logger.info("Waiting for instances to register with SSM...")
+            # CHANGED: Wait for AMI-based cluster to be ready
+            # This replaces verify_ssm_plugin() + verify_ssm_connectivity() + run_ansible()
+            self.wait_for_cluster(aws_region, timeout_seconds=600)
 
-            expected_instance_ids = self._discover_instance_ids(aws_region)
-            if expected_instance_ids:
-                logger.info(
-                    "Expecting %d instances to register with SSM: %s",
-                    len(expected_instance_ids),
-                    ", ".join(expected_instance_ids),
-                )
-            else:
-                logger.warning(
-                    "Could not determine expected instance IDs from EC2 API. Proceeding with SSM checks without explicit expectations."
-                )
-
-            # Poll for SSM Online status, then wait 90s for SSH daemon
-            self.verify_ssm_connectivity(
-                aws_region,
-                expected_instance_ids=expected_instance_ids or None,
-                max_wait=300,
-                check_interval=10,
-            )
-
-            # Deploy Pulsar cluster via Ansible (using SSM)
-            self.run_ansible("deploy.yaml")
-
-            logger.info("Setup phase completed successfully")
+            logger.info("="*60)
+            logger.info("SETUP PHASE COMPLETED SUCCESSFULLY")
+            logger.info("="*60)
 
         except Exception as e:
             logger.error(f"Setup failed: {e}")
@@ -482,7 +722,12 @@ class Orchestrator:
             raise
 
     def emergency_cleanup(self, region: str = None) -> None:
-        """Emergency cleanup using tag-based resource discovery (doesn't need Terraform state)"""
+        """
+        Emergency cleanup using tag-based resource discovery (doesn't need Terraform state).
+
+        Args:
+            region: AWS region (auto-detected if not provided)
+        """
         logger.warning("=" * 60)
         logger.warning("EMERGENCY CLEANUP: Finding resources by ExperimentID tag")
         logger.warning("=" * 60)
@@ -511,7 +756,9 @@ class Orchestrator:
             logger.error("You may need to manually cleanup resources from AWS console")
 
     def teardown(self) -> None:
-        """Destroy infrastructure"""
+        """
+        Destroy infrastructure using Terraform.
+        """
         logger.info("Starting teardown phase")
 
         # Check if Terraform state exists
@@ -570,7 +817,12 @@ class Orchestrator:
         logger.info("Teardown phase completed")
 
     def run_tests(self, test_plan_file: Path) -> None:
-        """Execute test plan using AWS SSM SendCommand"""
+        """
+        Execute test plan using AWS SSM SendCommand.
+
+        Args:
+            test_plan_file: Path to test plan YAML file
+        """
         logger.info(f"Running tests from plan: {test_plan_file}")
 
         test_plan = self.load_config(test_plan_file)
@@ -582,7 +834,6 @@ class Orchestrator:
         client_instance_id = client_data['ids'][0]
 
         logger.info(f"Running tests on client instance: {client_instance_id}")
-        logger.info("Using SSH-over-SSM for file transfers")
 
         # Initialize AWS client
         ssm_client = boto3.client('ssm', region_name=aws_region)
@@ -605,10 +856,22 @@ class Orchestrator:
             with open(workload_file, 'w') as f:
                 yaml.dump(workload, f)
 
-            # Upload workload file to client instance via SCP
+            # Upload workload file to client instance
             remote_workload_path = f"/tmp/workload_{test_name}.yaml"
             logger.info(f"Uploading workload to client instance: {remote_workload_path}")
-            self._scp_upload(client_instance_id, str(workload_file), remote_workload_path, aws_region)
+
+            # Use SSM SendCommand to write file (avoiding SCP complexity)
+            with open(workload_file, 'r') as f:
+                workload_content = f.read()
+
+            upload_cmd = f"cat > {remote_workload_path} << 'EOF'\n{workload_content}\nEOF"
+
+            self._ssm_run_command(
+                ssm_client,
+                client_instance_id,
+                [upload_cmd],
+                f"Upload workload {test_name}"
+            )
 
             # Run benchmark
             result_file = f"/opt/benchmark-results/{test_name}.json"
@@ -626,10 +889,21 @@ class Orchestrator:
                 f"Run benchmark {test_name}"
             )
 
-            # Download results from client instance via SCP
+            # Download results using SSM
             local_result = results_dir / f"{test_name}.json"
             logger.info(f"Downloading results to: {local_result}")
-            self._scp_download(client_instance_id, result_file, str(local_result), aws_region)
+
+            download_invocation = self._ssm_run_command(
+                ssm_client,
+                client_instance_id,
+                [f"cat {result_file}"],
+                f"Download results {test_name}"
+            )
+
+            # Write results to local file
+            result_content = download_invocation.get('StandardOutputContent', '')
+            with open(local_result, 'w') as f:
+                f.write(result_content)
 
             logger.info(f"Test '{test_name}' completed. Results saved to {local_result}")
 
@@ -638,7 +912,16 @@ class Orchestrator:
         logger.info(f"{'='*60}\n")
 
     def _generate_workload(self, base: Dict, overrides: Dict) -> Dict:
-        """Generate OpenMessaging Benchmark workload from test plan"""
+        """
+        Generate OpenMessaging Benchmark workload from test plan.
+
+        Args:
+            base: Base workload configuration
+            overrides: Test-specific overrides
+
+        Returns:
+            Complete workload configuration
+        """
         workload = {
             'name': overrides.get('name', base['name']),
             'topics': overrides.get('workload_overrides', {}).get('topics', base['topics']),
@@ -658,9 +941,15 @@ class Orchestrator:
 
         return workload
 
-    def _ssm_run_command(self, ssm_client, instance_id: str, commands: List[str], description: str) -> Dict:
+    def _ssm_run_command(
+        self,
+        ssm_client,
+        instance_id: str,
+        commands: List[str],
+        description: str
+    ) -> Dict:
         """
-        Execute commands on an instance using SSM SendCommand and wait for completion
+        Execute commands on an instance using SSM SendCommand and wait for completion.
 
         Args:
             ssm_client: Boto3 SSM client
@@ -746,70 +1035,6 @@ class Orchestrator:
             logger.error(f"SSM command execution failed: {e}")
             raise OrchestratorError(f"SSM command failed: {e}") from e
 
-    def _scp_upload(self, instance_id: str, local_path: str, remote_path: str, region: str) -> None:
-        """
-        Upload a file to an instance using SCP over SSM tunnel
-
-        Args:
-            instance_id: EC2 instance ID
-            local_path: Local file path
-            remote_path: Remote file path on instance
-            region: AWS region
-        """
-        ssh_key = self.infrastructure_config['ssh']['key_name']
-        ssh_key_path = Path.home() / ".ssh" / f"{ssh_key}.pem"
-
-        # Use ProxyCommand to tunnel SSH through SSM
-        scp_cmd = [
-            "scp",
-            "-i", str(ssh_key_path),
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", f"ProxyCommand=aws ssm start-session --target {instance_id} --document-name AWS-StartSSHSession --parameters portNumber=%p --region {region}",
-            local_path,
-            f"ec2-user@{instance_id}:{remote_path}"
-        ]
-
-        try:
-            result = subprocess.run(scp_cmd, capture_output=True, text=True, check=True)
-            logger.info(f"File uploaded successfully: {local_path} -> {remote_path}")
-        except subprocess.CalledProcessError as e:
-            error_msg = f"SCP upload failed: {e.stderr}"
-            logger.error(error_msg)
-            raise OrchestratorError(error_msg) from e
-
-    def _scp_download(self, instance_id: str, remote_path: str, local_path: str, region: str) -> None:
-        """
-        Download a file from an instance using SCP over SSM tunnel
-
-        Args:
-            instance_id: EC2 instance ID
-            remote_path: Remote file path on instance
-            local_path: Local file path
-            region: AWS region
-        """
-        ssh_key = self.infrastructure_config['ssh']['key_name']
-        ssh_key_path = Path.home() / ".ssh" / f"{ssh_key}.pem"
-
-        # Use ProxyCommand to tunnel SSH through SSM
-        scp_cmd = [
-            "scp",
-            "-i", str(ssh_key_path),
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", f"ProxyCommand=aws ssm start-session --target {instance_id} --document-name AWS-StartSSHSession --parameters portNumber=%p --region {region}",
-            f"ec2-user@{instance_id}:{remote_path}",
-            local_path
-        ]
-
-        try:
-            result = subprocess.run(scp_cmd, capture_output=True, text=True, check=True)
-            logger.info(f"File downloaded successfully: {remote_path} -> {local_path}")
-        except subprocess.CalledProcessError as e:
-            error_msg = f"SCP download failed: {e.stderr}"
-            logger.error(error_msg)
-            raise OrchestratorError(error_msg) from e
-
     def generate_report(self) -> None:
         """Generate experiment report"""
         logger.info("Generating report")
@@ -818,8 +1043,25 @@ class Orchestrator:
         # This will be implemented with the reporting module
         logger.warning("Report generation not yet implemented")
 
-    def full_lifecycle(self, config_file: Path, test_plan_file: Path, runtime_tags: Optional[Dict[str, str]] = None) -> None:
-        """Execute full lifecycle: setup -> test -> report -> teardown"""
+    def full_lifecycle(
+        self,
+        config_file: Path,
+        test_plan_file: Path,
+        runtime_tags: Optional[Dict[str, str]] = None
+    ) -> None:
+        """
+        Execute full lifecycle: setup -> test -> report -> teardown.
+
+        CHANGED: Updated workflow to use AMI-based deployment (no Ansible).
+
+        Args:
+            config_file: Infrastructure configuration path
+            test_plan_file: Test plan configuration path
+            runtime_tags: Optional runtime tags to apply
+
+        Raises:
+            OrchestratorError: If any phase fails
+        """
         logger.info("Starting full lifecycle")
 
         try:
@@ -843,7 +1085,18 @@ class Orchestrator:
 
     @staticmethod
     def resolve_experiment_id(experiment_id: str) -> str:
-        """Resolve experiment ID, handling 'latest' shortcut"""
+        """
+        Resolve experiment ID, handling 'latest' shortcut.
+
+        Args:
+            experiment_id: Experiment ID or 'latest'
+
+        Returns:
+            Resolved experiment ID
+
+        Raises:
+            OrchestratorError: If 'latest' link doesn't exist
+        """
         if experiment_id == "latest":
             latest_link = RESULTS_DIR / "latest"
             if not latest_link.exists():
@@ -853,7 +1106,7 @@ class Orchestrator:
 
     @staticmethod
     def list_experiments() -> None:
-        """List all experiments"""
+        """List all experiments with timestamps"""
         if not RESULTS_DIR.exists():
             print("No experiments found.")
             return
@@ -888,7 +1141,7 @@ class Orchestrator:
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(description="Pulsar AWS Lab Orchestrator")
+    parser = argparse.ArgumentParser(description="Pulsar AWS Lab Orchestrator (AMI-based)")
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
     # Setup command

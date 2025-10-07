@@ -55,41 +55,17 @@ output "client_instances" {
   }
 }
 
-# Ansible inventory format (SSM-based)
-output "ansible_inventory" {
-  description = "Ansible inventory in INI format with SSM connection"
-  value       = <<-EOT
-    [zookeeper]
-    %{for idx, id in module.compute.zookeeper_instance_ids~}
-    zk-${idx + 1} ansible_host=${id} zk_id=${idx + 1} private_ip=${module.compute.zookeeper_private_ips[idx]}
-    %{endfor~}
-
-    [bookkeeper]
-    %{for idx, id in module.compute.bookkeeper_instance_ids~}
-    bk-${idx + 1} ansible_host=${id} bk_id=${idx + 1} private_ip=${module.compute.bookkeeper_private_ips[idx]}
-    %{endfor~}
-
-    [broker]
-    %{for idx, id in module.compute.broker_instance_ids~}
-    broker-${idx + 1} ansible_host=${id} private_ip=${module.compute.broker_private_ips[idx]}
-    %{endfor~}
-
-    [client]
-    %{for idx, id in module.compute.client_instance_ids~}
-    client-${idx + 1} ansible_host=${id}
-    %{endfor~}
-
-    [pulsar:children]
-    zookeeper
-    bookkeeper
-    broker
-
-    [all:vars]
-    ansible_connection=amazon.aws.aws_ssm
-    ansible_user=ec2-user
-    ansible_python_interpreter=/usr/bin/python3
-    ansible_aws_ssm_region=${var.aws_region}
-  EOT
+# User data debugging output (shows example of rendered template)
+output "user_data_test" {
+  description = "Example rendered user data for debugging (ZooKeeper instance 1)"
+  value = length(module.compute.zookeeper_instance_ids) > 0 ? templatefile("${path.module}/user-data/zookeeper.sh.tpl", {
+    cluster_name   = var.cluster_name
+    pulsar_version = var.pulsar_version
+    zk_heap_size   = var.zookeeper_heap_size
+    zk_id          = 1
+    zk_servers     = join(",", [for i in range(var.zookeeper_count) : "10.0.1.${10 + i}:2888:3888"])
+  }) : "No ZooKeeper instances"
+  sensitive = false
 }
 
 # Connection info

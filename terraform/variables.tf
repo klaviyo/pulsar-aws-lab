@@ -64,9 +64,27 @@ variable "ssh_key_name" {
 }
 
 variable "ami_id" {
-  description = "AMI ID (uses latest Amazon Linux 2 if not specified)"
+  description = "AMI ID override (uses AMI filter if not specified)"
   type        = string
   default     = null
+}
+
+variable "ami_name_filter" {
+  description = "AMI name filter for finding pre-built Pulsar AMI"
+  type        = string
+  default     = "pulsar-base-3.0.0-*"
+}
+
+variable "pulsar_version" {
+  description = "Apache Pulsar version"
+  type        = string
+  default     = "3.0.0"
+}
+
+variable "cluster_name" {
+  description = "Pulsar cluster name"
+  type        = string
+  default     = "pulsar-aws-lab"
 }
 
 # ZooKeeper Configuration
@@ -80,6 +98,12 @@ variable "zookeeper_instance_type" {
   description = "ZooKeeper instance type"
   type        = string
   default     = "t3.micro"
+}
+
+variable "zookeeper_heap_size" {
+  description = "ZooKeeper JVM heap size"
+  type        = string
+  default     = "512M"
 }
 
 # BookKeeper Configuration
@@ -119,6 +143,18 @@ variable "bookkeeper_throughput" {
   default     = 125
 }
 
+variable "bookkeeper_heap_size" {
+  description = "BookKeeper JVM heap size"
+  type        = string
+  default     = "768M"
+}
+
+variable "bookkeeper_direct_memory_size" {
+  description = "BookKeeper JVM direct memory size"
+  type        = string
+  default     = "512M"
+}
+
 # Broker Configuration
 variable "broker_count" {
   description = "Number of Broker instances"
@@ -130,6 +166,18 @@ variable "broker_instance_type" {
   description = "Broker instance type"
   type        = string
   default     = "t3.small"
+}
+
+variable "broker_heap_size" {
+  description = "Broker JVM heap size"
+  type        = string
+  default     = "1G"
+}
+
+variable "broker_direct_memory_size" {
+  description = "Broker JVM direct memory size"
+  type        = string
+  default     = "512M"
 }
 
 # Client Configuration
