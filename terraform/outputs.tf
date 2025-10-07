@@ -61,22 +61,22 @@ output "ansible_inventory" {
   value       = <<-EOT
     [zookeeper]
     %{for idx, id in module.compute.zookeeper_instance_ids~}
-    zk-${idx + 1} ansible_host=${id} ansible_user=ec2-user zk_id=${idx + 1} private_ip=${module.compute.zookeeper_private_ips[idx]}
+    zk-${idx + 1} ansible_host=${id} zk_id=${idx + 1} private_ip=${module.compute.zookeeper_private_ips[idx]}
     %{endfor~}
 
     [bookkeeper]
     %{for idx, id in module.compute.bookkeeper_instance_ids~}
-    bk-${idx + 1} ansible_host=${id} ansible_user=ec2-user bk_id=${idx + 1} private_ip=${module.compute.bookkeeper_private_ips[idx]}
+    bk-${idx + 1} ansible_host=${id} bk_id=${idx + 1} private_ip=${module.compute.bookkeeper_private_ips[idx]}
     %{endfor~}
 
     [broker]
     %{for idx, id in module.compute.broker_instance_ids~}
-    broker-${idx + 1} ansible_host=${id} ansible_user=ec2-user private_ip=${module.compute.broker_private_ips[idx]}
+    broker-${idx + 1} ansible_host=${id} private_ip=${module.compute.broker_private_ips[idx]}
     %{endfor~}
 
     [client]
     %{for idx, id in module.compute.client_instance_ids~}
-    client-${idx + 1} ansible_host=${id} ansible_user=ec2-user
+    client-${idx + 1} ansible_host=${id}
     %{endfor~}
 
     [pulsar:children]
@@ -85,8 +85,10 @@ output "ansible_inventory" {
     broker
 
     [all:vars]
-    ansible_connection=ssh
-    ansible_ssh_private_key_file=~/.ssh/${var.ssh_key_name}.pem
+    ansible_connection=amazon.aws.aws_ssm
+    ansible_user=ec2-user
+    ansible_python_interpreter=/usr/bin/python3
+    ansible_aws_ssm_region=${var.aws_region}
   EOT
 }
 

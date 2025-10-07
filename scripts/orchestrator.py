@@ -14,7 +14,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import boto3
 import yaml
@@ -111,37 +111,89 @@ class Orchestrator:
             logger.error(error_msg)
             raise OrchestratorError(error_msg)
 
-    def verify_ssm_connectivity(self, region: str, max_wait: int = 300, check_interval: int = 10) -> None:
+    def verify_ssm_connectivity(
+        self,
+        region: str,
+        expected_instance_ids: Optional[List[str]] = None,
+        max_wait: int = 300,
+        check_interval: int = 10,
+    ) -> None:
         """Verify EC2 instances are registered with SSM and wait for SSH readiness"""
         logger.info("Verifying SSM connectivity to instances...")
 
         ssm_client = boto3.client('ssm', region_name=region)
         start_time = time.time()
+        expected_set: Set[str] = set(expected_instance_ids or [])
+        expected_count = len(expected_set) if expected_set else None
 
         try:
             # Poll for instance registration
             while time.time() - start_time < max_wait:
-                response = ssm_client.describe_instance_information(
-                    Filters=[
-                        {'Key': 'tag:ExperimentID', 'Values': [self.experiment_id]}
-                    ]
-                )
+                managed_instances: List[Dict] = []
+                next_token = None
 
-                managed_instances = response.get('InstanceInformationList', [])
+                while True:
+                    request_kwargs = {
+                        'Filters': [
+                            {'Key': 'tag:ExperimentID', 'Values': [self.experiment_id]}
+                        ],
+                        'MaxResults': 50,
+                    }
+                    if next_token:
+                        request_kwargs['NextToken'] = next_token
+
+                    response = ssm_client.describe_instance_information(**request_kwargs)
+                    managed_instances.extend(response.get('InstanceInformationList', []))
+                    next_token = response.get('NextToken')
+
+                    if not next_token:
+                        break
 
                 if managed_instances:
                     online_instances = [i for i in managed_instances if i.get('PingStatus') == 'Online']
-                    logger.info(f"Found {len(online_instances)}/{len(managed_instances)} instances online with SSM")
+                    found_ids = {instance['InstanceId'] for instance in managed_instances}
+                    missing_ids = expected_set - found_ids if expected_set else set()
 
-                    if len(online_instances) == len(managed_instances):
-                        # All instances online - list them
+                    expected_msg = f" (expected {expected_count})" if expected_count is not None else ""
+                    logger.info(
+                        f"Found {len(online_instances)}/{len(managed_instances)} instances online with SSM{expected_msg}"
+                    )
+
+                    if missing_ids:
+                        logger.info(
+                            "Instances not yet registered with SSM: %s",
+                            ", ".join(sorted(missing_ids)),
+                        )
+
+                    if expected_set:
+                        if missing_ids:
+                            logger.info(
+                                f"Waiting for remaining {len(missing_ids)} instances to register, retrying in {check_interval}s..."
+                            )
+                        elif len(online_instances) < len(expected_set):
+                            logger.info(
+                                f"Waiting for all instances to report Online, retrying in {check_interval}s..."
+                            )
+                        else:
+                            logger.info("All instances online with SSM:")
+                            for instance in managed_instances:
+                                instance_id = instance['InstanceId']
+                                ping_status = instance.get('PingStatus', 'Unknown')
+                                logger.info(f"  {instance_id}: {ping_status}")
+
+                            logger.info(
+                                "Waiting 90 seconds for SSH daemon and Session Manager to be fully ready..."
+                            )
+                            time.sleep(90)
+                            logger.info("SSH readiness wait complete, proceeding to Ansible")
+                            return
+                    elif len(online_instances) == len(managed_instances):
                         logger.info("All instances online with SSM:")
                         for instance in managed_instances:
                             instance_id = instance['InstanceId']
                             ping_status = instance.get('PingStatus', 'Unknown')
                             logger.info(f"  {instance_id}: {ping_status}")
 
-                        # Fixed delay for SSH daemon initialization (empirically determined for AL2023)
                         logger.info("Waiting 90 seconds for SSH daemon and Session Manager to be fully ready...")
                         time.sleep(90)
                         logger.info("SSH readiness wait complete, proceeding to Ansible")
@@ -238,6 +290,39 @@ class Orchestrator:
 
         logger.info(f"Generated Terraform variables: {output_file}")
 
+    def _discover_instance_ids(self, region: str) -> List[str]:
+        """Return the list of EC2 instance IDs tagged with the experiment"""
+        ec2_client = boto3.client('ec2', region_name=region)
+
+        instance_ids: List[str] = []
+        next_token = None
+
+        try:
+            while True:
+                request_kwargs = {
+                    'Filters': [
+                        {'Name': 'tag:ExperimentID', 'Values': [self.experiment_id]},
+                        {'Name': 'instance-state-name', 'Values': ['pending', 'running']}
+                    ]
+                }
+                if next_token:
+                    request_kwargs['NextToken'] = next_token
+
+                response = ec2_client.describe_instances(**request_kwargs)
+
+                for reservation in response.get('Reservations', []):
+                    for instance in reservation.get('Instances', []):
+                        instance_ids.append(instance['InstanceId'])
+
+                next_token = response.get('NextToken')
+                if not next_token:
+                    break
+
+        except Exception as exc:
+            logger.warning(f"Failed to discover instance IDs via EC2 API: {exc}")
+
+        return sorted(instance_ids)
+
     def get_terraform_output(self, output_name: str) -> str:
         """Get Terraform output value"""
         cmd = ["terraform", "-chdir=" + str(TERRAFORM_DIR), "output", "-raw", output_name]
@@ -307,6 +392,14 @@ class Orchestrator:
         env['ANSIBLE_CONFIG'] = str(ANSIBLE_DIR / "ansible.cfg")
         env['ANSIBLE_ROLES_PATH'] = f"{ANSIBLE_DIR / 'roles'}:~/.ansible/roles:/usr/share/ansible/roles:/etc/ansible/roles"
 
+        aws_region = None
+        if self.infrastructure_config:
+            aws_region = self.infrastructure_config.get('aws', {}).get('region')
+
+        if aws_region:
+            env.setdefault('AWS_REGION', aws_region)
+            env.setdefault('AWS_DEFAULT_REGION', aws_region)
+
         # Override pulsar_version from infrastructure config if available
         if self.infrastructure_config and 'pulsar_version' in self.infrastructure_config:
             cmd.extend(["-e", f"pulsar_version={self.infrastructure_config['pulsar_version']}"])
@@ -357,8 +450,25 @@ class Orchestrator:
             aws_region = self.infrastructure_config['aws']['region']
             logger.info("Waiting for instances to register with SSM...")
 
+            expected_instance_ids = self._discover_instance_ids(aws_region)
+            if expected_instance_ids:
+                logger.info(
+                    "Expecting %d instances to register with SSM: %s",
+                    len(expected_instance_ids),
+                    ", ".join(expected_instance_ids),
+                )
+            else:
+                logger.warning(
+                    "Could not determine expected instance IDs from EC2 API. Proceeding with SSM checks without explicit expectations."
+                )
+
             # Poll for SSM Online status, then wait 90s for SSH daemon
-            self.verify_ssm_connectivity(aws_region, max_wait=300, check_interval=10)
+            self.verify_ssm_connectivity(
+                aws_region,
+                expected_instance_ids=expected_instance_ids or None,
+                max_wait=300,
+                check_interval=10,
+            )
 
             # Deploy Pulsar cluster via Ansible (using SSM)
             self.run_ansible("deploy.yaml")
