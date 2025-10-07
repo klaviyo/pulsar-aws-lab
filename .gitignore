@@ -38,10 +38,6 @@ terraform/*.tfvars.json
 *.tfstate
 *.tfstate.backup
 
-# Ansible
-ansible/*.retry
-ansible/inventory/*.ini
-
 # Experiment data (stored in home directory)
 # But keep the structure
 !.pulsar-aws-lab/.gitkeep

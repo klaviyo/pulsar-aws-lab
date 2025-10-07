@@ -1,8 +1,0 @@
-#!/bin/bash
-# ZooKeeper Environment Configuration
-
-PULSAR_MEM="-Xms{{ zookeeper_heap_size }} -Xmx{{ zookeeper_heap_size }}"
-PULSAR_GC="-XX:+UseG1GC -XX:MaxGCPauseMillis=10"
-PULSAR_EXTRA_OPTS="-Dzookeeper.forceSync=yes"
-
-export PULSAR_MEM PULSAR_GC PULSAR_EXTRA_OPTS

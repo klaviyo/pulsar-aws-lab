@@ -2,8 +2,6 @@
 """
 Pulsar AWS Lab Orchestrator
 Main workflow controller for infrastructure, deployment, testing, and teardown
-
-REFACTORED: Removed Ansible dependency, now works with pre-baked AMIs
 """
 
 import argparse
@@ -297,19 +295,10 @@ class Orchestrator:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         return result.stdout.strip()
 
-    # REMOVED: run_ansible() method (lines 332-420)
-    # Ansible is no longer used - AMI contains pre-configured services
-
-    # REMOVED: verify_ssm_plugin() method
-    # REMOVED: verify_ssm_connectivity() method (lines 81-217)
-    # SSM connectivity checks replaced with wait_for_cluster()
-
     def wait_for_cluster(self, region: str, timeout_seconds: int = 600) -> None:
         """
         Wait for all cluster instances to be ready with exponential backoff.
-
-        CHANGED: New method to replace Ansible deployment and SSM connectivity checks.
-        Uses AWS SSM RunCommand for health checks (no interactive sessions needed).
+        Uses AWS SSM RunCommand for health checks.
 
         Args:
             region: AWS region
@@ -519,8 +508,6 @@ class Orchestrator:
         """
         Check if a systemd service is active using SSM RunCommand.
 
-        CHANGED: Uses SSM RunCommand instead of interactive sessions for better reliability.
-
         Args:
             ssm_client: Boto3 SSM client
             instance_id: EC2 instance ID
@@ -669,9 +656,6 @@ class Orchestrator:
         """
         Setup infrastructure using Terraform and wait for AMI-based cluster to be ready.
 
-        CHANGED: Removed Ansible deployment. Now only runs Terraform and waits for
-        AMI-based instances to initialize.
-
         Args:
             config_file: Path to infrastructure configuration YAML
             runtime_tags: Optional additional tags to apply
@@ -707,8 +691,7 @@ class Orchestrator:
             logger.info("Provisioning infrastructure with Terraform...")
             self.run_terraform("apply", config_file)
 
-            # CHANGED: Wait for AMI-based cluster to be ready
-            # This replaces verify_ssm_plugin() + verify_ssm_connectivity() + run_ansible()
+            # Wait for AMI-based cluster to be ready
             self.wait_for_cluster(aws_region, timeout_seconds=600)
 
             logger.info("="*60)
@@ -1051,8 +1034,6 @@ class Orchestrator:
     ) -> None:
         """
         Execute full lifecycle: setup -> test -> report -> teardown.
-
-        CHANGED: Updated workflow to use AMI-based deployment (no Ansible).
 
         Args:
             config_file: Infrastructure configuration path
