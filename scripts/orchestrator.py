@@ -647,160 +647,6 @@ spec:
 
         logger.info(f"✓ Pod logs collected in: {logs_dir}")
 
-    def run_terraform(self, action: str, var_file: Optional[Path] = None) -> None:
-        """
-        Execute Terraform commands.
-
-        Args:
-            action: Terraform action (init, plan, apply, destroy)
-            var_file: Optional path to variables file
-        """
-        logger.info(f"Running Terraform {action}")
-
-        cmd = ["terraform", "-chdir=" + str(TERRAFORM_DIR), action]
-
-        if action in ["plan", "apply", "destroy"]:
-            if var_file and var_file.exists():
-                if var_file.suffix == '.json':
-                    cmd.extend(["-var-file", str(var_file)])
-                else:
-                    config = self.load_config(var_file)
-                    tfvars_file = self.experiment_dir / "terraform.tfvars.json"
-                    self._generate_tfvars(config, tfvars_file)
-                    cmd.extend(["-var-file", str(tfvars_file)])
-
-            if action in ["apply", "destroy"]:
-                cmd.append("-auto-approve")
-
-        try:
-            result = subprocess.run(cmd, check=True)
-            logger.info(f"Terraform {action} completed successfully")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Terraform {action} failed with exit code {e.returncode}")
-            raise OrchestratorError(f"Terraform {action} failed") from e
-
-    def _generate_tfvars(self, config: Dict, output_file: Path) -> None:
-        """
-        Generate Terraform variables file from configuration.
-
-        Args:
-            config: Parsed infrastructure configuration
-            output_file: Path to output tfvars.json file
-        """
-        tfvars = {
-            "experiment_id": self.experiment_id,
-            "experiment_name": config["experiment"]["name"],
-            "aws_region": config["aws"]["region"],
-            "vpc_cidr": config["network"]["vpc_cidr"],
-            "additional_tags": config["experiment"].get("tags", {}),
-        }
-
-        # EKS-specific variables
-        if "availability_zones" in config["aws"]:
-            tfvars["availability_zones"] = config["aws"]["availability_zones"]
-
-        if "public_subnet_cidrs" in config["network"]:
-            tfvars["public_subnet_cidrs"] = config["network"]["public_subnet_cidrs"]
-
-        if "private_subnet_cidrs" in config["network"]:
-            tfvars["private_subnet_cidrs"] = config["network"]["private_subnet_cidrs"]
-
-        if "eks" in config:
-            tfvars["cluster_version"] = config["eks"].get("cluster_version", "1.31")
-
-            if "node_group" in config["eks"]:
-                ng = config["eks"]["node_group"]
-                tfvars["node_instance_types"] = ng.get("instance_types", ["t3.medium"])
-                tfvars["node_disk_size"] = ng.get("disk_size", 50)
-                tfvars["node_group_desired_size"] = ng.get("desired_size", 3)
-                tfvars["node_group_min_size"] = ng.get("min_size", 1)
-                tfvars["node_group_max_size"] = ng.get("max_size", 5)
-
-        with open(output_file, 'w') as f:
-            json.dump(tfvars, f, indent=2)
-
-        logger.info(f"Generated Terraform variables: {output_file}")
-
-    def get_terraform_output(self, output_name: str) -> str:
-        """Get Terraform output value"""
-        cmd = ["terraform", "-chdir=" + str(TERRAFORM_DIR), "output", "-raw", output_name]
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        return result.stdout.strip()
-
-    def deploy_eks_cluster(
-        self,
-        config_file: Path,
-        runtime_tags: Optional[Dict[str, str]] = None
-    ) -> None:
-        """
-        Deploy EKS cluster using Terraform (one-time setup).
-
-        Args:
-            config_file: Path to infrastructure configuration
-            runtime_tags: Optional runtime tags
-
-        Raises:
-            OrchestratorError: If deployment fails
-        """
-        logger.info("="*60)
-        logger.info("DEPLOYING EKS CLUSTER")
-        logger.info("="*60)
-
-        try:
-            # Load config
-            self.infrastructure_config = self.load_config(config_file)
-
-            # Merge tags
-            if runtime_tags:
-                config_tags = self.infrastructure_config.get('experiment', {}).get('tags', {})
-                merged_tags = {**config_tags, **runtime_tags}
-                self.infrastructure_config.setdefault('experiment', {})['tags'] = merged_tags
-
-            # Extract cluster info
-            region = self.infrastructure_config['aws']['region']
-            self.cluster_name = f"pulsar-eks-{self.experiment_id}"
-
-            # Run Terraform
-            self.run_terraform("init")
-            self.run_terraform("plan", config_file)
-            logger.info("Creating EKS cluster (this may take 15-20 minutes)...")
-            self.run_terraform("apply", config_file)
-
-            # Setup kubectl
-            self.setup_kubectl_context(region, self.cluster_name)
-
-            logger.info("="*60)
-            logger.info("EKS CLUSTER DEPLOYED SUCCESSFULLY")
-            logger.info(f"Cluster: {self.cluster_name}")
-            logger.info("="*60)
-
-        except Exception as e:
-            logger.error(f"EKS cluster deployment failed: {e}")
-            raise
-
-    def destroy_eks_cluster(self) -> None:
-        """Destroy EKS cluster using Terraform"""
-        logger.info("="*60)
-        logger.info("DESTROYING EKS CLUSTER")
-        logger.info("="*60)
-
-        # Check for state file
-        state_file = TERRAFORM_DIR / "terraform.tfstate"
-        if not state_file.exists():
-            logger.error("Terraform state file not found!")
-            logger.error(f"Expected: {state_file}")
-            return
-
-        # Find tfvars file
-        tfvars_file = self.experiment_dir / "terraform.tfvars.json"
-        if not tfvars_file.exists():
-            logger.warning("tfvars file not found, proceeding without it...")
-
-        # Destroy
-        self.run_terraform("destroy", tfvars_file if tfvars_file.exists() else None)
-
-        logger.info("✓ EKS cluster destroyed")
-
     def deploy_pulsar(
         self,
         config_file: Path,
@@ -808,6 +654,10 @@ spec:
     ) -> None:
         """
         Deploy Pulsar to EKS using Helm.
+
+        Prerequisites:
+            - EKS cluster must already exist (managed externally)
+            - kubectl must be configured for the target cluster
 
         Args:
             config_file: Infrastructure configuration
@@ -821,15 +671,24 @@ spec:
         logger.info("="*60)
 
         try:
+            # Verify kubectl is configured
+            result = self.run_command(
+                ["kubectl", "cluster-info"],
+                "Verify kubectl configuration",
+                capture_output=True,
+                check=False
+            )
+
+            if result.returncode != 0:
+                raise OrchestratorError(
+                    "kubectl is not configured for a cluster. "
+                    "Please ensure your EKS cluster exists and kubectl is configured:\n"
+                    "  aws eks update-kubeconfig --region <region> --name <cluster-name>"
+                )
+
             # Load config if not already loaded
             if not self.infrastructure_config:
                 self.infrastructure_config = self.load_config(config_file)
-
-            # Get cluster name and setup kubectl if needed
-            if not self.cluster_name:
-                region = self.infrastructure_config['aws']['region']
-                self.cluster_name = self.get_terraform_output("eks_cluster_name")
-                self.setup_kubectl_context(region, self.cluster_name)
 
             # Deploy via Helm
             self.helm_deploy(values_overrides)
@@ -1147,18 +1006,13 @@ spec:
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(description="Pulsar AWS Lab Orchestrator (EKS/Helm)")
+    parser = argparse.ArgumentParser(
+        description="Pulsar AWS Lab Orchestrator (EKS/Helm)\n\n"
+                    "NOTE: EKS cluster management is handled externally. "
+                    "Ensure your kubectl is configured for the target EKS cluster before running commands.",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
-
-    # Cluster create command
-    cluster_create_parser = subparsers.add_parser("cluster-create", help="Create EKS cluster (one-time)")
-    cluster_create_parser.add_argument("--config", type=Path, default=CONFIG_DIR / "infrastructure.yaml", help="Infrastructure config")
-    cluster_create_parser.add_argument("--experiment-id", help="Experiment ID")
-    cluster_create_parser.add_argument("--tag", action="append", metavar="KEY=VALUE", help="Additional tags")
-
-    # Cluster destroy command
-    cluster_destroy_parser = subparsers.add_parser("cluster-destroy", help="Destroy EKS cluster")
-    cluster_destroy_parser.add_argument("--experiment-id", required=True, help="Experiment ID")
 
     # Deploy command
     deploy_parser = subparsers.add_parser("deploy", help="Deploy Pulsar via Helm")
@@ -1202,7 +1056,7 @@ def main():
 
         # Resolve experiment ID
         experiment_id = getattr(args, "experiment_id", None)
-        if experiment_id and args.command in ["cluster-destroy", "undeploy", "run", "report"]:
+        if experiment_id and args.command in ["undeploy", "run", "report"]:
             experiment_id = Orchestrator.resolve_experiment_id(experiment_id)
 
         orchestrator = Orchestrator(experiment_id)
@@ -1217,11 +1071,7 @@ def main():
                 runtime_tags[key] = value
 
         # Execute command
-        if args.command == "cluster-create":
-            orchestrator.deploy_eks_cluster(args.config, runtime_tags=runtime_tags)
-        elif args.command == "cluster-destroy":
-            orchestrator.destroy_eks_cluster()
-        elif args.command == "deploy":
+        if args.command == "deploy":
             orchestrator.deploy_pulsar(args.config)
         elif args.command == "undeploy":
             orchestrator.undeploy_pulsar()

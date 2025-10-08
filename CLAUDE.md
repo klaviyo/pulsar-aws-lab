@@ -116,7 +116,7 @@ aws configure
 # Or export credentials
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
-export AWS_DEFAULT_REGION=us-west-2
+export AWS_DEFAULT_REGION=us-east-1
 ```
 
 ### Docker Image Management
@@ -127,36 +127,29 @@ cd docker/omb
 docker build -t pulsar-omb:latest .
 
 # Tag for ECR (if using AWS container registry)
-docker tag pulsar-omb:latest <account-id>.dkr.ecr.us-west-2.amazonaws.com/pulsar-omb:latest
+docker tag pulsar-omb:latest <account-id>.dkr.ecr.us-east-1.amazonaws.com/pulsar-omb:latest
 
 # Login to ECR
-aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-west-2.amazonaws.com
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-east-1.amazonaws.com
 
 # Push to ECR
-docker push <account-id>.dkr.ecr.us-west-2.amazonaws.com/pulsar-omb:latest
+docker push <account-id>.dkr.ecr.us-east-1.amazonaws.com/pulsar-omb:latest
 
 # For local development (minikube), load image directly
 minikube image load pulsar-omb:latest
 ```
 
-### EKS Cluster Management
+### kubectl Configuration
+
+**Prerequisites**: EKS cluster must be managed externally (not part of this repository).
 
 ```bash
-# Create EKS cluster (one-time setup)
-cd terraform
-terraform init
-terraform plan -var-file=../config/infrastructure.yaml
-terraform apply -var-file=../config/infrastructure.yaml
-
-# Configure kubectl to use EKS cluster
-aws eks update-kubeconfig --region us-west-2 --name pulsar-eks-<experiment-id>
+# Configure kubectl to connect to existing EKS cluster
+aws eks update-kubeconfig --region <region> --name <cluster-name>
 
 # Verify cluster access
 kubectl get nodes
 kubectl cluster-info
-
-# Destroy EKS cluster (cleanup)
-terraform destroy -var-file=../config/infrastructure.yaml
 ```
 
 ### Helm Operations
@@ -206,13 +199,11 @@ python scripts/orchestrator.py full --test-plan config/test-plans/poc.yaml --tag
 # List experiments
 python scripts/orchestrator.py list
 
-# Individual steps
-python scripts/orchestrator.py setup --config config/infrastructure.yaml  # Create EKS cluster
-python scripts/orchestrator.py deploy --experiment-id latest              # Helm install Pulsar
+# Individual steps (assumes EKS cluster already exists)
+python scripts/orchestrator.py deploy                                     # Helm install Pulsar
 python scripts/orchestrator.py run --test-plan config/test-plans/poc.yaml --experiment-id latest
 python scripts/orchestrator.py report --experiment-id latest
 python scripts/orchestrator.py undeploy --experiment-id latest            # Helm uninstall Pulsar
-python scripts/orchestrator.py teardown --experiment-id latest            # Destroy EKS cluster
 ```
 
 ### Kubectl Operations
@@ -242,13 +233,13 @@ kubectl exec -n pulsar pulsar-broker-0 -- bin/pulsar-admin topics delete persist
 
 ### Configuration
 
-- `config/infrastructure.yaml`: EKS cluster config (node types, counts, VPC, Kubernetes version)
+- `config/infrastructure.yaml`: AWS region and experiment metadata
 - `config/pulsar-cluster.yaml`: Pulsar component settings (replicas, JVM, storage)
 - `config/test-plans/*.yaml`: Test scenario definitions and matrices
 - `workloads/*.yaml`: OpenMessaging Benchmark workload specifications
 - `helm/pulsar-eks-lab/values.yaml`: Helm chart default values (EKS-optimized)
 
-**Note**: Infrastructure config is used by Terraform for EKS setup. Pulsar settings are passed to Helm via values override.
+**Note**: EKS cluster is managed externally. Configuration files control Helm deployment and test execution.
 
 ## Pulsar Components
 
@@ -316,7 +307,7 @@ Each test run generates:
 **EKS Cluster Connection Issues**
 ```bash
 # Ensure kubeconfig is updated
-aws eks update-kubeconfig --region us-west-2 --name pulsar-eks-<experiment-id>
+aws eks update-kubeconfig --region us-east-1 --name pulsar-eks-<experiment-id>
 
 # Verify cluster access
 kubectl get nodes
@@ -368,7 +359,7 @@ kubectl describe pvc <pvc-name> -n pulsar
 docker images | grep pulsar-omb
 
 # For ECR, verify authentication
-aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-west-2.amazonaws.com
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-east-1.amazonaws.com
 
 # Check imagePullSecrets in Helm values
 kubectl get secrets -n pulsar
@@ -401,21 +392,17 @@ kubectl describe nodes
 # Check pod resource usage
 kubectl top pods -n pulsar
 
-# Scale up node group
+# Scale up node group (managed externally)
 aws eks update-nodegroup-config \
-  --cluster-name pulsar-eks-<experiment-id> \
+  --cluster-name <cluster-name> \
   --nodegroup-name <nodegroup-name> \
   --scaling-config desiredSize=5
-
-# Or edit infrastructure.yaml and run terraform apply
 ```
 
 ### Important Files and Locations
 
 - **Orchestrator logs**: `~/.pulsar-aws-lab/<experiment-id>/orchestrator.log`
 - **Experiment results**: `~/.pulsar-aws-lab/<experiment-id>/`
-- **Terraform state**: `terraform/terraform.tfstate`
-- **Terraform variables**: `~/.pulsar-aws-lab/<experiment-id>/terraform.tfvars.json`
 - **Latest experiment symlink**: `~/.pulsar-aws-lab/latest`
 - **Kubeconfig**: `~/.kube/config` (updated by `aws eks update-kubeconfig`)
 - **Helm values**: `helm/pulsar-eks-lab/values.yaml`

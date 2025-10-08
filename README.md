@@ -111,7 +111,7 @@ python3 --version  # >= 3.8
    # Or use environment variables:
    export AWS_ACCESS_KEY_ID=your_access_key
    export AWS_SECRET_ACCESS_KEY=your_secret_key
-   export AWS_DEFAULT_REGION=us-west-2
+   export AWS_DEFAULT_REGION=us-east-1
    ```
 
 2. **IAM Permissions**:
@@ -138,13 +138,17 @@ pip install -r scripts/requirements.txt
 
 ## Quick Start
 
-### 1. Create EKS Cluster (One-Time)
+**Prerequisites**: EKS cluster must already exist and kubectl must be configured. See [Prerequisites](#prerequisites) for setup.
+
+###  1. Configure kubectl for EKS
 
 ```bash
-python scripts/orchestrator.py cluster-create
-```
+# Configure kubectl to connect to your EKS cluster
+aws eks update-kubeconfig --region <region> --name <cluster-name>
 
-This creates the EKS cluster (takes 15-20 minutes). The cluster remains running for multiple test cycles.
+# Verify connection
+kubectl cluster-info
+```
 
 ### 2. Run Full Test Cycle
 
@@ -185,17 +189,8 @@ python scripts/orchestrator.py run \
 python scripts/orchestrator.py report \
   --experiment-id latest
 
-# Undeploy Pulsar (keep cluster running)
+# Undeploy Pulsar (cluster remains for future tests)
 python scripts/orchestrator.py undeploy \
-  --experiment-id latest
-```
-
-### 4. Cleanup (When Done Testing)
-
-Destroy the EKS cluster:
-
-```bash
-python scripts/orchestrator.py cluster-destroy \
   --experiment-id latest
 ```
 
@@ -214,11 +209,11 @@ experiment:
     owner: "john.doe"
 
 aws:
-  region: "us-west-2"
+  region: "us-east-1"
   availability_zones:
-    - "us-west-2a"
-    - "us-west-2b"
-    - "us-west-2c"
+    - "us-east-1a"
+    - "us-east-1b"
+    - "us-east-1c"
 
 eks:
   cluster_version: "1.31"
@@ -289,14 +284,8 @@ test_runs:
 
 ## Commands Reference
 
-### Cluster Management
+### Experiment Management
 ```bash
-# Create EKS cluster (one-time)
-python scripts/orchestrator.py cluster-create
-
-# Destroy EKS cluster
-python scripts/orchestrator.py cluster-destroy --experiment-id <id>
-
 # List experiments
 python scripts/orchestrator.py list
 ```
@@ -365,7 +354,7 @@ Costs are automatically included in reports.
 aws eks describe-cluster --name pulsar-eks-<experiment-id>
 
 # Update kubectl context
-aws eks update-kubeconfig --region us-west-2 --name pulsar-eks-<experiment-id>
+aws eks update-kubeconfig --region us-east-1 --name pulsar-eks-<experiment-id>
 
 # View nodes
 kubectl get nodes
@@ -412,24 +401,6 @@ All logs are saved in `~/.pulsar-aws-lab/<experiment-id>/`:
 
 ## Advanced Usage
 
-### Manual Terraform Operations
-
-```bash
-cd terraform
-
-# Initialize
-terraform init
-
-# Plan
-terraform plan
-
-# Apply
-terraform apply
-
-# Destroy
-terraform destroy
-```
-
 ### Manual Helm Operations
 
 ```bash
@@ -450,7 +421,7 @@ helm uninstall pulsar -n pulsar
 ./scripts/build-omb-image.sh
 
 # Build and push to ECR
-./scripts/build-omb-image.sh --registry <account-id>.dkr.ecr.us-west-2.amazonaws.com/pulsar-omb --push
+./scripts/build-omb-image.sh --registry <account-id>.dkr.ecr.us-east-1.amazonaws.com/pulsar-omb --push
 
 # Build for specific platform
 ./scripts/build-omb-image.sh --platform linux/amd64
