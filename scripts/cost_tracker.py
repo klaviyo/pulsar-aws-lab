@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class CostTracker:
     """AWS Cost tracking and reporting"""
 
-    def __init__(self, region: str = "us-west-2"):
+    def __init__(self, region: str = "us-east-1"):
         """Initialize cost tracker"""
         self.region = region
         self.ce_client = boto3.client('ce', region_name=region)
@@ -185,7 +185,7 @@ class CostTracker:
 
         In production, use AWS Price List API for accurate pricing
         """
-        # Simplified pricing estimates for common instance types (us-west-2)
+        # Simplified pricing estimates for common instance types (us-east-1)
         pricing = {
             't3.micro': 0.0104,
             't3.small': 0.0208,
@@ -264,7 +264,7 @@ class CostTracker:
         duration_hours: float
     ) -> float:
         """Estimate EBS storage cost"""
-        # Simplified pricing (us-west-2, per GB-month)
+        # Simplified pricing (us-east-1, per GB-month)
         monthly_pricing = {
             'gp2': 0.10,
             'gp3': 0.08,

@@ -11,10 +11,10 @@
 **Solution**:
 ```bash
 # Build the AMI first
-python scripts/build-ami.py build --version 3.0.0 --region us-west-2
+python scripts/build-ami.py build --version 3.0.0 --region us-east-1
 
 # Verify it exists
-python scripts/build-ami.py list --region us-west-2
+python scripts/build-ami.py list --region us-east-1
 ```
 
 **Prevention**: Build AMI as part of initial setup documentation
@@ -53,10 +53,10 @@ python scripts/build-ami.py build --version 3.0.0 --force
 **Solution**:
 ```bash
 # Check SSH key exists
-aws ec2 describe-key-pairs --key-names pulsar-lab-key --region us-west-2
+aws ec2 describe-key-pairs --key-names pulsar-lab-key --region us-east-1
 
 # Create if missing
-aws ec2 create-key-pair --key-name pulsar-lab-key --region us-west-2
+aws ec2 create-key-pair --key-name pulsar-lab-key --region us-east-1
 
 # Check IAM role
 aws iam get-role --role-name SSMManagedInstanceCore
@@ -223,7 +223,7 @@ python scripts/orchestrator.py teardown --experiment-id exp-xxxxx
 # Use tag-based cleanup (doesn't need Terraform state)
 python scripts/cleanup_by_tag.py \
   --experiment-id exp-xxxxx \
-  --region us-west-2 \
+  --region us-east-1 \
   --execute
 ```
 

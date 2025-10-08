@@ -43,7 +43,7 @@
         "region": {
           "type": "string",
           "pattern": "^[a-z]{2}-[a-z]+-[0-9]$",
-          "description": "AWS region (e.g., us-west-2)"
+          "description": "AWS region (e.g., us-east-1)"
         },
         "availability_zone": {
           "type": "string",

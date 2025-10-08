@@ -6,9 +6,9 @@
 #   ./build-omb-image.sh [OPTIONS]
 #
 # Options:
-#   --push              Push image to registry after build
-#   --registry REPO     Docker registry/repository (default: pulsar-omb)
-#   --tag TAG           Image tag (default: latest)
+#   --push              Push image to ECR after build
+#   --registry REPO     Docker registry/repository (default: ECR sre/pulsar-omb)
+#   --tag TAG           Additional image tag (timestamp tag is always added)
 #   --platform PLATFORM Build for specific platform (e.g., linux/amd64,linux/arm64)
 #
 
@@ -21,9 +21,13 @@ DOCKERFILE_DIR="$PROJECT_ROOT/docker/omb"
 
 # Default values
 PUSH=false
-REGISTRY="pulsar-omb"
-TAG="latest"
+REGISTRY="439508887365.dkr.ecr.us-east-1.amazonaws.com/sre/pulsar-omb"
+AWS_REGION="us-east-1"
+TAG=""
 PLATFORM=""
+
+# Generate timestamp tag: YYYYMMDDHHmm
+TIMESTAMP_TAG=$(date -u +"%Y%m%d%H%M")
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -48,11 +52,14 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --push              Push image to registry after build"
-            echo "  --registry REPO     Docker registry/repository (default: pulsar-omb)"
-            echo "  --tag TAG           Image tag (default: latest)"
+            echo "  --push              Push image to ECR after build"
+            echo "  --registry REPO     Docker registry/repository"
+            echo "                      (default: 439508887365.dkr.ecr.us-east-1.amazonaws.com/sre/pulsar-omb)"
+            echo "  --tag TAG           Additional image tag (timestamp tag is always created)"
             echo "  --platform PLATFORM Build for specific platform"
             echo "  -h, --help          Show this help message"
+            echo ""
+            echo "Image is always tagged with timestamp (YYYYMMDDHHmm) and 'latest'"
             exit 0
             ;;
         *)
@@ -63,38 +70,78 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Build the image
-IMAGE_NAME="${REGISTRY}:${TAG}"
-echo "Building Docker image: ${IMAGE_NAME}"
-echo "Dockerfile location: ${DOCKERFILE_DIR}"
+# Build the image with timestamp tag
+TIMESTAMP_IMAGE="${REGISTRY}:${TIMESTAMP_TAG}"
+LATEST_IMAGE="${REGISTRY}:latest"
 
-BUILD_CMD="docker build -t ${IMAGE_NAME} ${DOCKERFILE_DIR}"
+echo "Building Docker image with tags:"
+echo "  - ${TIMESTAMP_TAG} (timestamp)"
+echo "  - latest"
+if [ -n "$TAG" ]; then
+    echo "  - ${TAG} (custom)"
+fi
+echo ""
+echo "Dockerfile location: ${DOCKERFILE_DIR}"
+echo ""
+
+BUILD_CMD="docker build -t ${TIMESTAMP_IMAGE} -t ${LATEST_IMAGE}"
+
+if [ -n "$TAG" ]; then
+    CUSTOM_IMAGE="${REGISTRY}:${TAG}"
+    BUILD_CMD="${BUILD_CMD} -t ${CUSTOM_IMAGE}"
+fi
 
 if [ -n "$PLATFORM" ]; then
     BUILD_CMD="${BUILD_CMD} --platform ${PLATFORM}"
 fi
 
+BUILD_CMD="${BUILD_CMD} ${DOCKERFILE_DIR}"
+
 echo "Running: ${BUILD_CMD}"
 eval "${BUILD_CMD}"
 
-echo "✓ Successfully built ${IMAGE_NAME}"
+echo "✓ Successfully built images"
 
 # Push if requested
 if [ "$PUSH" = true ]; then
-    echo "Pushing image to registry..."
-    docker push "${IMAGE_NAME}"
-    echo "✓ Successfully pushed ${IMAGE_NAME}"
+    echo ""
+    echo "Logging in to ECR..."
+    aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${REGISTRY%%/*}
+
+    echo ""
+    echo "Pushing images to ECR..."
+
+    echo "  Pushing ${TIMESTAMP_TAG}..."
+    docker push "${TIMESTAMP_IMAGE}"
+
+    echo "  Pushing latest..."
+    docker push "${LATEST_IMAGE}"
+
+    if [ -n "$TAG" ]; then
+        echo "  Pushing ${TAG}..."
+        docker push "${CUSTOM_IMAGE}"
+    fi
+
+    echo ""
+    echo "✓ Successfully pushed all images to ECR"
+    echo ""
+    echo "Images available at:"
+    echo "  ${TIMESTAMP_IMAGE}"
+    echo "  ${LATEST_IMAGE}"
+    if [ -n "$TAG" ]; then
+        echo "  ${CUSTOM_IMAGE}"
+    fi
 fi
 
 echo ""
-echo "Image details:"
-docker images "${REGISTRY}" --filter "reference=${IMAGE_NAME}"
+echo "Local image details:"
+docker images "${REGISTRY}" | head -5
 echo ""
 echo "To run the image:"
-echo "  docker run --rm ${IMAGE_NAME} 'benchmark --help'"
+echo "  docker run --rm ${LATEST_IMAGE} 'benchmark --help'"
 echo ""
 
 if [ "$PUSH" = false ]; then
-    echo "To push the image to a registry:"
-    echo "  $0 --push --registry <your-registry>/${REGISTRY} --tag ${TAG}"
+    echo "To push images to ECR:"
+    echo "  $0 --push"
 fi

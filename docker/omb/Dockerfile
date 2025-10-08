@@ -1,7 +1,7 @@
 # OpenMessaging Benchmark Docker Image
-# Uses latest stable Maven and Java LTS for building OMB
+# Uses Maven 3.9 and Java 17 LTS (Java 21 has compatibility issues with OMB dependencies)
 
-FROM maven:3.9-eclipse-temurin-21 AS builder
+FROM maven:3.9-eclipse-temurin-17 AS builder
 
 # Install ca-certificates and update certificate store
 RUN apt-get update && \
@@ -20,7 +20,7 @@ RUN git clone https://github.com/openmessaging/benchmark.git .
 RUN mvn clean verify -DskipTests
 
 # Runtime stage - smaller final image
-FROM eclipse-temurin:21-jre
+FROM eclipse-temurin:17-jre
 
 # Install runtime dependencies
 RUN apt-get update && \
