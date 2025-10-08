@@ -73,3 +73,13 @@ logs/
 tmp/
 temp/
 .tmp/
+
+# Kubernetes and Helm
+*.kubeconfig
+kubeconfig*
+.kube/config.lock
+helm/*/charts/*.tgz
+**/Chart.lock
+
+# Helm dependencies
+helm/**/charts/

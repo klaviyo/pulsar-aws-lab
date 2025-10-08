@@ -1,58 +1,68 @@
-# Infrastructure Configuration - Minimal Cost Setup
-# Uses smallest viable instance types for testing
+# Infrastructure Configuration - EKS Setup
 
 experiment:
-  id: "pulsar-test-001"
-  name: "Baseline Pulsar Performance Test"
-  description: "Initial performance baseline with minimal infrastructure"
+  id: "pulsar-eks-test-001"
+  name: "Baseline Pulsar Performance Test on EKS"
+  description: "Initial performance baseline with EKS and Helm-based deployment"
   tags:
     environment: "test"
     cost_center: "engineering"
     owner: "fkh"
 
-# Pulsar version to install (see https://pulsar.apache.org/download/)
-pulsar_version: "3.0.0"
-
 aws:
   region: "us-west-2"
-  # availability_zone: "us-west-2a"  # Optional: specify AZ
-  use_spot_instances: false  # Set to true for additional cost savings (higher risk)
-  # spot_max_price: "0.05"  # Uncomment if using spot instances
+  availability_zones:
+    - "us-west-2a"
+    - "us-west-2b"
+    - "us-west-2c"
 
 network:
   vpc_cidr: "10.0.0.0/16"
-  public_subnet_cidr: "10.0.1.0/24"
-  allowed_ssh_cidrs:
-    - "0.0.0.0/0"  # WARNING: Restrict this in production!
+  public_subnet_cidrs:
+    - "10.0.1.0/24"
+    - "10.0.2.0/24"
+    - "10.0.3.0/24"
+  private_subnet_cidrs:
+    - "10.0.11.0/24"
+    - "10.0.12.0/24"
+    - "10.0.13.0/24"
 
-compute:
-  # SSH key pair name (must be created in AWS console first)
-  ssh_key_name: "pulsar-lab-key"
+eks:
+  # Kubernetes cluster configuration
+  cluster_version: "1.31"
 
-  # AMI: uses latest Amazon Linux 2 if not specified
-  # ami_id: "ami-0abcdef1234567890"
+  # Node group configuration
+  node_group:
+    instance_types:
+      - "t3.medium"  # 2 vCPU, 4 GB RAM - suitable for testing
+    disk_size: 50  # GB
+    desired_size: 3
+    min_size: 1
+    max_size: 5
 
-  # ZooKeeper: Cluster coordination (3 nodes for quorum)
+# Pulsar deployment configuration (via Helm)
+pulsar:
+  # These values override helm/pulsar-eks-lab/values.yaml
   zookeeper:
-    count: 3
-    instance_type: "t3.micro"  # 2 vCPU, 1 GB RAM - minimal for testing
+    replicas: 3
 
-  # BookKeeper: Message storage (3 bookies minimum)
   bookkeeper:
-    count: 3
-    instance_type: "t3.small"  # 2 vCPU, 2 GB RAM
-    storage:
-      volume_size: 50  # GB - minimal for testing
-      volume_type: "gp3"  # General Purpose SSD v3 (cost-effective)
-      throughput: 125  # MB/s (gp3 baseline)
-      # iops: 3000  # Optional: gp3 baseline is 3000 IOPS
+    replicas: 3
 
-  # Broker: Message routing (2 brokers for basic testing)
   broker:
-    count: 2
-    instance_type: "t3.small"  # 2 vCPU, 2 GB RAM
+    replicas: 3
 
-  # Client: Benchmark execution nodes (1 sufficient for basic tests)
-  client:
-    count: 1
-    instance_type: "t3.small"  # 2 vCPU, 2 GB RAM
+  proxy:
+    replicas: 2
+
+# OpenMessaging Benchmark configuration
+benchmark:
+  image:
+    repository: "pulsar-omb"
+    tag: "latest"
+
+  producer:
+    replicas: 1
+
+  consumer:
+    replicas: 1
