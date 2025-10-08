@@ -1,0 +1,16 @@
+{{- if and .Values.pulsar (index .Values.pulsar "kube-prometheus-stack") (index .Values.pulsar "kube-prometheus-stack" "grafana") (index .Values.pulsar "kube-prometheus-stack" "grafana" "enabled") }}
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "grafana-dashboard-%s" (base $path | replace ".json" "") }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    grafana_dashboard: "1"
+    app: grafana
+data:
+  {{ base $path }}: |-
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}

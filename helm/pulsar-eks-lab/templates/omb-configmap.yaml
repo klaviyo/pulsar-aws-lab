@@ -1,0 +1,47 @@
+{{- if .Values.omb.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pulsar-eks-lab.fullname" . }}-omb-workload
+  labels:
+    {{- include "pulsar-eks-lab.labels" . | nindent 4 }}
+data:
+  driver.yaml: |
+    name: Pulsar
+    driverClass: io.openmessaging.benchmark.driver.pulsar.PulsarBenchmarkDriver
+
+    # Pulsar client configuration
+    client:
+      serviceUrl: pulsar://{{ include "pulsar-eks-lab.fullname" . }}-pulsar-broker:6650
+      httpUrl: http://{{ include "pulsar-eks-lab.fullname" . }}-pulsar-broker:8080
+
+    # Producer configuration
+    producer:
+      batchingEnabled: true
+      batchingMaxPublishDelayMs: 1
+      blockIfQueueFull: true
+      pendingQueueSize: 1000
+
+    # Consumer configuration
+    consumer:
+      subscriptionType: Exclusive
+
+  workload.yaml: |
+    # Example workload configuration
+    # This will be overridden by the orchestrator with specific test parameters
+
+    name: test-workload
+    topics: 1
+    partitionsPerTopic: 10
+    messageSize: 1024
+
+    subscriptionsPerTopic: 1
+    consumerPerSubscription: 1
+    producersPerTopic: 1
+
+    producerRate: 10000
+    testDurationMinutes: 5
+
+    # Warmup phase
+    warmupDurationMinutes: 1
+{{- end }}
