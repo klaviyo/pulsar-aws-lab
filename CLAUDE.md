@@ -466,4 +466,4 @@ This project has migrated from AMI-based EC2 instances to Kubernetes on EKS:
 - Faster deployment cycles (no AMI rebuild required)
 - Cost optimization (shared node infrastructure)
 
-If you see references to Packer, AMIs, Ansible, or SSM in code or docs, they are outdated and should be removed. The `packer/` directory exists only for reference and is NOT used in the current workflow.
+If you see references to Packer, AMIs, Ansible, or SSM in code or docs, they are outdated and should be removed. These components have been completely removed from the project.
