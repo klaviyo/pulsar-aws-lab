@@ -1,87 +1,82 @@
 # Pulsar AWS Lab
 
-A reproducible, ephemeral Apache Pulsar testing framework on AWS with automated infrastructure deployment, load testing using OpenMessaging Benchmark, comprehensive reporting, and cost tracking.
+A reproducible Apache Pulsar testing framework on AWS EKS with automated infrastructure deployment, load testing using OpenMessaging Benchmark, comprehensive reporting, and cost tracking.
 
-**🚀 New to Pulsar AWS Lab? Start with the [Quick Start Guide](docs/QUICKSTART.md)!**
+**🚀 New to Pulsar AWS Lab? See [CLAUDE.md](CLAUDE.md) for complete documentation!**
 
 ## Features
 
-- ✅ **Automated Infrastructure**: Terraform-based EC2 provisioning with cost optimization
-- ✅ **Immutable AMI Deployment**: Pre-baked Pulsar AMIs with Packer for fast, consistent deployments
-- ✅ **Load Testing**: Integration with OpenMessaging Benchmark framework
+- ✅ **EKS Infrastructure**: Terraform-based EKS cluster with managed node groups
+- ✅ **Helm Deployments**: Apache Pulsar deployed via official Helm charts
+- ✅ **Kubernetes Native**: Pulsar components run as Kubernetes pods with built-in monitoring
+- ✅ **Load Testing**: OpenMessaging Benchmark framework in containers
 - ✅ **Cost Tracking**: AWS Cost Explorer integration with detailed reporting
-- ✅ **Comprehensive Reports**: HTML/CSV/JSON export with all metrics
+- ✅ **Ephemeral Tests**: Deploy Pulsar → test → undeploy (cluster remains)
 - ✅ **Systematic Testing**: Test plan matrices for exploring parameter spaces
-- ✅ **Full Lifecycle**: Automated setup → test → report → teardown
-- ✅ **Fast Deployment**: 60-120 seconds cluster startup (vs 5-10 minutes with runtime provisioning)
+- ✅ **Full Lifecycle**: Automated deploy → test → report → undeploy
 
 ## Architecture
 
 ### Components
 
-- **ZooKeeper**: Cluster coordination (default: 3 nodes)
-- **BookKeeper**: Message storage layer (default: 3 bookies)
-- **Broker**: Message routing and serving (default: 2 brokers)
-- **Client**: OpenMessaging Benchmark execution (default: 1 node)
+Pulsar runs in Kubernetes with the following components:
+
+- **ZooKeeper StatefulSet**: Cluster coordination (default: 3 replicas)
+- **BookKeeper StatefulSet**: Message storage layer (default: 3 replicas)
+- **Broker Deployment**: Message routing and serving (default: 3 replicas)
+- **Proxy Deployment**: Load balancer for clients (default: 2 replicas)
+- **Prometheus & Grafana**: Monitoring stack with pre-configured dashboards
 
 ### Deployment Architecture
 
-**AMI-Based Immutable Infrastructure:**
-- **Pre-baked AMIs** - Pulsar binaries and dependencies installed via Packer
-- **User-data scripts** - Runtime configuration at boot time
-- **Fast deployment** - Cluster ready in 60-120 seconds
-- **Consistent environments** - Same AMI every time
+**EKS + Helm Architecture:**
+- **Long-lived EKS cluster** - Created once, reused for multiple tests
+- **Ephemeral Pulsar deployments** - Installed/uninstalled per test via Helm
+- **Docker-based OMB** - Benchmark runs as Kubernetes Jobs
+- **Kubernetes-native** - All components are Kubernetes resources
 
 **Deployment Flow:**
 ```
-1. Build Phase (one-time):
-   Packer → Amazon Linux 2023 + Pulsar 3.0.0 → AMI
+1. One-time EKS Setup:
+   Terraform → EKS Cluster + VPC + Node Groups → kubectl configured
 
-2. Deploy Phase (per experiment):
-   Terraform → Launch EC2 from AMI → User-data configures:
-      - ZooKeeper: myid, zoo.cfg, starts service
-      - BookKeeper: formats ledgers, bookkeeper.conf, starts service
-      - Broker: broker.conf, initializes metadata, starts service
-      - Client: configures benchmark framework
+2. Per Test Cycle:
+   Helm install Pulsar → Wait for pods ready → Run OMB Job → Collect results → Helm uninstall
 
-3. Ready in 60-120 seconds (vs 5-10 minutes with Ansible)
+3. Cleanup:
+   Terraform destroy (when done with all testing)
 ```
 
 **Network Design:**
-- EC2 instances have **public IPs** for AWS API access and package downloads
-- Pulsar components communicate via **private IPs** within VPC
-- ZooKeeper connect string: `10.0.1.x:2181,10.0.1.y:2181,...`
-- Broker service URL: `pulsar://10.0.1.z:6650`
-- All inter-cluster traffic stays private
+- EKS nodes in private subnets with NAT gateway for egress
+- Public subnets for load balancers
+- Pulsar components communicate via Kubernetes Services
+- OMB Jobs connect to broker service: `pulsar://pulsar-broker:6650`
 
 **Security:**
-- SSH access via key pair (optional, for debugging)
-- Security groups restrict inter-component traffic
-- IAM roles for AWS API access
+- IAM roles for EKS cluster and node groups
+- OIDC provider for Kubernetes service account authentication
+- Network policies for pod-to-pod communication (optional)
 
 ### Directory Structure
 
 ```
 pulsar-aws-lab/
 ├── config/               # Configuration files
-│   ├── infrastructure.yaml
-│   ├── pulsar-cluster.yaml
-│   ├── schema/          # JSON schemas
-│   └── test-plans/      # Test scenario definitions
-├── terraform/           # Infrastructure as Code
-│   ├── modules/         # Modular components
-│   └── user-data/       # Boot-time configuration scripts
-├── packer/              # AMI building
-│   ├── pulsar-base.pkr.hcl
-│   └── scripts/         # Installation scripts
-├── scripts/             # Orchestration scripts
-│   ├── orchestrator.py  # Main orchestration
-│   ├── build-ami.py     # AMI management
+│   ├── infrastructure.yaml  # EKS cluster configuration
+│   └── test-plans/       # Test scenario definitions
+├── terraform/            # Infrastructure as Code
+│   └── modules/          # EKS, network, IAM modules
+├── helm/                 # Helm charts
+│   └── pulsar-eks-lab/   # Pulsar + OMB chart
+├── docker/               # Container images
+│   └── omb/              # OpenMessaging Benchmark
+├── scripts/              # Orchestration
+│   ├── orchestrator.py   # Main orchestration (kubectl/helm)
+│   ├── build-omb-image.sh
 │   ├── cost_tracker.py
 │   └── report_generator.py
-├── workloads/           # Benchmark workloads
-├── reporting/           # Report templates
-└── docs/                # Documentation
+└── docs/                 # Documentation
 ```
 
 ## Prerequisites
@@ -92,20 +87,21 @@ pulsar-aws-lab/
 # AWS CLI
 aws --version  # >= 2.0
 
+# kubectl
+kubectl version  # >= 1.28
+
+# Helm
+helm version  # >= 3.12
+
 # Terraform
 terraform --version  # >= 1.0
 
+# Docker (for building OMB image)
+docker --version  # >= 20.0
+
 # Python
 python3 --version  # >= 3.8
-
-# Packer (only for building custom AMIs)
-packer --version  # >= 1.8
-# Install: https://www.packer.io/downloads
-# macOS: brew install packer
-# Linux: see Packer website
 ```
-
-**Note**: Packer is only required if you want to build custom AMIs. The project can use pre-built AMIs from your AWS account.
 
 ### AWS Setup
 
@@ -118,23 +114,21 @@ packer --version  # >= 1.8
    export AWS_DEFAULT_REGION=us-west-2
    ```
 
-2. **IAM Permissions** (for your AWS credentials):
+2. **IAM Permissions**:
    Your AWS user/role needs permissions for:
-   - EC2 (create instances, AMIs, security groups, VPCs, snapshots)
+   - EKS (create clusters, node groups)
+   - EC2 (VPC, subnets, security groups, NAT gateways)
+   - IAM (create roles for EKS)
    - Cost Explorer (for cost tracking)
-   - IAM (create roles for EC2 instances - optional)
 
-3. **Build Pulsar AMI** (first-time setup):
+3. **Build OMB Docker Image** (first-time setup):
    ```bash
-   # Build the base Pulsar AMI (takes ~10-15 minutes)
-   python scripts/build-ami.py build --version 3.0.0 --region us-west-2
+   # Build the OpenMessaging Benchmark image
+   ./scripts/build-omb-image.sh
 
-   # Validate the AMI (optional but recommended)
-   AMI_ID=$(python scripts/build-ami.py latest --region us-west-2)
-   python scripts/build-ami.py validate --ami-id $AMI_ID
+   # Or with custom registry
+   ./scripts/build-omb-image.sh --registry your-ecr-repo --push
    ```
-
-   See [AMI Build Guide](docs/BUILD-AMI-GUIDE.md) for detailed instructions.
 
 ### Python Dependencies
 
@@ -144,51 +138,45 @@ pip install -r scripts/requirements.txt
 
 ## Quick Start
 
-### 1. Run Proof of Concept Test
+### 1. Create EKS Cluster (One-Time)
 
-Execute a simple validation test (20k msgs/sec for 2 minutes):
+```bash
+python scripts/orchestrator.py cluster-create
+```
+
+This creates the EKS cluster (takes 15-20 minutes). The cluster remains running for multiple test cycles.
+
+### 2. Run Full Test Cycle
+
+Execute a test with automatic Pulsar deployment and cleanup:
 
 ```bash
 python scripts/orchestrator.py full \
   --test-plan config/test-plans/poc.yaml
 ```
 
-**Add custom tags** to identify resources in a shared AWS account:
-
-```bash
-python scripts/orchestrator.py full \
-  --test-plan config/test-plans/poc.yaml \
-  --tag team=data-platform \
-  --tag owner=john.doe \
-  --tag cost-center=engineering
-```
-
 This will:
-1. Deploy AWS infrastructure
-2. Install and configure Pulsar cluster
-3. Run a single validation test (20k msgs/sec, 1KB messages, 2 min)
-4. Generate comprehensive report
-5. Destroy all resources
+1. Deploy Pulsar via Helm
+2. Wait for all pods to be ready
+3. Run benchmark test (20k msgs/sec, 2 min)
+4. Collect results
+5. Undeploy Pulsar (uninstall Helm chart)
 
-**For more comprehensive testing**, use the baseline test plan:
+**For comprehensive testing:**
 ```bash
 python scripts/orchestrator.py full \
   --test-plan config/test-plans/baseline.yaml
 ```
 
-### 2. Manual Workflow
+### 3. Manual Workflow
 
 For more control, run each phase separately:
 
 ```bash
-# Setup infrastructure and deploy Pulsar
-python scripts/orchestrator.py setup \
-  --config config/infrastructure.yaml
+# Deploy Pulsar to EKS
+python scripts/orchestrator.py deploy
 
-# The experiment ID will be displayed. Or list experiments:
-python scripts/orchestrator.py list
-
-# Run tests (use 'latest' or specific experiment ID)
+# Run tests
 python scripts/orchestrator.py run \
   --test-plan config/test-plans/baseline.yaml \
   --experiment-id latest
@@ -197,104 +185,80 @@ python scripts/orchestrator.py run \
 python scripts/orchestrator.py report \
   --experiment-id latest
 
-# Teardown (when done) - use 'latest' for most recent
-python scripts/orchestrator.py teardown \
+# Undeploy Pulsar (keep cluster running)
+python scripts/orchestrator.py undeploy \
   --experiment-id latest
 ```
 
-**Tip**: Use `--experiment-id latest` to reference the most recent experiment, or use `list` to see all experiments.
+### 4. Cleanup (When Done Testing)
+
+Destroy the EKS cluster:
+
+```bash
+python scripts/orchestrator.py cluster-destroy \
+  --experiment-id latest
+```
 
 ## Configuration
 
 ### Infrastructure Configuration
 
-Edit `config/infrastructure.yaml` to customize:
+Edit `config/infrastructure.yaml`:
 
 ```yaml
 experiment:
   id: "my-experiment"
-  name: "My Pulsar Test"
-  # Optional: Add tags to all resources (useful for shared accounts)
+  name: "My Pulsar EKS Test"
   tags:
     team: "data-platform"
     owner: "john.doe"
-    cost_center: "engineering"
-
-# Pulsar version to install (e.g., "3.0.0", "3.1.0", "3.2.0")
-pulsar_version: "3.0.0"
 
 aws:
   region: "us-west-2"
-  use_spot_instances: false  # Set true for cost savings
+  availability_zones:
+    - "us-west-2a"
+    - "us-west-2b"
+    - "us-west-2c"
 
-compute:
-  # Adjust instance types and counts
+eks:
+  cluster_version: "1.31"
+  node_group:
+    instance_types: ["t3.medium"]
+    disk_size: 50
+    desired_size: 3
+    min_size: 1
+    max_size: 5
+
+pulsar:
   zookeeper:
-    count: 3
-    instance_type: "t3.micro"
-
+    replicas: 3
   bookkeeper:
-    count: 3
-    instance_type: "t3.small"
-    storage:
-      volume_size: 20
-      volume_type: "gp3"
-
+    replicas: 3
   broker:
-    count: 2
-    instance_type: "t3.small"
-
-  client:
-    count: 1
-    instance_type: "t3.small"
+    replicas: 3
 ```
 
-### Resource Tagging
+### Helm Values
 
-**All AWS resources are automatically tagged with:**
-- `Project`: "pulsar-aws-lab"
-- `ExperimentID`: Auto-generated ID (e.g., "exp-20251005-143056")
-- `Experiment`: Your experiment name from config
-- `ManagedBy`: "terraform"
-
-**Add custom tags in two ways:**
-
-1. **Config file** (`config/infrastructure.yaml`):
-   ```yaml
-   experiment:
-     tags:
-       team: "data-platform"
-       owner: "john.doe"
-       cost_center: "engineering"
-   ```
-
-2. **Command line** (overrides config tags):
-   ```bash
-   python scripts/orchestrator.py full \
-     --test-plan config/test-plans/poc.yaml \
-     --tag team=data-platform \
-     --tag owner=john.doe
-   ```
-
-Tags help identify resources in shared AWS accounts and enable cost tracking per team/owner.
-
-### Pulsar Cluster Configuration
-
-Edit `config/pulsar-cluster.yaml`:
+Customize Pulsar deployment in `helm/pulsar-eks-lab/values.yaml`:
 
 ```yaml
-pulsar_version: "3.0.0"
+pulsar:
+  volumes:
+    persistence: true  # Use persistent volumes
 
-zookeeper:
-  heap_size: "512M"
+  bookkeeper:
+    replicaCount: 3
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "1000m"
 
-bookkeeper:
-  heap_size: "768M"
-  direct_memory_size: "512M"
-
-broker:
-  heap_size: "1G"
-  managed_ledger_cache_size_mb: 256
+  broker:
+    replicaCount: 3
+    configData:
+      managedLedgerDefaultEnsembleSize: "3"
+      managedLedgerDefaultWriteQuorum: "3"
 ```
 
 ### Test Plans
@@ -321,196 +285,130 @@ test_runs:
   - name: "high-load"
     type: "fixed_rate"
     producer_rate: 50000
-    workload_overrides:
-      producers_per_topic: 4
-      consumers_per_topic: 4
 ```
 
-## Workloads
+## Commands Reference
 
-Pre-configured workloads in `workloads/`:
+### Cluster Management
+```bash
+# Create EKS cluster (one-time)
+python scripts/orchestrator.py cluster-create
 
-- `poc.yaml`: **Proof of concept** - 20k msgs/sec, 1KB messages, 2 min (recommended for initial validation)
-- `simple-test.yaml`: Single topic, 10k msgs/sec
-- `multi-topic.yaml`: 10 topics, distributed load
-- `high-throughput.yaml`: Stress test, 100k msgs/sec
-- `large-messages.yaml`: 64KB messages
-- `latency-test.yaml`: Low load latency characterization
+# Destroy EKS cluster
+python scripts/orchestrator.py cluster-destroy --experiment-id <id>
 
-### Custom Workloads
+# List experiments
+python scripts/orchestrator.py list
+```
 
-Create workloads compatible with OpenMessaging Benchmark:
+### Pulsar Deployment
+```bash
+# Deploy Pulsar to EKS
+python scripts/orchestrator.py deploy
 
-```yaml
-name: my-workload
-topics: 1
-partitionsPerTopic: 16
-messageSize: 1024
-producersPerTopic: 1
-consumerPerSubscription: 1
-testDurationMinutes: 5
-producerRate: 10000
+# Undeploy Pulsar from EKS
+python scripts/orchestrator.py undeploy --experiment-id <id>
+```
+
+### Testing
+```bash
+# Full cycle (deploy → test → undeploy)
+python scripts/orchestrator.py full --test-plan <file>
+
+# Run tests only (Pulsar must be deployed)
+python scripts/orchestrator.py run --test-plan <file> --experiment-id <id>
+
+# Generate report
+python scripts/orchestrator.py report --experiment-id <id>
+```
+
+### Kubernetes Operations
+```bash
+# View Pulsar pods
+kubectl get pods -n pulsar
+
+# View Helm releases
+helm list -n pulsar
+
+# Check pod logs
+kubectl logs -n pulsar <pod-name>
+
+# Port-forward to Grafana
+kubectl port-forward -n pulsar svc/grafana 3000:3000
 ```
 
 ## Cost Optimization
 
 ### Minimize Costs
 
-1. **Use smallest instances**: Default config uses t3.micro/t3.small
-2. **Enable spot instances**:
-   ```yaml
-   aws:
-     use_spot_instances: true
-     spot_max_price: "0.05"
-   ```
-3. **Reduce test duration**: Shorter tests = lower costs
-4. **Auto-teardown**: Always use `full` lifecycle to ensure cleanup
+1. **Use appropriately sized nodes**: Default is t3.medium (2 vCPU, 4GB RAM)
+2. **Adjust node group scaling**: Set min_size to 1 when not testing
+3. **Destroy cluster when not in use**: EKS cluster costs ~$0.10/hour
+4. **Use spot instances** (future): Save ~70% on node costs
 
 ### Cost Tracking
 
 View costs for an experiment:
 
 ```bash
-python scripts/cost_tracker.py my-experiment-id
+python scripts/cost_tracker.py <experiment-id>
 ```
 
-Costs are automatically included in reports when using the orchestrator.
-
-## Reports
-
-Reports are generated in `~/.pulsar-aws-lab/<experiment-id>/report/`:
-
-- `index.html`: Interactive HTML report
-- `metrics.csv`: Raw metrics in CSV format
-- `metrics.json`: JSON export
-- `costs.json`: Cost breakdown
-- `raw_data/`: Original benchmark outputs
-
-### Metrics Captured
-
-- **Throughput**: Messages/sec, MB/sec
-- **Latency**: p50, p95, p99, p99.9, max
-- **Errors**: Publish/consume failures
-- **Costs**: Total cost, cost per million messages
-
-## Error Handling & Automatic Cleanup
-
-**Automatic Resource Cleanup**: If any error occurs during setup or testing, the orchestrator will **automatically clean up all AWS resources** to prevent unexpected costs.
-
-How it works:
-- On error, finds resources by `ExperimentID` tag (doesn't need Terraform state)
-- Deletes resources in correct order: instances → volumes → network → VPC
-- Logs cleanup progress
-- Re-raises the original error for visibility
-
-Example error flow:
-```
-2025-10-05 20:43:54 - ERROR - Ansible playbook failed
-2025-10-05 20:43:54 - WARNING - Initiating automatic cleanup of resources...
-============================================================
-EMERGENCY CLEANUP: Finding resources by ExperimentID tag
-============================================================
-Found 9 resources to cleanup
-Instances to terminate: ['i-abc123', 'i-def456', ...]
-Waiting for instances to terminate...
-Instances terminated.
-Volumes to delete: ['vol-123', 'vol-456']
-...
-Emergency cleanup completed
-```
-
-You can also manually trigger emergency cleanup:
-```bash
-python scripts/cleanup_by_tag.py --experiment-id exp-20251005-143056 --execute
-```
+Costs are automatically included in reports.
 
 ## Troubleshooting
 
-### Managing Experiments
+### EKS Cluster Issues
 
 ```bash
-# List all experiments
-python scripts/orchestrator.py list
+# Check EKS cluster status
+aws eks describe-cluster --name pulsar-eks-<experiment-id>
 
-# Teardown the latest experiment
-python scripts/orchestrator.py teardown --experiment-id latest
+# Update kubectl context
+aws eks update-kubeconfig --region us-west-2 --name pulsar-eks-<experiment-id>
 
-# Teardown a specific experiment
-python scripts/orchestrator.py teardown --experiment-id exp-20251005-123456
+# View nodes
+kubectl get nodes
 ```
 
-**Experiment Storage**: All experiments are stored in `~/.pulsar-aws-lab/`
-- Each experiment has its own directory with logs and configs
-- The `latest` symlink always points to the most recent experiment
-
-### AMI Issues
-
-**No AMI found:**
-```bash
-# Check if AMI exists in your region
-python scripts/build-ami.py list --region us-west-2
-
-# Build a new AMI if needed
-python scripts/build-ami.py build --version 3.0.0 --region us-west-2
-```
-
-**AMI validation fails:**
-```bash
-# Validate the AMI to diagnose issues
-python scripts/build-ami.py validate --ami-id ami-xxxxx
-
-# Check user-data scripts in terraform/user-data/
-# Check cloud-init logs on a test instance:
-# /var/log/cloud-init-output.log
-```
-
-**Wrong AMI being used:**
-```bash
-# List all AMIs to see which one will be used
-python scripts/build-ami.py list
-
-# The orchestrator uses the latest AMI matching the filter pattern
-# Update terraform/variables.tf if you need to change the filter
-```
-
-### Terraform State Issues
+### Pulsar Deployment Issues
 
 ```bash
-# If state gets corrupted
-cd terraform
-terraform init -reconfigure
+# Check Helm release status
+helm status pulsar -n pulsar
+
+# View pod status
+kubectl get pods -n pulsar
+
+# Check pod logs
+kubectl logs -n pulsar <pod-name> --tail=100
+
+# Describe pod for events
+kubectl describe pod -n pulsar <pod-name>
+
+# Collect all logs for troubleshooting
+# (orchestrator does this automatically on failure)
 ```
 
-### Stuck Resources or Lost State
-
-If Terraform state is lost or teardown fails, use the emergency cleanup script:
+### OMB Test Failures
 
 ```bash
-# Dry run (see what would be deleted)
-python scripts/cleanup_by_tag.py --experiment-id exp-20251005-123456
+# View Job status
+kubectl get jobs -n pulsar
 
-# Actually delete resources
-python scripts/cleanup_by_tag.py --experiment-id exp-20251005-123456 --execute
+# Check Job logs
+kubectl logs -n pulsar job/omb-<test-name>
 
-# Use 'latest' (requires list command first)
-python scripts/orchestrator.py list  # Find the experiment ID
-python scripts/cleanup_by_tag.py --experiment-id <id> --execute
+# Delete stuck Job
+kubectl delete job -n pulsar omb-<test-name>
 ```
-
-This script finds and deletes all AWS resources tagged with the ExperimentID.
 
 ### View Logs
 
-```bash
-# Orchestrator logs
-tail -f ~/.pulsar-aws-lab/<experiment-id>/orchestrator.log
-
-# SSH to instance and check service logs
-ssh -i ~/.ssh/pulsar-lab-key.pem ec2-user@<ip>
-sudo journalctl -u zookeeper -f
-sudo journalctl -u bookkeeper -f
-sudo journalctl -u broker -f
-```
+All logs are saved in `~/.pulsar-aws-lab/<experiment-id>/`:
+- `orchestrator.log`: Main orchestration log
+- `benchmark_results/`: Test results
+- `pod_logs/`: Pulsar component logs (collected on failure)
 
 ## Advanced Usage
 
@@ -519,113 +417,104 @@ sudo journalctl -u broker -f
 ```bash
 cd terraform
 
-# Plan infrastructure
-terraform plan -var-file=../config/infrastructure.tfvars
+# Initialize
+terraform init
+
+# Plan
+terraform plan
 
 # Apply
-terraform apply -var-file=../config/infrastructure.tfvars
+terraform apply
 
 # Destroy
-terraform destroy -var-file=../config/infrastructure.tfvars
+terraform destroy
 ```
 
-### Manual AMI Operations
+### Manual Helm Operations
 
 ```bash
-# Build a new AMI
-python scripts/build-ami.py build --version 3.0.0 --region us-west-2
+# Install Pulsar
+helm install pulsar ./helm/pulsar-eks-lab -n pulsar --create-namespace
 
-# List available AMIs
-python scripts/build-ami.py list --region us-west-2
+# Upgrade Pulsar
+helm upgrade pulsar ./helm/pulsar-eks-lab -n pulsar
 
-# Validate an AMI
-python scripts/build-ami.py validate --ami-id ami-xxxxx
-
-# Delete old AMIs
-python scripts/build-ami.py delete --ami-id ami-xxxxx
-
-# Get latest AMI ID (useful for scripting)
-AMI_ID=$(python scripts/build-ami.py latest --region us-west-2)
+# Uninstall Pulsar
+helm uninstall pulsar -n pulsar
 ```
 
-See [AMI Build Guide](docs/BUILD-AMI-GUIDE.md) for complete documentation.
-
-### Run Individual Benchmarks
-
-SSH to client node and run:
+### Build and Push OMB Image
 
 ```bash
-# Using wrapper script
-run-benchmark workloads/simple-test.yaml my-test
+# Build locally
+./scripts/build-omb-image.sh
 
-# Or directly
-cd /opt/openmessaging-benchmark/benchmark-framework
-bin/benchmark \
-  --drivers /opt/benchmark-configs/pulsar-driver.yaml \
-  workloads/simple-test.yaml
+# Build and push to ECR
+./scripts/build-omb-image.sh --registry <account-id>.dkr.ecr.us-west-2.amazonaws.com/pulsar-omb --push
+
+# Build for specific platform
+./scripts/build-omb-image.sh --platform linux/amd64
 ```
+
+## Monitoring
+
+Access Grafana dashboards:
+
+```bash
+# Port-forward to Grafana
+kubectl port-forward -n pulsar svc/grafana 3000:3000
+
+# Open browser to http://localhost:3000
+# Default credentials: admin / admin
+```
+
+Pre-configured dashboards:
+- Pulsar Overview
+- Broker Metrics
+- BookKeeper Metrics
+- Topic & Namespace Stats
+- Consumer & Subscription Stats
+- JVM & System Metrics
 
 ## Development
 
-### Validate Configurations
+### Extend OMB Docker Image
+
+Edit `docker/omb/Dockerfile` and rebuild:
 
 ```bash
-# Validate against JSON schema
-python -c "
-import yaml
-import jsonschema
-
-with open('config/infrastructure.yaml') as f:
-    config = yaml.safe_load(f)
-
-with open('config/schema/infrastructure.schema.json') as f:
-    schema = yaml.safe_load(f)
-
-jsonschema.validate(config, schema)
-print('✓ Valid')
-"
+./scripts/build-omb-image.sh
 ```
 
-### Extend with Custom Metrics
+### Custom Helm Values
 
-Add custom metrics to `scripts/report_generator.py`:
+Override values during deployment:
 
-```python
-def calculate_custom_metrics(self, results: Dict) -> Dict:
-    # Your custom metric calculations
-    pass
+```bash
+python scripts/orchestrator.py deploy --values-file custom-values.yaml
 ```
-
-## Contributing
-
-Contributions welcome! Please:
-
-1. Follow existing code style
-2. Update tests for new features
-3. Update documentation
-4. Test with multiple configurations
-
-## License
-
-MIT License - see LICENSE file
 
 ## Resources
 
 ### Documentation
-- [Quick Start Guide](docs/QUICKSTART.md) - Get started in 30 minutes
-- [AMI Build Guide](docs/BUILD-AMI-GUIDE.md) - Complete guide to building and managing Pulsar AMIs
-- [AMI Quick Reference](docs/AMI-QUICK-REFERENCE.md) - Cheat sheet for common AMI commands
+- [CLAUDE.md](CLAUDE.md) - Complete architecture and development guide
+- [Helm Chart Values](helm/pulsar-eks-lab/values.yaml) - All configuration options
 
 ### External Resources
 - [Apache Pulsar Documentation](https://pulsar.apache.org/docs/)
+- [Apache Pulsar Helm Chart](https://pulsar.apache.org/docs/helm-overview/)
 - [OpenMessaging Benchmark](https://openmessaging.cloud/docs/benchmarks/)
 - [Terraform AWS Provider](https://registry.terraform.io/providers/hashicorp/aws/latest/docs)
-- [Packer Documentation](https://www.packer.io/docs)
+- [Terraform EKS Module](https://registry.terraform.io/modules/terraform-aws-modules/eks/aws/)
 
 ## Support
 
 For issues and questions:
 
-- GitHub Issues: [Report an issue](#)
-- Pulsar Slack: [Join channel](https://pulsar.apache.org/community/#section-discussions)
-- Mailing List: users@pulsar.apache.org
+- GitHub Issues: Report bugs and feature requests
+- Pulsar Slack: [Join #general channel](https://pulsar.apache.org/community/)
+- Pulsar Mailing List: users@pulsar.apache.org
+
+## License
+
+MIT License - see LICENSE file
