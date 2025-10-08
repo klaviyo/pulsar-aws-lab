@@ -34,35 +34,51 @@ class ReportGenerator:
         with open(results_file, 'r') as f:
             return json.load(f)
 
-    def parse_benchmark_metrics(self, results: Dict) -> Dict:
-        """Parse and aggregate benchmark metrics"""
+    def parse_benchmark_metrics(self, results: Dict, test_name: str = "test") -> Dict:
+        """
+        Parse OpenMessaging Benchmark JSON results.
+
+        Args:
+            results: OMB JSON output dictionary
+            test_name: Name to use for this test in metrics
+
+        Returns:
+            Metrics dictionary with throughput, latency, and error data
+        """
         metrics = {
             'throughput': {},
             'latency': {},
             'errors': {}
         }
 
-        # Extract metrics from OpenMessaging Benchmark results
-        # This is a simplified parser - actual format depends on benchmark output
-        if 'results' in results:
-            for test_name, test_results in results['results'].items():
-                metrics['throughput'][test_name] = {
-                    'publish_rate': test_results.get('publishRate', 0),
-                    'consume_rate': test_results.get('consumeRate', 0),
-                }
+        # Extract throughput metrics
+        # OMB stores rates as arrays of periodic measurements, use average
+        publish_rates = results.get('publishRate', [])
+        consume_rates = results.get('consumeRate', [])
 
-                metrics['latency'][test_name] = {
-                    'p50': test_results.get('latencyP50', 0),
-                    'p95': test_results.get('latencyP95', 0),
-                    'p99': test_results.get('latencyP99', 0),
-                    'p999': test_results.get('latencyP999', 0),
-                    'max': test_results.get('latencyMax', 0),
-                }
+        avg_publish_rate = sum(publish_rates) / len(publish_rates) if publish_rates else 0
+        avg_consume_rate = sum(consume_rates) / len(consume_rates) if consume_rates else 0
 
-                metrics['errors'][test_name] = {
-                    'publish_errors': test_results.get('publishErrors', 0),
-                    'consume_errors': test_results.get('consumeErrors', 0),
-                }
+        metrics['throughput'][test_name] = {
+            'publish_rate': avg_publish_rate,
+            'consume_rate': avg_consume_rate
+        }
+
+        # Extract latency metrics (in milliseconds)
+        metrics['latency'][test_name] = {
+            'p50': results.get('publishLatency50pct', 0),
+            'p95': results.get('publishLatency95pct', 0),
+            'p99': results.get('publishLatency99pct', 0),
+            'p999': results.get('publishLatency999pct', 0),
+            'max': results.get('publishLatencyMax', 0)
+        }
+
+        # Extract error metrics
+        # OMB doesn't explicitly track errors in JSON
+        metrics['errors'][test_name] = {
+            'publish_errors': 0,
+            'consume_errors': 0
+        }
 
         return metrics
 
@@ -193,8 +209,9 @@ class ReportGenerator:
         }
 
         for results_file in results_files:
+            test_name = results_file.stem  # Filename without extension
             results = self.load_benchmark_results(results_file)
-            metrics = self.parse_benchmark_metrics(results)
+            metrics = self.parse_benchmark_metrics(results, test_name=test_name)
 
             # Merge metrics
             for metric_type in ['throughput', 'latency', 'errors']:

@@ -531,18 +531,29 @@ spec:
             echo "Starting OMB test: {test_name}"
             /app/bin/benchmark \\
               --drivers /workload/driver.yaml \\
+              --output /results/result.json \\
               /workload/workload.yaml
+            echo "Results saved to /results/result.json"
         volumeMounts:
         - name: workload
           mountPath: /workload
+        - name: results
+          mountPath: /results
       volumes:
       - name: workload
         configMap:
           name: omb-workload-{test_name}
+      - name: results
+        emptyDir: {{}}
 """
 
     def _collect_job_logs(self, test_name: str, success: bool) -> str:
-        """Collect logs from OMB Job pod"""
+        """
+        Collect logs and results from OMB Job pod.
+
+        Returns:
+            JSON results as string
+        """
         # Get Job pod name
         result = self.run_command(
             ["kubectl", "get", "pods", "-n", self.namespace,
@@ -575,7 +586,31 @@ spec:
 
         logger.info(f"Logs saved to: {log_file}")
 
-        return logs
+        # Copy JSON results from pod if test succeeded
+        json_data = ""
+        if success:
+            results_dir = self.experiment_dir / "benchmark_results"
+            results_dir.mkdir(exist_ok=True)
+
+            result_file = results_dir / f"{test_name}.json"
+
+            # Copy result file from pod
+            result = self.run_command(
+                ["kubectl", "cp",
+                 f"{self.namespace}/{pod_name}:/results/result.json",
+                 str(result_file)],
+                f"Copy results for {test_name}",
+                check=False
+            )
+
+            if result.returncode == 0 and result_file.exists():
+                logger.info(f"Results saved to: {result_file}")
+                with open(result_file, 'r') as f:
+                    json_data = f.read()
+            else:
+                logger.warning(f"Failed to copy results file for {test_name}")
+
+        return json_data
 
     def collect_pod_logs(self) -> None:
         """Collect logs from all Pulsar component pods for debugging"""
@@ -898,10 +933,133 @@ spec:
 
         return workload
 
+    def parse_omb_results(self, result_files: List[Path]) -> Dict:
+        """
+        Parse OpenMessaging Benchmark JSON results.
+
+        Args:
+            result_files: List of JSON result file paths
+
+        Returns:
+            Dictionary with parsed metrics in ReportGenerator format:
+            {
+                'throughput': {test_name: {'publish_rate': X, 'consume_rate': Y}},
+                'latency': {test_name: {'p50': X, 'p95': Y, 'p99': Z, 'p999': A, 'max': B}},
+                'errors': {test_name: {'publish_errors': X, 'consume_errors': Y}}
+            }
+        """
+        logger.info(f"Parsing {len(result_files)} result files...")
+
+        metrics = {
+            'throughput': {},
+            'latency': {},
+            'errors': {}
+        }
+
+        for result_file in result_files:
+            test_name = result_file.stem  # Filename without extension
+
+            try:
+                with open(result_file, 'r') as f:
+                    data = json.load(f)
+
+                # Extract throughput metrics
+                # OMB stores rates as arrays of periodic measurements, we use the average
+                publish_rates = data.get('publishRate', [])
+                consume_rates = data.get('consumeRate', [])
+
+                avg_publish_rate = sum(publish_rates) / len(publish_rates) if publish_rates else 0
+                avg_consume_rate = sum(consume_rates) / len(consume_rates) if consume_rates else 0
+
+                metrics['throughput'][test_name] = {
+                    'publish_rate': avg_publish_rate,
+                    'consume_rate': avg_consume_rate
+                }
+
+                # Extract latency metrics (in milliseconds)
+                metrics['latency'][test_name] = {
+                    'p50': data.get('publishLatency50pct', 0),
+                    'p95': data.get('publishLatency95pct', 0),
+                    'p99': data.get('publishLatency99pct', 0),
+                    'p999': data.get('publishLatency999pct', 0),
+                    'max': data.get('publishLatencyMax', 0)
+                }
+
+                # Extract error metrics
+                # OMB doesn't explicitly track errors in JSON, so we'll default to 0
+                # Errors would show up as job failures or in logs
+                metrics['errors'][test_name] = {
+                    'publish_errors': 0,
+                    'consume_errors': 0
+                }
+
+                logger.info(f"✓ Parsed results for '{test_name}': "
+                           f"{avg_publish_rate:.0f} msg/s, "
+                           f"p99={data.get('publishLatency99pct', 0):.2f}ms")
+
+            except Exception as e:
+                logger.error(f"Failed to parse {result_file}: {e}")
+                # Add placeholder data for failed parse
+                metrics['throughput'][test_name] = {'publish_rate': 0, 'consume_rate': 0}
+                metrics['latency'][test_name] = {'p50': 0, 'p95': 0, 'p99': 0, 'p999': 0, 'max': 0}
+                metrics['errors'][test_name] = {'publish_errors': 1, 'consume_errors': 0}
+
+        return metrics
+
     def generate_report(self) -> None:
-        """Generate experiment report"""
-        logger.info("Generating report...")
-        logger.warning("Report generation not yet implemented")
+        """Generate comprehensive experiment report with metrics and costs"""
+        logger.info("="*60)
+        logger.info("GENERATING REPORT")
+        logger.info("="*60)
+
+        # Find all result files
+        results_dir = self.experiment_dir / "benchmark_results"
+        if not results_dir.exists():
+            logger.error(f"Results directory not found: {results_dir}")
+            logger.error("Run tests first using: orchestrator.py run --test-plan <file>")
+            return
+
+        result_files = list(results_dir.glob("*.json"))
+        if not result_files:
+            logger.error(f"No result files found in {results_dir}")
+            logger.error("Expected JSON files from OMB tests")
+            return
+
+        logger.info(f"Found {len(result_files)} result files")
+
+        # Parse OMB results
+        metrics = self.parse_omb_results(result_files)
+
+        # Load experiment configuration
+        config_file = self.experiment_dir / "infrastructure.yaml"
+        config = {}
+        if config_file.exists():
+            config = self.load_config(config_file)
+
+        # Get cost data
+        logger.info("Fetching AWS cost data...")
+        from cost_tracker import CostTracker
+        cost_tracker = CostTracker(region=self.region)
+        cost_data = cost_tracker.get_experiment_costs(self.experiment_id)
+
+        # Generate report package
+        logger.info("Generating HTML report...")
+        from report_generator import ReportGenerator
+        generator = ReportGenerator(self.experiment_dir)
+
+        report_dir = generator.create_report_package(
+            results_files=result_files,
+            cost_data=cost_data,
+            config=config,
+            include_raw_data=True
+        )
+
+        logger.info("="*60)
+        logger.info("REPORT GENERATED")
+        logger.info(f"  HTML: {report_dir}/index.html")
+        logger.info(f"  CSV:  {report_dir}/metrics.csv")
+        logger.info(f"  JSON: {report_dir}/metrics.json")
+        logger.info("="*60)
 
     def full_lifecycle(
         self,
