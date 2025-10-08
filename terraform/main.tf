@@ -6,6 +6,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 
   # Optional: Configure S3 backend for state management
@@ -22,7 +26,7 @@ provider "aws" {
   default_tags {
     tags = merge(
       {
-        Project      = "pulsar-aws-lab"
+        Project      = "pulsar-eks-lab"
         ExperimentID = var.experiment_id
         Experiment   = var.experiment_name
         ManagedBy    = "terraform"
@@ -32,30 +36,8 @@ provider "aws" {
   }
 }
 
-# Data source for pre-built Pulsar AMI
-data "aws_ami" "pulsar_base" {
-  most_recent = true
-  owners      = ["self"]  # Look for AMIs in the same account
-
-  filter {
-    name   = "name"
-    values = [var.ami_name_filter]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-
-  filter {
-    name   = "state"
-    values = ["available"]
-  }
-}
-
 locals {
-  ami_id = var.ami_id != null ? var.ami_id : data.aws_ami.pulsar_base.id
-  az     = var.availability_zone != null ? var.availability_zone : "${var.aws_region}a"
+  cluster_name = "pulsar-eks-${var.experiment_id}"
 }
 
 # Network Module
@@ -63,61 +45,50 @@ module "network" {
   source = "./modules/network"
 
   experiment_id        = var.experiment_id
-  vpc_cidr            = var.vpc_cidr
-  public_subnet_cidr  = var.public_subnet_cidr
-  availability_zone   = local.az
-  allowed_ssh_cidrs   = var.allowed_ssh_cidrs
+  cluster_name         = local.cluster_name
+  vpc_cidr             = var.vpc_cidr
+  availability_zones   = var.availability_zones
+  public_subnet_cidrs  = var.public_subnet_cidrs
+  private_subnet_cidrs = var.private_subnet_cidrs
 }
 
-# Storage Module (BookKeeper volumes)
-module "storage" {
-  source = "./modules/storage"
+# IAM Module
+module "iam" {
+  source = "./modules/iam"
 
   experiment_id = var.experiment_id
-  count_nodes   = var.bookkeeper_count
-  volume_size   = var.bookkeeper_volume_size
-  volume_type   = var.bookkeeper_volume_type
-  iops          = var.bookkeeper_iops
-  throughput    = var.bookkeeper_throughput
-  availability_zone = local.az
+  cluster_name  = local.cluster_name
 }
 
-# Compute Module
-module "compute" {
-  source = "./modules/compute"
+# EKS Module
+module "eks" {
+  source = "./modules/eks"
 
-  experiment_id        = var.experiment_id
-  ami_id               = local.ami_id
-  ssh_key_name         = var.ssh_key_name
-  vpc_id               = module.network.vpc_id
-  subnet_id            = module.network.public_subnet_id
-  security_group_id    = module.network.security_group_id
-  use_spot_instances   = var.use_spot_instances
-  spot_max_price       = var.spot_max_price
+  experiment_id          = var.experiment_id
+  cluster_name           = local.cluster_name
+  cluster_version        = var.cluster_version
+  vpc_id                 = module.network.vpc_id
+  subnet_ids             = concat(module.network.public_subnet_ids, module.network.private_subnet_ids)
+  cluster_role_arn       = module.iam.cluster_role_arn
+  node_group_role_arn    = module.iam.node_group_role_arn
+  node_group_desired_size = var.node_group_desired_size
+  node_group_min_size    = var.node_group_min_size
+  node_group_max_size    = var.node_group_max_size
+  node_instance_types    = var.node_instance_types
+  node_disk_size         = var.node_disk_size
 
-  # Pulsar configuration
-  pulsar_version = var.pulsar_version
-  cluster_name   = var.cluster_name
+  depends_on = [module.iam]
+}
 
-  # ZooKeeper
-  zookeeper_count         = var.zookeeper_count
-  zookeeper_instance_type = var.zookeeper_instance_type
-  zookeeper_heap_size     = var.zookeeper_heap_size
+# Generate kubeconfig file for kubectl access
+resource "null_resource" "kubeconfig" {
+  provisioner "local-exec" {
+    command = "aws eks update-kubeconfig --region ${var.aws_region} --name ${module.eks.cluster_name}"
+  }
 
-  # BookKeeper
-  bookkeeper_count              = var.bookkeeper_count
-  bookkeeper_instance_type      = var.bookkeeper_instance_type
-  bookkeeper_volume_ids         = module.storage.volume_ids
-  bookkeeper_heap_size          = var.bookkeeper_heap_size
-  bookkeeper_direct_memory_size = var.bookkeeper_direct_memory_size
+  triggers = {
+    cluster_id = module.eks.cluster_id
+  }
 
-  # Broker
-  broker_count              = var.broker_count
-  broker_instance_type      = var.broker_instance_type
-  broker_heap_size          = var.broker_heap_size
-  broker_direct_memory_size = var.broker_direct_memory_size
-
-  # Client
-  client_count         = var.client_count
-  client_instance_type = var.client_instance_type
+  depends_on = [module.eks]
 }

@@ -1,4 +1,4 @@
-# Terraform Variables
+# Terraform Variables - EKS Configuration
 
 variable "experiment_id" {
   description = "Unique experiment identifier"
@@ -20,24 +20,6 @@ variable "aws_region" {
   default     = "us-west-2"
 }
 
-variable "availability_zone" {
-  description = "AWS availability zone (optional)"
-  type        = string
-  default     = null
-}
-
-variable "use_spot_instances" {
-  description = "Use spot instances for cost savings"
-  type        = bool
-  default     = false
-}
-
-variable "spot_max_price" {
-  description = "Maximum spot instance price"
-  type        = string
-  default     = null
-}
-
 # Network Configuration
 variable "vpc_cidr" {
   description = "VPC CIDR block"
@@ -45,152 +27,60 @@ variable "vpc_cidr" {
   default     = "10.0.0.0/16"
 }
 
-variable "public_subnet_cidr" {
-  description = "Public subnet CIDR block"
-  type        = string
-  default     = "10.0.1.0/24"
-}
-
-variable "allowed_ssh_cidrs" {
-  description = "CIDR blocks allowed for SSH access"
+variable "availability_zones" {
+  description = "List of availability zones"
   type        = list(string)
-  default     = ["0.0.0.0/0"]
+  default     = ["us-west-2a", "us-west-2b", "us-west-2c"]
 }
 
-# Compute Configuration
-variable "ssh_key_name" {
-  description = "AWS SSH key pair name"
+variable "public_subnet_cidrs" {
+  description = "List of public subnet CIDR blocks"
+  type        = list(string)
+  default     = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+}
+
+variable "private_subnet_cidrs" {
+  description = "List of private subnet CIDR blocks"
+  type        = list(string)
+  default     = ["10.0.11.0/24", "10.0.12.0/24", "10.0.13.0/24"]
+}
+
+# EKS Cluster Configuration
+variable "cluster_version" {
+  description = "Kubernetes version for EKS cluster"
   type        = string
+  default     = "1.31"
 }
 
-variable "ami_id" {
-  description = "AMI ID override (uses AMI filter if not specified)"
-  type        = string
-  default     = null
+# EKS Node Group Configuration
+variable "node_instance_types" {
+  description = "List of instance types for EKS node group"
+  type        = list(string)
+  default     = ["t3.medium"]
 }
 
-variable "ami_name_filter" {
-  description = "AMI name filter for finding pre-built Pulsar AMI"
-  type        = string
-  default     = "pulsar-base-3.0.0-*"
+variable "node_disk_size" {
+  description = "Disk size for EKS nodes (GB)"
+  type        = number
+  default     = 50
 }
 
-variable "pulsar_version" {
-  description = "Apache Pulsar version"
-  type        = string
-  default     = "3.0.0"
-}
-
-variable "cluster_name" {
-  description = "Pulsar cluster name"
-  type        = string
-  default     = "pulsar-aws-lab"
-}
-
-# ZooKeeper Configuration
-variable "zookeeper_count" {
-  description = "Number of ZooKeeper instances"
+variable "node_group_desired_size" {
+  description = "Desired number of nodes in EKS node group"
   type        = number
   default     = 3
 }
 
-variable "zookeeper_instance_type" {
-  description = "ZooKeeper instance type"
-  type        = string
-  default     = "t3.micro"
-}
-
-variable "zookeeper_heap_size" {
-  description = "ZooKeeper JVM heap size"
-  type        = string
-  default     = "512M"
-}
-
-# BookKeeper Configuration
-variable "bookkeeper_count" {
-  description = "Number of BookKeeper instances"
-  type        = number
-  default     = 3
-}
-
-variable "bookkeeper_instance_type" {
-  description = "BookKeeper instance type"
-  type        = string
-  default     = "t3.small"
-}
-
-variable "bookkeeper_volume_size" {
-  description = "BookKeeper EBS volume size (GB)"
-  type        = number
-  default     = 20
-}
-
-variable "bookkeeper_volume_type" {
-  description = "BookKeeper EBS volume type"
-  type        = string
-  default     = "gp3"
-}
-
-variable "bookkeeper_iops" {
-  description = "BookKeeper EBS IOPS (for io1/io2)"
-  type        = number
-  default     = null
-}
-
-variable "bookkeeper_throughput" {
-  description = "BookKeeper EBS throughput in MB/s (for gp3)"
-  type        = number
-  default     = 125
-}
-
-variable "bookkeeper_heap_size" {
-  description = "BookKeeper JVM heap size"
-  type        = string
-  default     = "768M"
-}
-
-variable "bookkeeper_direct_memory_size" {
-  description = "BookKeeper JVM direct memory size"
-  type        = string
-  default     = "512M"
-}
-
-# Broker Configuration
-variable "broker_count" {
-  description = "Number of Broker instances"
-  type        = number
-  default     = 2
-}
-
-variable "broker_instance_type" {
-  description = "Broker instance type"
-  type        = string
-  default     = "t3.small"
-}
-
-variable "broker_heap_size" {
-  description = "Broker JVM heap size"
-  type        = string
-  default     = "1G"
-}
-
-variable "broker_direct_memory_size" {
-  description = "Broker JVM direct memory size"
-  type        = string
-  default     = "512M"
-}
-
-# Client Configuration
-variable "client_count" {
-  description = "Number of Client instances"
+variable "node_group_min_size" {
+  description = "Minimum number of nodes in EKS node group"
   type        = number
   default     = 1
 }
 
-variable "client_instance_type" {
-  description = "Client instance type"
-  type        = string
-  default     = "t3.small"
+variable "node_group_max_size" {
+  description = "Maximum number of nodes in EKS node group"
+  type        = number
+  default     = 5
 }
 
 # Tags

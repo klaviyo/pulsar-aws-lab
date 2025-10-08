@@ -1,7 +1,12 @@
-# Network Module - VPC, Subnets, Security Groups
+# Network Module - VPC, Subnets, NAT Gateway for EKS
 
 variable "experiment_id" {
   description = "Experiment ID"
+  type        = string
+}
+
+variable "cluster_name" {
+  description = "EKS cluster name"
   type        = string
 }
 
@@ -10,18 +15,18 @@ variable "vpc_cidr" {
   type        = string
 }
 
-variable "public_subnet_cidr" {
-  description = "Public subnet CIDR"
-  type        = string
+variable "availability_zones" {
+  description = "List of availability zones"
+  type        = list(string)
 }
 
-variable "availability_zone" {
-  description = "Availability zone"
-  type        = string
+variable "public_subnet_cidrs" {
+  description = "List of public subnet CIDRs"
+  type        = list(string)
 }
 
-variable "allowed_ssh_cidrs" {
-  description = "Allowed SSH CIDR blocks"
+variable "private_subnet_cidrs" {
+  description = "List of private subnet CIDRs"
   type        = list(string)
 }
 
@@ -31,9 +36,14 @@ resource "aws_vpc" "main" {
   enable_dns_hostnames = true
   enable_dns_support   = true
 
-  tags = {
-    Name = "pulsar-lab-${var.experiment_id}"
-  }
+  tags = merge(
+    {
+      Name = "pulsar-eks-${var.experiment_id}"
+    },
+    {
+      "kubernetes.io/cluster/${var.cluster_name}" = "shared"
+    }
+  )
 
   lifecycle {
     ignore_changes = [tags_all]
@@ -45,7 +55,7 @@ resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
 
   tags = {
-    Name = "pulsar-lab-igw-${var.experiment_id}"
+    Name = "pulsar-eks-igw-${var.experiment_id}"
   }
 
   lifecycle {
@@ -53,23 +63,85 @@ resource "aws_internet_gateway" "main" {
   }
 }
 
-# Public Subnet
+# Public Subnets
 resource "aws_subnet" "public" {
+  count                   = length(var.public_subnet_cidrs)
   vpc_id                  = aws_vpc.main.id
-  cidr_block              = var.public_subnet_cidr
-  availability_zone       = var.availability_zone
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  availability_zone       = var.availability_zones[count.index]
   map_public_ip_on_launch = true
 
-  tags = {
-    Name = "pulsar-lab-public-${var.experiment_id}"
-  }
+  tags = merge(
+    {
+      Name = "pulsar-eks-public-${var.experiment_id}-${count.index + 1}"
+    },
+    {
+      "kubernetes.io/cluster/${var.cluster_name}" = "shared"
+      "kubernetes.io/role/elb"                    = "1"
+    }
+  )
 
   lifecycle {
     ignore_changes = [tags_all]
   }
 }
 
-# Route Table
+# Private Subnets
+resource "aws_subnet" "private" {
+  count             = length(var.private_subnet_cidrs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_subnet_cidrs[count.index]
+  availability_zone = var.availability_zones[count.index]
+
+  tags = merge(
+    {
+      Name = "pulsar-eks-private-${var.experiment_id}-${count.index + 1}"
+    },
+    {
+      "kubernetes.io/cluster/${var.cluster_name}" = "shared"
+      "kubernetes.io/role/internal-elb"           = "1"
+    }
+  )
+
+  lifecycle {
+    ignore_changes = [tags_all]
+  }
+}
+
+# Elastic IPs for NAT Gateways
+resource "aws_eip" "nat" {
+  count  = length(var.public_subnet_cidrs)
+  domain = "vpc"
+
+  tags = {
+    Name = "pulsar-eks-nat-eip-${var.experiment_id}-${count.index + 1}"
+  }
+
+  depends_on = [aws_internet_gateway.main]
+
+  lifecycle {
+    ignore_changes = [tags_all]
+  }
+}
+
+# NAT Gateways (one per AZ for high availability)
+resource "aws_nat_gateway" "main" {
+  count         = length(var.public_subnet_cidrs)
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
+
+  tags = {
+    Name = "pulsar-eks-nat-${var.experiment_id}-${count.index + 1}"
+  }
+
+  depends_on = [aws_internet_gateway.main]
+
+  lifecycle {
+    ignore_changes = [tags_all]
+  }
+}
+
+# Public Route Table
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
 
@@ -79,7 +151,7 @@ resource "aws_route_table" "public" {
   }
 
   tags = {
-    Name = "pulsar-lab-rt-${var.experiment_id}"
+    Name = "pulsar-eks-public-rt-${var.experiment_id}"
   }
 
   lifecycle {
@@ -87,124 +159,37 @@ resource "aws_route_table" "public" {
   }
 }
 
-# Route Table Association
-resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.public.id
-  route_table_id = aws_route_table.public.id
-}
+# Private Route Tables (one per AZ)
+resource "aws_route_table" "private" {
+  count  = length(var.private_subnet_cidrs)
+  vpc_id = aws_vpc.main.id
 
-# Security Group
-resource "aws_security_group" "pulsar" {
-  name        = "pulsar-lab-sg-${var.experiment_id}"
-  description = "Security group for Pulsar cluster"
-  vpc_id      = aws_vpc.main.id
-
-  # SSH removed - using AWS Systems Manager Session Manager instead
-
-  # ZooKeeper client port
-  ingress {
-    from_port   = 2181
-    to_port     = 2181
-    protocol    = "tcp"
-    self        = true
-    description = "ZooKeeper client"
-  }
-
-  # ZooKeeper peer ports
-  ingress {
-    from_port   = 2888
-    to_port     = 2888
-    protocol    = "tcp"
-    self        = true
-    description = "ZooKeeper peer"
-  }
-
-  ingress {
-    from_port   = 3888
-    to_port     = 3888
-    protocol    = "tcp"
-    self        = true
-    description = "ZooKeeper leader election"
-  }
-
-  # BookKeeper port
-  ingress {
-    from_port   = 3181
-    to_port     = 3181
-    protocol    = "tcp"
-    self        = true
-    description = "BookKeeper"
-  }
-
-  # Pulsar broker binary protocol
-  ingress {
-    from_port   = 6650
-    to_port     = 6650
-    protocol    = "tcp"
-    self        = true
-    description = "Pulsar broker binary"
-  }
-
-  # Allow external access to broker for testing
-  ingress {
-    from_port   = 6650
-    to_port     = 6650
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Pulsar broker binary (external)"
-  }
-
-  # Pulsar broker HTTP
-  ingress {
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    self        = true
-    description = "Pulsar broker HTTP"
-  }
-
-  # Allow external access to broker HTTP for testing
-  ingress {
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Pulsar broker HTTP (external)"
-  }
-
-  # Pulsar broker TLS (optional)
-  ingress {
-    from_port   = 6651
-    to_port     = 6651
-    protocol    = "tcp"
-    self        = true
-    description = "Pulsar broker TLS"
-  }
-
-  ingress {
-    from_port   = 8443
-    to_port     = 8443
-    protocol    = "tcp"
-    self        = true
-    description = "Pulsar broker HTTPS"
-  }
-
-  # Allow all outbound traffic
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "All outbound traffic"
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
   }
 
   tags = {
-    Name = "pulsar-lab-sg-${var.experiment_id}"
+    Name = "pulsar-eks-private-rt-${var.experiment_id}-${count.index + 1}"
   }
 
   lifecycle {
     ignore_changes = [tags_all]
   }
+}
+
+# Public Route Table Associations
+resource "aws_route_table_association" "public" {
+  count          = length(var.public_subnet_cidrs)
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+# Private Route Table Associations
+resource "aws_route_table_association" "private" {
+  count          = length(var.private_subnet_cidrs)
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private[count.index].id
 }
 
 # Outputs
@@ -213,12 +198,17 @@ output "vpc_id" {
   value       = aws_vpc.main.id
 }
 
-output "public_subnet_id" {
-  description = "Public subnet ID"
-  value       = aws_subnet.public.id
+output "public_subnet_ids" {
+  description = "List of public subnet IDs"
+  value       = aws_subnet.public[*].id
 }
 
-output "security_group_id" {
-  description = "Security group ID"
-  value       = aws_security_group.pulsar.id
+output "private_subnet_ids" {
+  description = "List of private subnet IDs"
+  value       = aws_subnet.private[*].id
+}
+
+output "nat_gateway_ips" {
+  description = "List of NAT Gateway public IPs"
+  value       = aws_eip.nat[*].public_ip
 }
