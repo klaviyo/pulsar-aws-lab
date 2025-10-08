@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pulsar AWS Lab Orchestrator
-Main workflow controller for infrastructure, deployment, testing, and teardown
+Workflow controller for EKS cluster management, Helm deployments, and benchmark testing
 """
 
 import argparse
@@ -13,7 +13,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import boto3
 import yaml
@@ -28,10 +28,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Project root directory
+# Project directories
 PROJECT_ROOT = Path(__file__).parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
 TERRAFORM_DIR = PROJECT_ROOT / "terraform"
+HELM_DIR = PROJECT_ROOT / "helm" / "pulsar-eks-lab"
 RESULTS_DIR = Path.home() / ".pulsar-aws-lab"
 
 
@@ -41,7 +42,7 @@ class OrchestratorError(Exception):
 
 
 class Orchestrator:
-    """Main orchestrator class for AMI-based deployments"""
+    """Main orchestrator for EKS-based Pulsar deployments"""
 
     def __init__(self, experiment_id: Optional[str] = None):
         """
@@ -54,6 +55,9 @@ class Orchestrator:
         self.experiment_dir = RESULTS_DIR / self.experiment_id
         self.experiment_dir.mkdir(parents=True, exist_ok=True)
         self.infrastructure_config = None
+        self.cluster_name = None
+        self.helm_release_name = "pulsar"
+        self.namespace = "pulsar"
 
         # Create/update "latest" symlink
         latest_link = RESULTS_DIR / "latest"
@@ -89,69 +93,524 @@ class Orchestrator:
         with open(config_file, 'r') as f:
             return yaml.safe_load(f)
 
-    def validate_ami_exists(self, region: str, ami_name_pattern: str = "pulsar-base-*") -> Optional[str]:
+    def run_command(
+        self,
+        cmd: List[str],
+        description: str,
+        capture_output: bool = False,
+        check: bool = True
+    ) -> subprocess.CompletedProcess:
         """
-        Validate that the required AMI exists in the region.
+        Run shell command with logging.
 
         Args:
-            region: AWS region to check
-            ami_name_pattern: AMI name pattern to search for
+            cmd: Command and arguments as list
+            description: Human-readable description
+            capture_output: Whether to capture stdout/stderr
+            check: Whether to raise exception on non-zero exit
 
         Returns:
-            AMI ID if found, None otherwise
+            CompletedProcess object
 
         Raises:
-            OrchestratorError: If AMI not found or validation fails
+            OrchestratorError: If command fails and check=True
         """
-        logger.info(f"Validating AMI availability in {region}...")
-        logger.info(f"Searching for AMI with pattern: {ami_name_pattern}")
-
-        ec2_client = boto3.client('ec2', region_name=region)
+        logger.info(f"Running: {description}")
+        logger.debug(f"Command: {' '.join(cmd)}")
 
         try:
-            # Search for AMI by name pattern (owned by self)
-            response = ec2_client.describe_images(
-                Filters=[
-                    {'Name': 'name', 'Values': [ami_name_pattern]},
-                    {'Name': 'state', 'Values': ['available']}
-                ],
-                Owners=['self']  # Only search AMIs owned by this account
+            result = subprocess.run(
+                cmd,
+                capture_output=capture_output,
+                text=True,
+                check=check
+            )
+            if capture_output and result.stdout:
+                logger.debug(f"Output: {result.stdout[:500]}")
+            return result
+        except subprocess.CalledProcessError as e:
+            error_msg = f"Command failed: {description}"
+            if capture_output and e.stderr:
+                error_msg += f"\nError: {e.stderr}"
+            logger.error(error_msg)
+            raise OrchestratorError(error_msg) from e
+
+    def setup_kubectl_context(self, region: str, cluster_name: str) -> None:
+        """
+        Configure kubectl to connect to EKS cluster.
+
+        Args:
+            region: AWS region
+            cluster_name: EKS cluster name
+
+        Raises:
+            OrchestratorError: If kubectl setup fails
+        """
+        logger.info(f"Setting up kubectl context for cluster: {cluster_name}")
+
+        # Update kubeconfig
+        self.run_command(
+            ["aws", "eks", "update-kubeconfig",
+             "--region", region,
+             "--name", cluster_name],
+            "Configure kubectl context"
+        )
+
+        # Verify connectivity
+        result = self.run_command(
+            ["kubectl", "cluster-info"],
+            "Verify kubectl connectivity",
+            capture_output=True
+        )
+        logger.info(f"✓ kubectl configured successfully")
+        logger.debug(result.stdout)
+
+        # Get node count
+        result = self.run_command(
+            ["kubectl", "get", "nodes", "-o", "json"],
+            "Get cluster nodes",
+            capture_output=True
+        )
+        nodes = json.loads(result.stdout)
+        node_count = len(nodes.get('items', []))
+        logger.info(f"✓ Cluster has {node_count} nodes")
+
+    def helm_deploy(self, values_overrides: Optional[Dict] = None) -> None:
+        """
+        Deploy or upgrade Pulsar using Helm.
+
+        Args:
+            values_overrides: Optional Helm values to override
+
+        Raises:
+            OrchestratorError: If Helm deployment fails
+        """
+        logger.info(f"Deploying Helm chart: {self.helm_release_name}")
+
+        # Check if release exists
+        result = self.run_command(
+            ["helm", "list", "-n", self.namespace, "-o", "json"],
+            "Check existing Helm releases",
+            capture_output=True,
+            check=False
+        )
+
+        releases = json.loads(result.stdout) if result.stdout else []
+        release_exists = any(r['name'] == self.helm_release_name for r in releases)
+
+        # Prepare Helm command
+        if release_exists:
+            cmd = ["helm", "upgrade", self.helm_release_name]
+            action = "Upgrading"
+        else:
+            cmd = ["helm", "install", self.helm_release_name]
+            action = "Installing"
+
+        cmd.extend([
+            str(HELM_DIR),
+            "-n", self.namespace,
+            "--create-namespace",
+            "--wait",
+            "--timeout", "15m"
+        ])
+
+        # Add custom values if provided
+        if values_overrides:
+            values_file = self.experiment_dir / "helm-values.yaml"
+            with open(values_file, 'w') as f:
+                yaml.dump(values_overrides, f)
+            cmd.extend(["-f", str(values_file)])
+
+        # Execute Helm deploy
+        logger.info(f"{action} {self.helm_release_name}...")
+        self.run_command(cmd, f"{action} Helm release")
+
+        logger.info(f"✓ Helm release {self.helm_release_name} deployed successfully")
+
+    def helm_undeploy(self) -> None:
+        """
+        Uninstall Pulsar Helm release.
+
+        Raises:
+            OrchestratorError: If Helm uninstall fails
+        """
+        logger.info(f"Uninstalling Helm release: {self.helm_release_name}")
+
+        self.run_command(
+            ["helm", "uninstall", self.helm_release_name,
+             "-n", self.namespace,
+             "--wait",
+             "--timeout", "10m"],
+            "Uninstall Helm release"
+        )
+
+        logger.info(f"✓ Helm release {self.helm_release_name} uninstalled")
+
+        # Wait for namespace cleanup
+        logger.info("Waiting for pods to terminate...")
+        timeout = 120
+        start = time.time()
+
+        while time.time() - start < timeout:
+            result = self.run_command(
+                ["kubectl", "get", "pods", "-n", self.namespace, "-o", "json"],
+                "Check pod status",
+                capture_output=True,
+                check=False
             )
 
-            images = response.get('Images', [])
+            pods = json.loads(result.stdout) if result.stdout else {}
+            pod_count = len(pods.get('items', []))
 
-            if not images:
-                # CHANGED: Provide detailed error message with troubleshooting steps
-                error_msg = (
-                    f"No AMI found matching pattern '{ami_name_pattern}' in {region}.\n"
-                    f"Please ensure you have built the Pulsar base AMI using Packer.\n"
-                    f"Run: cd packer && packer build pulsar-base.pkr.hcl\n"
-                    f"Or check that the AMI exists in region {region}"
-                )
-                logger.error(error_msg)
-                raise OrchestratorError(error_msg)
+            if pod_count == 0:
+                logger.info("✓ All pods terminated")
+                break
 
-            # Sort by creation date (newest first)
-            images.sort(key=lambda x: x['CreationDate'], reverse=True)
-            latest_ami = images[0]
-            ami_id = latest_ami['ImageId']
-            ami_name = latest_ami['Name']
-            creation_date = latest_ami['CreationDate']
+            logger.info(f"Waiting for {pod_count} pods to terminate...")
+            time.sleep(5)
 
-            logger.info(f"✓ Found AMI: {ami_name} ({ami_id})")
-            logger.info(f"  Created: {creation_date}")
-            logger.info(f"  State: {latest_ami['State']}")
+    def wait_for_pods_ready(self, timeout_seconds: int = 600) -> None:
+        """
+        Wait for all Pulsar pods to be ready.
 
-            if len(images) > 1:
-                logger.info(f"  Note: Found {len(images)} matching AMIs, using the latest")
+        Args:
+            timeout_seconds: Maximum time to wait
 
-            return ami_id
+        Raises:
+            OrchestratorError: If pods don't become ready within timeout
+        """
+        logger.info("="*60)
+        logger.info("WAITING FOR PODS TO BE READY")
+        logger.info("="*60)
 
-        except Exception as e:
-            if isinstance(e, OrchestratorError):
-                raise
-            logger.error(f"AMI validation failed: {e}")
-            raise OrchestratorError(f"Failed to validate AMI: {e}") from e
+        start_time = time.time()
+        backoff_seconds = 5
+        max_backoff = 30
+
+        critical_components = ['zookeeper', 'bookkeeper', 'broker']
+
+        while time.time() - start_time < timeout_seconds:
+            # Get all pods
+            result = self.run_command(
+                ["kubectl", "get", "pods", "-n", self.namespace, "-o", "json"],
+                "Get pod status",
+                capture_output=True
+            )
+
+            pods = json.loads(result.stdout)
+            pod_items = pods.get('items', [])
+
+            if not pod_items:
+                logger.warning("No pods found yet, retrying...")
+                time.sleep(backoff_seconds)
+                continue
+
+            # Check pod readiness
+            all_ready = True
+            component_status = {}
+
+            for pod in pod_items:
+                name = pod['metadata']['name']
+                component = self._get_pod_component(name)
+
+                # Get pod phase and conditions
+                phase = pod['status'].get('phase', 'Unknown')
+                conditions = pod['status'].get('conditions', [])
+
+                ready = False
+                for condition in conditions:
+                    if condition['type'] == 'Ready':
+                        ready = condition['status'] == 'True'
+                        break
+
+                status_str = f"{phase} ({'Ready' if ready else 'Not Ready'})"
+                component_status.setdefault(component, []).append((name, status_str, ready))
+
+                if not ready:
+                    all_ready = False
+
+            # Log status
+            logger.info(f"Pod status ({len(pod_items)} total):")
+            for component in sorted(component_status.keys()):
+                pods_status = component_status[component]
+                ready_count = sum(1 for _, _, ready in pods_status if ready)
+                logger.info(f"  {component}: {ready_count}/{len(pods_status)} ready")
+                for pod_name, status, _ in pods_status:
+                    symbol = "✓" if "Ready" in status else "✗"
+                    logger.info(f"    {symbol} {pod_name}: {status}")
+
+            if all_ready:
+                logger.info("\n✓ All pods are ready!")
+                break
+
+            elapsed = int(time.time() - start_time)
+            logger.info(f"Waiting for pods... ({elapsed}s elapsed)")
+            time.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 1.5, max_backoff)
+
+        if time.time() - start_time >= timeout_seconds:
+            raise OrchestratorError(
+                f"Timeout waiting for pods to be ready after {timeout_seconds}s"
+            )
+
+        total_time = int(time.time() - start_time)
+        logger.info("="*60)
+        logger.info(f"PODS READY! (Total time: {total_time}s)")
+        logger.info("="*60)
+
+    def _get_pod_component(self, pod_name: str) -> str:
+        """Extract component type from pod name"""
+        for component in ['zookeeper', 'bookkeeper', 'broker', 'proxy', 'prometheus', 'grafana']:
+            if component in pod_name.lower():
+                return component
+        return 'other'
+
+    def check_pulsar_health(self) -> None:
+        """
+        Verify Pulsar broker health endpoint.
+
+        Raises:
+            OrchestratorError: If health check fails
+        """
+        logger.info("Checking Pulsar broker health...")
+
+        # Get broker service
+        result = self.run_command(
+            ["kubectl", "get", "svc", "-n", self.namespace,
+             "-l", "component=broker",
+             "-o", "jsonpath={.items[0].metadata.name}"],
+            "Get broker service name",
+            capture_output=True
+        )
+
+        broker_svc = result.stdout.strip()
+        if not broker_svc:
+            raise OrchestratorError("Broker service not found")
+
+        # Check health via kubectl exec on broker pod
+        result = self.run_command(
+            ["kubectl", "get", "pods", "-n", self.namespace,
+             "-l", "component=broker",
+             "-o", "jsonpath={.items[0].metadata.name}"],
+            "Get broker pod name",
+            capture_output=True
+        )
+
+        broker_pod = result.stdout.strip()
+        if not broker_pod:
+            raise OrchestratorError("Broker pod not found")
+
+        # Check health endpoint
+        result = self.run_command(
+            ["kubectl", "exec", "-n", self.namespace, broker_pod, "--",
+             "curl", "-s", "-f", "http://localhost:8080/admin/v2/brokers/health"],
+            "Check broker health endpoint",
+            capture_output=True
+        )
+
+        logger.info("✓ Pulsar broker health check passed")
+
+    def run_omb_job(self, test_config: Dict, workload_config: Dict) -> str:
+        """
+        Run OpenMessaging Benchmark job.
+
+        Args:
+            test_config: Test run configuration
+            workload_config: Workload specification
+
+        Returns:
+            Test results as JSON string
+
+        Raises:
+            OrchestratorError: If test execution fails
+        """
+        test_name = test_config['name']
+        logger.info(f"Running OMB test: {test_name}")
+
+        # Generate workload ConfigMap
+        workload_yaml = self._generate_omb_workload_yaml(test_name, workload_config)
+        workload_file = self.experiment_dir / f"workload_{test_name}.yaml"
+
+        with open(workload_file, 'w') as f:
+            f.write(workload_yaml)
+
+        # Apply workload ConfigMap
+        self.run_command(
+            ["kubectl", "apply", "-f", str(workload_file)],
+            f"Apply workload ConfigMap for {test_name}"
+        )
+
+        # Create OMB Job (modify from template)
+        job_yaml = self._generate_omb_job_yaml(test_name)
+        job_file = self.experiment_dir / f"omb_job_{test_name}.yaml"
+
+        with open(job_file, 'w') as f:
+            f.write(job_yaml)
+
+        # Apply Job
+        self.run_command(
+            ["kubectl", "apply", "-f", str(job_file)],
+            f"Create OMB Job for {test_name}"
+        )
+
+        # Wait for Job completion
+        logger.info(f"Waiting for test {test_name} to complete...")
+        result = self.run_command(
+            ["kubectl", "wait", "--for=condition=complete",
+             f"job/omb-{test_name}", "-n", self.namespace,
+             "--timeout=30m"],
+            f"Wait for Job {test_name} completion",
+            check=False
+        )
+
+        if result.returncode != 0:
+            # Check if Job failed
+            logger.error(f"Job {test_name} did not complete successfully")
+            self._collect_job_logs(test_name, success=False)
+            raise OrchestratorError(f"OMB test {test_name} failed")
+
+        # Collect results from Job logs
+        logger.info(f"Collecting results for {test_name}...")
+        results = self._collect_job_logs(test_name, success=True)
+
+        # Cleanup Job
+        self.run_command(
+            ["kubectl", "delete", "job", f"omb-{test_name}", "-n", self.namespace],
+            f"Delete OMB Job {test_name}",
+            check=False
+        )
+
+        return results
+
+    def _generate_omb_workload_yaml(self, test_name: str, workload: Dict) -> str:
+        """Generate Kubernetes ConfigMap YAML for OMB workload"""
+        workload_content = yaml.dump(workload)
+
+        return f"""apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omb-workload-{test_name}
+  namespace: {self.namespace}
+data:
+  workload.yaml: |
+{chr(10).join('    ' + line for line in workload_content.split(chr(10)))}
+  driver.yaml: |
+    name: Pulsar
+    driverClass: io.openmessaging.benchmark.driver.pulsar.PulsarBenchmarkDriver
+    client:
+      serviceUrl: pulsar://{self.helm_release_name}-broker:6650
+      httpUrl: http://{self.helm_release_name}-broker:8080
+    producer:
+      batchingEnabled: true
+      batchingMaxPublishDelayMs: 1
+      blockIfQueueFull: true
+      pendingQueueSize: 1000
+    consumer:
+      subscriptionType: Exclusive
+"""
+
+    def _generate_omb_job_yaml(self, test_name: str) -> str:
+        """Generate Kubernetes Job YAML for OMB test"""
+        return f"""apiVersion: batch/v1
+kind: Job
+metadata:
+  name: omb-{test_name}
+  namespace: {self.namespace}
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: omb
+        image: pulsar-omb:latest
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            echo "Starting OMB test: {test_name}"
+            /app/bin/benchmark \\
+              --drivers /workload/driver.yaml \\
+              /workload/workload.yaml
+        volumeMounts:
+        - name: workload
+          mountPath: /workload
+      volumes:
+      - name: workload
+        configMap:
+          name: omb-workload-{test_name}
+"""
+
+    def _collect_job_logs(self, test_name: str, success: bool) -> str:
+        """Collect logs from OMB Job pod"""
+        # Get Job pod name
+        result = self.run_command(
+            ["kubectl", "get", "pods", "-n", self.namespace,
+             "-l", f"job-name=omb-{test_name}",
+             "-o", "jsonpath={.items[0].metadata.name}"],
+            f"Get Job pod for {test_name}",
+            capture_output=True,
+            check=False
+        )
+
+        pod_name = result.stdout.strip()
+        if not pod_name:
+            logger.warning(f"Could not find pod for Job {test_name}")
+            return ""
+
+        # Get pod logs
+        result = self.run_command(
+            ["kubectl", "logs", pod_name, "-n", self.namespace],
+            f"Get logs for {test_name}",
+            capture_output=True,
+            check=False
+        )
+
+        logs = result.stdout
+
+        # Save logs to file
+        log_file = self.experiment_dir / f"omb_{test_name}_{'success' if success else 'failed'}.log"
+        with open(log_file, 'w') as f:
+            f.write(logs)
+
+        logger.info(f"Logs saved to: {log_file}")
+
+        return logs
+
+    def collect_pod_logs(self) -> None:
+        """Collect logs from all Pulsar component pods for debugging"""
+        logger.info("Collecting pod logs for troubleshooting...")
+
+        result = self.run_command(
+            ["kubectl", "get", "pods", "-n", self.namespace, "-o", "json"],
+            "Get all pods",
+            capture_output=True
+        )
+
+        pods = json.loads(result.stdout)
+
+        logs_dir = self.experiment_dir / "pod_logs"
+        logs_dir.mkdir(exist_ok=True)
+
+        for pod in pods.get('items', []):
+            pod_name = pod['metadata']['name']
+            component = self._get_pod_component(pod_name)
+
+            logger.info(f"Collecting logs from {pod_name}...")
+
+            result = self.run_command(
+                ["kubectl", "logs", pod_name, "-n", self.namespace,
+                 "--tail=1000"],
+                f"Get logs from {pod_name}",
+                capture_output=True,
+                check=False
+            )
+
+            log_file = logs_dir / f"{component}_{pod_name}.log"
+            with open(log_file, 'w') as f:
+                f.write(result.stdout if result.stdout else "No logs available")
+
+        logger.info(f"✓ Pod logs collected in: {logs_dir}")
 
     def run_terraform(self, action: str, var_file: Optional[Path] = None) -> None:
         """
@@ -167,12 +626,9 @@ class Orchestrator:
 
         if action in ["plan", "apply", "destroy"]:
             if var_file and var_file.exists():
-                # Check if it's already a tfvars.json file or a YAML config
                 if var_file.suffix == '.json':
-                    # Already a tfvars file, use directly
                     cmd.extend(["-var-file", str(var_file)])
                 else:
-                    # YAML config, convert to tfvars
                     config = self.load_config(var_file)
                     tfvars_file = self.experiment_dir / "terraform.tfvars.json"
                     self._generate_tfvars(config, tfvars_file)
@@ -182,7 +638,6 @@ class Orchestrator:
                 cmd.append("-auto-approve")
 
         try:
-            # Stream output to console in real-time
             result = subprocess.run(cmd, check=True)
             logger.info(f"Terraform {action} completed successfully")
         except subprocess.CalledProcessError as e:
@@ -191,720 +646,240 @@ class Orchestrator:
 
     def _generate_tfvars(self, config: Dict, output_file: Path) -> None:
         """
-        Generate Terraform variables file from YAML config.
+        Generate Terraform variables file from configuration.
 
         Args:
             config: Parsed infrastructure configuration
             output_file: Path to output tfvars.json file
         """
         tfvars = {
-            "experiment_id": self.experiment_id,  # Use orchestrator's ID, not config file
+            "experiment_id": self.experiment_id,
             "experiment_name": config["experiment"]["name"],
             "aws_region": config["aws"]["region"],
             "vpc_cidr": config["network"]["vpc_cidr"],
-            "public_subnet_cidr": config["network"]["public_subnet_cidr"],
-            "allowed_ssh_cidrs": config["network"]["allowed_ssh_cidrs"],
-            "ssh_key_name": config["compute"]["ssh_key_name"],
-            "zookeeper_count": config["compute"]["zookeeper"]["count"],
-            "zookeeper_instance_type": config["compute"]["zookeeper"]["instance_type"],
-            "bookkeeper_count": config["compute"]["bookkeeper"]["count"],
-            "bookkeeper_instance_type": config["compute"]["bookkeeper"]["instance_type"],
-            "broker_count": config["compute"]["broker"]["count"],
-            "broker_instance_type": config["compute"]["broker"]["instance_type"],
-            "client_count": config["compute"]["client"]["count"],
-            "client_instance_type": config["compute"]["client"]["instance_type"],
             "additional_tags": config["experiment"].get("tags", {}),
         }
 
-        # Add optional fields
-        if "availability_zone" in config["aws"]:
-            tfvars["availability_zone"] = config["aws"]["availability_zone"]
+        # EKS-specific variables
+        if "availability_zones" in config["aws"]:
+            tfvars["availability_zones"] = config["aws"]["availability_zones"]
 
-        if "use_spot_instances" in config["aws"]:
-            tfvars["use_spot_instances"] = config["aws"]["use_spot_instances"]
-            if config["aws"].get("spot_max_price"):
-                tfvars["spot_max_price"] = config["aws"]["spot_max_price"]
+        if "public_subnet_cidrs" in config["network"]:
+            tfvars["public_subnet_cidrs"] = config["network"]["public_subnet_cidrs"]
 
-        # BookKeeper storage
-        if "storage" in config["compute"]["bookkeeper"]:
-            storage = config["compute"]["bookkeeper"]["storage"]
-            tfvars["bookkeeper_volume_size"] = storage["volume_size"]
-            tfvars["bookkeeper_volume_type"] = storage["volume_type"]
-            if "iops" in storage:
-                tfvars["bookkeeper_iops"] = storage["iops"]
-            if "throughput" in storage:
-                tfvars["bookkeeper_throughput"] = storage["throughput"]
+        if "private_subnet_cidrs" in config["network"]:
+            tfvars["private_subnet_cidrs"] = config["network"]["private_subnet_cidrs"]
+
+        if "eks" in config:
+            tfvars["cluster_version"] = config["eks"].get("cluster_version", "1.31")
+
+            if "node_group" in config["eks"]:
+                ng = config["eks"]["node_group"]
+                tfvars["node_instance_types"] = ng.get("instance_types", ["t3.medium"])
+                tfvars["node_disk_size"] = ng.get("disk_size", 50)
+                tfvars["node_group_desired_size"] = ng.get("desired_size", 3)
+                tfvars["node_group_min_size"] = ng.get("min_size", 1)
+                tfvars["node_group_max_size"] = ng.get("max_size", 5)
 
         with open(output_file, 'w') as f:
             json.dump(tfvars, f, indent=2)
 
         logger.info(f"Generated Terraform variables: {output_file}")
 
-    def _discover_instance_ids(self, region: str) -> List[str]:
-        """
-        Discover EC2 instance IDs tagged with the experiment.
-
-        Args:
-            region: AWS region
-
-        Returns:
-            List of instance IDs
-        """
-        ec2_client = boto3.client('ec2', region_name=region)
-
-        instance_ids: List[str] = []
-        next_token = None
-
-        try:
-            while True:
-                request_kwargs = {
-                    'Filters': [
-                        {'Name': 'tag:ExperimentID', 'Values': [self.experiment_id]},
-                        {'Name': 'instance-state-name', 'Values': ['pending', 'running']}
-                    ]
-                }
-                if next_token:
-                    request_kwargs['NextToken'] = next_token
-
-                response = ec2_client.describe_instances(**request_kwargs)
-
-                for reservation in response.get('Reservations', []):
-                    for instance in reservation.get('Instances', []):
-                        instance_ids.append(instance['InstanceId'])
-
-                next_token = response.get('NextToken')
-                if not next_token:
-                    break
-
-        except Exception as exc:
-            logger.warning(f"Failed to discover instance IDs via EC2 API: {exc}")
-
-        return sorted(instance_ids)
-
     def get_terraform_output(self, output_name: str) -> str:
-        """
-        Get Terraform output value.
-
-        Args:
-            output_name: Name of Terraform output
-
-        Returns:
-            Output value as string
-        """
+        """Get Terraform output value"""
         cmd = ["terraform", "-chdir=" + str(TERRAFORM_DIR), "output", "-raw", output_name]
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         return result.stdout.strip()
 
-    def wait_for_cluster(self, region: str, timeout_seconds: int = 600) -> None:
-        """
-        Wait for all cluster instances to be ready with exponential backoff.
-        Uses AWS SSM RunCommand for health checks.
-
-        Args:
-            region: AWS region
-            timeout_seconds: Maximum time to wait (default: 10 minutes)
-
-        Raises:
-            OrchestratorError: If cluster doesn't become ready within timeout
-        """
-        logger.info("="*60)
-        logger.info("WAITING FOR CLUSTER TO BE READY")
-        logger.info("="*60)
-
-        ssm_client = boto3.client('ssm', region_name=region)
-        ec2_client = boto3.client('ec2', region_name=region)
-
-        start_time = time.time()
-        backoff_seconds = 5  # Initial backoff
-        max_backoff = 30
-
-        # Step 1: Wait for all instances to be in 'running' state
-        logger.info("Step 1/3: Waiting for EC2 instances to reach 'running' state...")
-        instance_ids = []
-
-        while time.time() - start_time < timeout_seconds:
-            instance_ids = self._discover_instance_ids(region)
-
-            if not instance_ids:
-                logger.warning("No instances found yet, retrying...")
-                time.sleep(backoff_seconds)
-                continue
-
-            # Check instance states
-            response = ec2_client.describe_instances(InstanceIds=instance_ids)
-            all_running = True
-            instance_states = {}
-
-            for reservation in response['Reservations']:
-                for instance in reservation['Instances']:
-                    instance_id = instance['InstanceId']
-                    state = instance['State']['Name']
-                    instance_states[instance_id] = state
-                    if state != 'running':
-                        all_running = False
-
-            logger.info(f"Found {len(instance_ids)} instances:")
-            for instance_id, state in instance_states.items():
-                logger.info(f"  {instance_id}: {state}")
-
-            if all_running:
-                logger.info("✓ All instances are running")
-                break
-
-            elapsed = int(time.time() - start_time)
-            logger.info(f"Waiting for instances to start... ({elapsed}s elapsed)")
-            time.sleep(backoff_seconds)
-            backoff_seconds = min(backoff_seconds * 1.5, max_backoff)
-
-        if time.time() - start_time >= timeout_seconds:
-            raise OrchestratorError(
-                f"Timeout waiting for instances to reach 'running' state after {timeout_seconds}s"
-            )
-
-        # Step 2: Wait for SSM agent registration
-        logger.info("\nStep 2/3: Waiting for SSM agent registration...")
-        backoff_seconds = 5
-
-        while time.time() - start_time < timeout_seconds:
-            response = ssm_client.describe_instance_information(
-                Filters=[
-                    {'Key': 'tag:ExperimentID', 'Values': [self.experiment_id]}
-                ]
-            )
-
-            managed_instances = response.get('InstanceInformationList', [])
-            online_instances = [i for i in managed_instances if i.get('PingStatus') == 'Online']
-
-            logger.info(f"SSM status: {len(online_instances)}/{len(instance_ids)} instances online")
-
-            if len(online_instances) == len(instance_ids):
-                logger.info("✓ All instances registered with SSM")
-                for instance in managed_instances:
-                    logger.info(f"  {instance['InstanceId']}: {instance.get('PingStatus')}")
-                break
-
-            elapsed = int(time.time() - start_time)
-            logger.info(f"Waiting for SSM registration... ({elapsed}s elapsed)")
-            time.sleep(backoff_seconds)
-            backoff_seconds = min(backoff_seconds * 1.5, max_backoff)
-
-        if time.time() - start_time >= timeout_seconds:
-            raise OrchestratorError(
-                f"Timeout waiting for SSM agent registration after {timeout_seconds}s"
-            )
-
-        # Step 3: Wait for systemd services to be active
-        logger.info("\nStep 3/3: Waiting for Pulsar services to be active...")
-
-        # Get instance details by component
-        component_instances = self._get_instances_by_component(region)
-
-        # Define service checks by component
-        service_checks = {
-            'zookeeper': ['zookeeper.service'],
-            'bookkeeper': ['bookkeeper.service'],
-            'broker': ['pulsar-broker.service'],
-            'client': []  # No critical services on client nodes
-        }
-
-        backoff_seconds = 10
-
-        while time.time() - start_time < timeout_seconds:
-            all_services_ready = True
-
-            for component, instances in component_instances.items():
-                services = service_checks.get(component, [])
-
-                if not services:
-                    logger.info(f"Component '{component}': No service checks required")
-                    continue
-
-                for instance_id in instances:
-                    for service_name in services:
-                        # Check if service is active using SSM RunCommand
-                        is_active, status_msg = self._check_service_status(
-                            ssm_client, instance_id, service_name
-                        )
-
-                        if is_active:
-                            logger.info(f"✓ {instance_id} ({component}): {service_name} is active")
-                        else:
-                            logger.warning(
-                                f"✗ {instance_id} ({component}): {service_name} not active ({status_msg})"
-                            )
-                            all_services_ready = False
-
-            if all_services_ready:
-                logger.info("\n✓ All Pulsar services are active and ready!")
-                break
-
-            elapsed = int(time.time() - start_time)
-            logger.info(f"Waiting for services to start... ({elapsed}s elapsed)")
-            time.sleep(backoff_seconds)
-            backoff_seconds = min(backoff_seconds * 1.5, max_backoff)
-
-        if time.time() - start_time >= timeout_seconds:
-            raise OrchestratorError(
-                f"Timeout waiting for Pulsar services to be ready after {timeout_seconds}s"
-            )
-
-        # Step 4: Verify service health endpoints
-        logger.info("\nVerifying service health endpoints...")
-        self._verify_health_endpoints(region, component_instances)
-
-        total_time = int(time.time() - start_time)
-        logger.info("="*60)
-        logger.info(f"CLUSTER READY! (Total time: {total_time}s)")
-        logger.info("="*60)
-
-    def _get_instances_by_component(self, region: str) -> Dict[str, List[str]]:
-        """
-        Get instance IDs organized by component type.
-
-        Args:
-            region: AWS region
-
-        Returns:
-            Dictionary mapping component names to lists of instance IDs
-        """
-        ec2_client = boto3.client('ec2', region_name=region)
-
-        response = ec2_client.describe_instances(
-            Filters=[
-                {'Name': 'tag:ExperimentID', 'Values': [self.experiment_id]},
-                {'Name': 'instance-state-name', 'Values': ['running']}
-            ]
-        )
-
-        component_instances = {
-            'zookeeper': [],
-            'bookkeeper': [],
-            'broker': [],
-            'client': []
-        }
-
-        for reservation in response['Reservations']:
-            for instance in reservation['Instances']:
-                instance_id = instance['InstanceId']
-                # Find Component tag
-                component = None
-                for tag in instance.get('Tags', []):
-                    if tag['Key'] == 'Component':
-                        component = tag['Value'].lower()
-                        break
-
-                if component in component_instances:
-                    component_instances[component].append(instance_id)
-
-        return component_instances
-
-    def _check_service_status(
+    def deploy_eks_cluster(
         self,
-        ssm_client,
-        instance_id: str,
-        service_name: str,
-        timeout_seconds: int = 30
-    ) -> Tuple[bool, str]:
-        """
-        Check if a systemd service is active using SSM RunCommand.
-
-        Args:
-            ssm_client: Boto3 SSM client
-            instance_id: EC2 instance ID
-            service_name: Systemd service name
-            timeout_seconds: Command timeout
-
-        Returns:
-            Tuple of (is_active: bool, status_message: str)
-        """
-        try:
-            # Send command to check service status
-            response = ssm_client.send_command(
-                InstanceIds=[instance_id],
-                DocumentName='AWS-RunShellScript',
-                Parameters={
-                    'commands': [f'systemctl is-active {service_name}']
-                },
-                TimeoutSeconds=timeout_seconds
-            )
-
-            command_id = response['Command']['CommandId']
-
-            # Wait for command to complete (short timeout for health checks)
-            max_attempts = 10  # 10 attempts * 2 seconds = 20 seconds
-            for attempt in range(max_attempts):
-                time.sleep(2)
-
-                try:
-                    invocation = ssm_client.get_command_invocation(
-                        CommandId=command_id,
-                        InstanceId=instance_id
-                    )
-
-                    status = invocation['Status']
-
-                    if status == 'Success':
-                        output = invocation.get('StandardOutputContent', '').strip()
-                        return (output == 'active', output)
-
-                    elif status in ['Failed', 'Cancelled', 'TimedOut']:
-                        error = invocation.get('StandardErrorContent', 'Unknown error')
-                        return (False, f"{status}: {error}")
-
-                    # Still running, wait for next attempt
-                    continue
-
-                except ssm_client.exceptions.InvocationDoesNotExist:
-                    # Command not yet registered
-                    continue
-
-            return (False, "Timeout waiting for status check")
-
-        except Exception as e:
-            logger.warning(f"Service status check failed for {instance_id}/{service_name}: {e}")
-            return (False, str(e))
-
-    def _verify_health_endpoints(
-        self,
-        region: str,
-        component_instances: Dict[str, List[str]]
+        config_file: Path,
+        runtime_tags: Optional[Dict[str, str]] = None
     ) -> None:
         """
-        Verify service health endpoints are responding.
+        Deploy EKS cluster using Terraform (one-time setup).
 
         Args:
-            region: AWS region
-            component_instances: Dictionary mapping components to instance IDs
-        """
-        ssm_client = boto3.client('ssm', region_name=region)
-
-        # Define health checks by component
-        health_checks = {
-            'zookeeper': ('localhost', 2181, 'ruok'),  # ZooKeeper four-letter word
-            'bookkeeper': ('localhost', 3181, None),    # BookKeeper client port (TCP check)
-            'broker': ('localhost', 8080, '/admin/v2/brokers/health'),  # Broker HTTP endpoint
-        }
-
-        for component, instances in component_instances.items():
-            if component not in health_checks:
-                continue
-
-            host, port, path = health_checks[component]
-
-            for instance_id in instances:
-                logger.info(f"Checking health endpoint for {instance_id} ({component})...")
-
-                # Build health check command based on component
-                if component == 'zookeeper':
-                    # ZooKeeper: send "ruok" via netcat
-                    cmd = f"echo {path} | nc {host} {port}"
-                elif component == 'bookkeeper':
-                    # BookKeeper: simple TCP connection test
-                    cmd = f"timeout 5 nc -zv {host} {port} 2>&1"
-                else:
-                    # HTTP endpoints: use curl
-                    cmd = f"curl -f -s -o /dev/null -w '%{{http_code}}' http://{host}:{port}{path}"
-
-                try:
-                    response = ssm_client.send_command(
-                        InstanceIds=[instance_id],
-                        DocumentName='AWS-RunShellScript',
-                        Parameters={'commands': [cmd]},
-                        TimeoutSeconds=30
-                    )
-
-                    command_id = response['Command']['CommandId']
-
-                    # Wait for result
-                    for attempt in range(10):
-                        time.sleep(2)
-
-                        try:
-                            invocation = ssm_client.get_command_invocation(
-                                CommandId=command_id,
-                                InstanceId=instance_id
-                            )
-
-                            if invocation['Status'] == 'Success':
-                                output = invocation.get('StandardOutputContent', '').strip()
-
-                                # Validate response
-                                if component == 'zookeeper' and 'imok' in output:
-                                    logger.info(f"  ✓ ZooKeeper health check passed")
-                                elif component == 'bookkeeper' and 'succeeded' in output:
-                                    logger.info(f"  ✓ BookKeeper port check passed")
-                                elif component == 'broker' and output == '200':
-                                    logger.info(f"  ✓ Broker health endpoint returned 200")
-                                else:
-                                    logger.warning(f"  ✗ Unexpected health check response: {output}")
-
-                                break
-
-                            elif invocation['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
-                                logger.warning(
-                                    f"  ✗ Health check failed: {invocation.get('StandardErrorContent', 'Unknown')}"
-                                )
-                                break
-
-                        except ssm_client.exceptions.InvocationDoesNotExist:
-                            continue
-
-                except Exception as e:
-                    logger.warning(f"  ✗ Health check error: {e}")
-
-    def setup(self, config_file: Path, runtime_tags: Optional[Dict[str, str]] = None) -> None:
-        """
-        Setup infrastructure using Terraform and wait for AMI-based cluster to be ready.
-
-        Args:
-            config_file: Path to infrastructure configuration YAML
-            runtime_tags: Optional additional tags to apply
+            config_file: Path to infrastructure configuration
+            runtime_tags: Optional runtime tags
 
         Raises:
-            OrchestratorError: If setup fails
+            OrchestratorError: If deployment fails
         """
-        logger.info("Starting setup phase (AMI-based deployment)")
+        logger.info("="*60)
+        logger.info("DEPLOYING EKS CLUSTER")
+        logger.info("="*60)
 
         try:
-            # Load infrastructure config
+            # Load config
             self.infrastructure_config = self.load_config(config_file)
 
-            # Merge runtime tags with config tags
+            # Merge tags
             if runtime_tags:
                 config_tags = self.infrastructure_config.get('experiment', {}).get('tags', {})
-                merged_tags = {**config_tags, **runtime_tags}  # Runtime tags override config tags
+                merged_tags = {**config_tags, **runtime_tags}
                 self.infrastructure_config.setdefault('experiment', {})['tags'] = merged_tags
-                logger.info(f"Merged tags: {merged_tags}")
 
-            # CHANGED: Validate AMI exists before Terraform
-            aws_region = self.infrastructure_config['aws']['region']
-            ami_id = self.validate_ami_exists(aws_region, ami_name_pattern="pulsar-base-*")
-            logger.info(f"Using AMI: {ami_id}")
+            # Extract cluster info
+            region = self.infrastructure_config['aws']['region']
+            self.cluster_name = f"pulsar-eks-{self.experiment_id}"
 
-            # Initialize Terraform
+            # Run Terraform
             self.run_terraform("init")
-
-            # Plan infrastructure
             self.run_terraform("plan", config_file)
-
-            # Apply infrastructure
-            logger.info("Provisioning infrastructure with Terraform...")
+            logger.info("Creating EKS cluster (this may take 15-20 minutes)...")
             self.run_terraform("apply", config_file)
 
-            # Wait for AMI-based cluster to be ready
-            self.wait_for_cluster(aws_region, timeout_seconds=600)
+            # Setup kubectl
+            self.setup_kubectl_context(region, self.cluster_name)
 
             logger.info("="*60)
-            logger.info("SETUP PHASE COMPLETED SUCCESSFULLY")
+            logger.info("EKS CLUSTER DEPLOYED SUCCESSFULLY")
+            logger.info(f"Cluster: {self.cluster_name}")
             logger.info("="*60)
 
         except Exception as e:
-            logger.error(f"Setup failed: {e}")
-            logger.warning("Initiating automatic cleanup of resources...")
-            self.emergency_cleanup()
+            logger.error(f"EKS cluster deployment failed: {e}")
             raise
 
-    def emergency_cleanup(self, region: str = None) -> None:
-        """
-        Emergency cleanup using tag-based resource discovery (doesn't need Terraform state).
+    def destroy_eks_cluster(self) -> None:
+        """Destroy EKS cluster using Terraform"""
+        logger.info("="*60)
+        logger.info("DESTROYING EKS CLUSTER")
+        logger.info("="*60)
 
-        Args:
-            region: AWS region (auto-detected if not provided)
-        """
-        logger.warning("=" * 60)
-        logger.warning("EMERGENCY CLEANUP: Finding resources by ExperimentID tag")
-        logger.warning("=" * 60)
-
-        if not region:
-            region = self.infrastructure_config.get('aws', {}).get('region', 'us-west-2') if self.infrastructure_config else 'us-west-2'
-
-        logger.info(f"Searching for resources with ExperimentID: {self.experiment_id} in {region}")
-
-        try:
-            resources = get_resources_by_experiment_id(self.experiment_id, region)
-
-            # Check if any resources found
-            total_resources = sum(len(v) if isinstance(v, list) else 0 for v in resources.values())
-
-            if total_resources == 0:
-                logger.info("No resources found to cleanup")
-                return
-
-            logger.warning(f"Found {total_resources} resources to cleanup")
-            cleanup_resources(resources, region, dry_run=False)
-            logger.info("Emergency cleanup completed")
-
-        except Exception as e:
-            logger.error(f"Emergency cleanup failed: {e}")
-            logger.error("You may need to manually cleanup resources from AWS console")
-
-    def teardown(self) -> None:
-        """
-        Destroy infrastructure using Terraform.
-        """
-        logger.info("Starting teardown phase")
-
-        # Check if Terraform state exists
+        # Check for state file
         state_file = TERRAFORM_DIR / "terraform.tfstate"
         if not state_file.exists():
             logger.error("Terraform state file not found!")
             logger.error(f"Expected: {state_file}")
-            logger.error("Attempting emergency cleanup by tags...")
-            self.emergency_cleanup()
             return
 
-        # Get AWS region from config or default
-        region = self.infrastructure_config.get('aws', {}).get('region', 'us-west-2') if self.infrastructure_config else 'us-west-2'
-
-        # Find tfvars file from setup
+        # Find tfvars file
         tfvars_file = self.experiment_dir / "terraform.tfvars.json"
         if not tfvars_file.exists():
-            logger.warning(f"tfvars file not found: {tfvars_file}")
-            logger.warning("Attempting destroy without variable file...")
+            logger.warning("tfvars file not found, proceeding without it...")
 
-        # Destroy infrastructure
+        # Destroy
         self.run_terraform("destroy", tfvars_file if tfvars_file.exists() else None)
 
-        # Verify resources are actually destroyed
-        logger.info("Verifying resources are destroyed...")
-        ec2_client = boto3.client('ec2', region_name=region)
+        logger.info("✓ EKS cluster destroyed")
+
+    def deploy_pulsar(
+        self,
+        config_file: Path,
+        values_overrides: Optional[Dict] = None
+    ) -> None:
+        """
+        Deploy Pulsar to EKS using Helm.
+
+        Args:
+            config_file: Infrastructure configuration
+            values_overrides: Optional Helm values overrides
+
+        Raises:
+            OrchestratorError: If deployment fails
+        """
+        logger.info("="*60)
+        logger.info("DEPLOYING PULSAR VIA HELM")
+        logger.info("="*60)
 
         try:
-            instances = ec2_client.describe_instances(
-                Filters=[
-                    {'Name': 'tag:ExperimentID', 'Values': [self.experiment_id]},
-                    {'Name': 'instance-state-name', 'Values': ['running', 'pending', 'stopping', 'stopped']}
-                ]
-            )
+            # Load config if not already loaded
+            if not self.infrastructure_config:
+                self.infrastructure_config = self.load_config(config_file)
 
-            remaining = []
-            for reservation in instances['Reservations']:
-                for instance in reservation['Instances']:
-                    remaining.append(f"{instance['InstanceId']} ({instance['State']['Name']})")
+            # Get cluster name and setup kubectl if needed
+            if not self.cluster_name:
+                region = self.infrastructure_config['aws']['region']
+                self.cluster_name = self.get_terraform_output("eks_cluster_name")
+                self.setup_kubectl_context(region, self.cluster_name)
 
-            if remaining:
-                logger.warning("\n" + "="*60)
-                logger.warning("WARNING: Some instances are still running!")
-                logger.warning(f"Experiment ID: {self.experiment_id}")
-                for inst in remaining:
-                    logger.warning(f"  - {inst}")
-                logger.warning("\nTo cleanup manually, run:")
-                logger.warning(f"  python scripts/cleanup_by_tag.py --experiment-id {self.experiment_id} --execute")
-                logger.warning("="*60 + "\n")
-            else:
-                logger.info("✓ All instances terminated successfully")
+            # Deploy via Helm
+            self.helm_deploy(values_overrides)
+
+            # Wait for pods
+            self.wait_for_pods_ready()
+
+            # Health check
+            self.check_pulsar_health()
+
+            logger.info("="*60)
+            logger.info("PULSAR DEPLOYED SUCCESSFULLY")
+            logger.info("="*60)
 
         except Exception as e:
-            logger.warning(f"Could not verify resource cleanup: {e}")
+            logger.error(f"Pulsar deployment failed: {e}")
+            logger.info("Collecting pod logs for troubleshooting...")
+            self.collect_pod_logs()
+            raise
 
-        logger.info("Teardown phase completed")
+    def undeploy_pulsar(self) -> None:
+        """Remove Pulsar from EKS cluster"""
+        logger.info("="*60)
+        logger.info("UNDEPLOYING PULSAR")
+        logger.info("="*60)
+
+        try:
+            self.helm_undeploy()
+            logger.info("="*60)
+            logger.info("PULSAR UNDEPLOYED SUCCESSFULLY")
+            logger.info("="*60)
+        except Exception as e:
+            logger.error(f"Pulsar undeploy failed: {e}")
+            raise
 
     def run_tests(self, test_plan_file: Path) -> None:
         """
-        Execute test plan using AWS SSM SendCommand.
+        Execute test plan with OMB.
 
         Args:
-            test_plan_file: Path to test plan YAML file
+            test_plan_file: Path to test plan YAML
         """
-        logger.info(f"Running tests from plan: {test_plan_file}")
+        logger.info("="*60)
+        logger.info("RUNNING BENCHMARK TESTS")
+        logger.info("="*60)
 
         test_plan = self.load_config(test_plan_file)
-
-        # Get AWS region and client instance ID
-        aws_region = self.infrastructure_config['aws']['region']
-        client_data_str = self.get_terraform_output("client_instances")
-        client_data = json.loads(client_data_str)
-        client_instance_id = client_data['ids'][0]
-
-        logger.info(f"Running tests on client instance: {client_instance_id}")
-
-        # Initialize AWS client
-        ssm_client = boto3.client('ssm', region_name=aws_region)
 
         # Create results directory
         results_dir = self.experiment_dir / "benchmark_results"
         results_dir.mkdir(exist_ok=True)
 
-        # Run each test in the test plan
+        # Run each test
         for idx, test_run in enumerate(test_plan['test_runs']):
             test_name = test_run['name']
             logger.info(f"\n{'='*60}")
-            logger.info(f"Running test: {test_name} ({idx + 1}/{len(test_plan['test_runs'])})")
+            logger.info(f"Test {idx + 1}/{len(test_plan['test_runs'])}: {test_name}")
             logger.info(f"{'='*60}\n")
 
-            # Generate workload file from test plan
+            # Generate workload
             workload = self._generate_workload(test_plan['base_workload'], test_run)
-            workload_file = self.experiment_dir / f"workload_{test_name}.yaml"
 
-            with open(workload_file, 'w') as f:
-                yaml.dump(workload, f)
+            # Run OMB job
+            try:
+                results = self.run_omb_job(test_run, workload)
 
-            # Upload workload file to client instance
-            remote_workload_path = f"/tmp/workload_{test_name}.yaml"
-            logger.info(f"Uploading workload to client instance: {remote_workload_path}")
+                # Save results
+                result_file = results_dir / f"{test_name}.log"
+                with open(result_file, 'w') as f:
+                    f.write(results)
 
-            # Use SSM SendCommand to write file (avoiding SCP complexity)
-            with open(workload_file, 'r') as f:
-                workload_content = f.read()
+                logger.info(f"✓ Test '{test_name}' completed")
+                logger.info(f"Results: {result_file}")
 
-            upload_cmd = f"cat > {remote_workload_path} << 'EOF'\n{workload_content}\nEOF"
-
-            self._ssm_run_command(
-                ssm_client,
-                client_instance_id,
-                [upload_cmd],
-                f"Upload workload {test_name}"
-            )
-
-            # Run benchmark
-            result_file = f"/opt/benchmark-results/{test_name}.json"
-            benchmark_cmd = (
-                f"cd /opt/openmessaging-benchmark/benchmark-framework && "
-                f"sudo bin/benchmark --drivers /opt/benchmark-configs/pulsar-driver.yaml "
-                f"{remote_workload_path} --output {result_file}"
-            )
-
-            logger.info(f"Executing benchmark: {test_name}")
-            self._ssm_run_command(
-                ssm_client,
-                client_instance_id,
-                [benchmark_cmd],
-                f"Run benchmark {test_name}"
-            )
-
-            # Download results using SSM
-            local_result = results_dir / f"{test_name}.json"
-            logger.info(f"Downloading results to: {local_result}")
-
-            download_invocation = self._ssm_run_command(
-                ssm_client,
-                client_instance_id,
-                [f"cat {result_file}"],
-                f"Download results {test_name}"
-            )
-
-            # Write results to local file
-            result_content = download_invocation.get('StandardOutputContent', '')
-            with open(local_result, 'w') as f:
-                f.write(result_content)
-
-            logger.info(f"Test '{test_name}' completed. Results saved to {local_result}")
+            except OrchestratorError as e:
+                logger.error(f"Test '{test_name}' failed: {e}")
+                continue
 
         logger.info(f"\n{'='*60}")
-        logger.info(f"All tests completed! Results: {results_dir}")
+        logger.info(f"ALL TESTS COMPLETED")
+        logger.info(f"Results: {results_dir}")
         logger.info(f"{'='*60}\n")
 
     def _generate_workload(self, base: Dict, overrides: Dict) -> Dict:
-        """
-        Generate OpenMessaging Benchmark workload from test plan.
-
-        Args:
-            base: Base workload configuration
-            overrides: Test-specific overrides
-
-        Returns:
-            Complete workload configuration
-        """
+        """Generate OMB workload from test plan"""
         workload = {
             'name': overrides.get('name', base['name']),
             'topics': overrides.get('workload_overrides', {}).get('topics', base['topics']),
@@ -918,112 +893,14 @@ class Orchestrator:
             'warmupDurationMinutes': overrides.get('workload_overrides', {}).get('warmup_duration_minutes', base.get('warmup_duration_minutes', 1)),
         }
 
-        # Add producer rate if specified
         if overrides['type'] == 'fixed_rate' and 'producer_rate' in overrides:
             workload['producerRate'] = overrides['producer_rate']
 
         return workload
 
-    def _ssm_run_command(
-        self,
-        ssm_client,
-        instance_id: str,
-        commands: List[str],
-        description: str
-    ) -> Dict:
-        """
-        Execute commands on an instance using SSM SendCommand and wait for completion.
-
-        Args:
-            ssm_client: Boto3 SSM client
-            instance_id: EC2 instance ID
-            commands: List of shell commands to execute
-            description: Human-readable description for logging
-
-        Returns:
-            Command invocation response with output
-
-        Raises:
-            OrchestratorError: If command fails or times out
-        """
-        logger.info(f"SSM Command: {description}")
-
-        try:
-            # Send command
-            response = ssm_client.send_command(
-                InstanceIds=[instance_id],
-                DocumentName='AWS-RunShellScript',
-                Parameters={'commands': commands},
-                Comment=description,
-                TimeoutSeconds=3600,  # 1 hour timeout
-            )
-
-            command_id = response['Command']['CommandId']
-            logger.info(f"Command ID: {command_id}")
-
-            # Wait for command to complete
-            max_attempts = 360  # 30 minutes (5 second intervals)
-            attempt = 0
-
-            while attempt < max_attempts:
-                time.sleep(5)
-                attempt += 1
-
-                try:
-                    # Get command invocation status
-                    invocation = ssm_client.get_command_invocation(
-                        CommandId=command_id,
-                        InstanceId=instance_id
-                    )
-
-                    status = invocation['Status']
-
-                    if status == 'Success':
-                        logger.info(f"Command completed successfully")
-                        if invocation.get('StandardOutputContent'):
-                            logger.debug(f"Output: {invocation['StandardOutputContent'][:500]}")
-                        return invocation
-
-                    elif status in ['Failed', 'Cancelled', 'TimedOut']:
-                        error_msg = f"Command {description} failed with status: {status}"
-                        if invocation.get('StandardErrorContent'):
-                            error_msg += f"\nError: {invocation['StandardErrorContent']}"
-                        logger.error(error_msg)
-                        raise OrchestratorError(error_msg)
-
-                    elif status in ['Pending', 'InProgress', 'Delayed']:
-                        # Still running, continue waiting
-                        if attempt % 12 == 0:  # Log every minute
-                            logger.info(f"Command still running... (status: {status})")
-                        continue
-
-                    else:
-                        logger.warning(f"Unknown command status: {status}")
-                        continue
-
-                except ssm_client.exceptions.InvocationDoesNotExist:
-                    # Command not yet registered, keep waiting
-                    if attempt % 12 == 0:
-                        logger.info("Waiting for command to be registered...")
-                    continue
-
-            # Timeout reached
-            raise OrchestratorError(
-                f"Command {description} timed out after {max_attempts * 5} seconds"
-            )
-
-        except Exception as e:
-            if isinstance(e, OrchestratorError):
-                raise
-            logger.error(f"SSM command execution failed: {e}")
-            raise OrchestratorError(f"SSM command failed: {e}") from e
-
     def generate_report(self) -> None:
         """Generate experiment report"""
-        logger.info("Generating report")
-
-        # TODO: Implement report generation
-        # This will be implemented with the reporting module
+        logger.info("Generating report...")
         logger.warning("Report generation not yet implemented")
 
     def full_lifecycle(
@@ -1033,55 +910,48 @@ class Orchestrator:
         runtime_tags: Optional[Dict[str, str]] = None
     ) -> None:
         """
-        Execute full lifecycle: setup -> test -> report -> teardown.
+        Execute full test lifecycle: deploy → test → undeploy.
 
         Args:
-            config_file: Infrastructure configuration path
-            test_plan_file: Test plan configuration path
-            runtime_tags: Optional runtime tags to apply
+            config_file: Infrastructure configuration
+            test_plan_file: Test plan configuration
+            runtime_tags: Optional runtime tags
 
         Raises:
             OrchestratorError: If any phase fails
         """
-        logger.info("Starting full lifecycle")
+        logger.info("="*60)
+        logger.info("STARTING FULL TEST LIFECYCLE")
+        logger.info("="*60)
 
         try:
-            # Setup infrastructure (has its own error handling)
-            self.setup(config_file, runtime_tags=runtime_tags)
+            # Deploy Pulsar
+            self.deploy_pulsar(config_file)
 
-            # Run tests and generate report, ensuring teardown happens
+            # Run tests and generate report
             try:
                 self.run_tests(test_plan_file)
                 self.generate_report()
             finally:
-                logger.info("Tearing down infrastructure...")
-                self.teardown()
+                # Always undeploy
+                logger.info("\nUndeploying Pulsar...")
+                self.undeploy_pulsar()
 
-            logger.info("Full lifecycle completed successfully")
+            logger.info("="*60)
+            logger.info("FULL LIFECYCLE COMPLETED SUCCESSFULLY")
+            logger.info("="*60)
 
         except Exception as e:
-            logger.error(f"Full lifecycle failed: {e}")
-            logger.warning("Resources should have been cleaned up automatically")
+            logger.error(f"Lifecycle failed: {e}")
             raise
 
     @staticmethod
     def resolve_experiment_id(experiment_id: str) -> str:
-        """
-        Resolve experiment ID, handling 'latest' shortcut.
-
-        Args:
-            experiment_id: Experiment ID or 'latest'
-
-        Returns:
-            Resolved experiment ID
-
-        Raises:
-            OrchestratorError: If 'latest' link doesn't exist
-        """
+        """Resolve experiment ID, handling 'latest' shortcut"""
         if experiment_id == "latest":
             latest_link = RESULTS_DIR / "latest"
             if not latest_link.exists():
-                raise OrchestratorError("No experiments found. 'latest' link does not exist.")
+                raise OrchestratorError("No experiments found")
             return latest_link.resolve().name
         return experiment_id
 
@@ -1108,7 +978,6 @@ class Orchestrator:
             exp_id = exp_dir.name
             timestamp = datetime.fromtimestamp(exp_dir.stat().st_mtime)
 
-            # Check if this is the latest
             is_latest = ""
             latest_link = RESULTS_DIR / "latest"
             if latest_link.exists() and latest_link.resolve() == exp_dir:
@@ -1116,30 +985,34 @@ class Orchestrator:
 
             print(f"{exp_id:30} {timestamp.strftime('%Y-%m-%d %H:%M:%S')}{is_latest}")
         print("=" * 60)
-        print(f"\nTo teardown an experiment: python scripts/orchestrator.py teardown --experiment-id <id>")
-        print(f"Or use 'latest': python scripts/orchestrator.py teardown --experiment-id latest\n")
 
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(description="Pulsar AWS Lab Orchestrator (AMI-based)")
+    parser = argparse.ArgumentParser(description="Pulsar AWS Lab Orchestrator (EKS/Helm)")
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
-    # Setup command
-    setup_parser = subparsers.add_parser("setup", help="Setup infrastructure and deploy cluster")
-    setup_parser.add_argument("--config", type=Path, required=True, help="Infrastructure config file")
-    setup_parser.add_argument("--experiment-id", help="Experiment ID (auto-generated if not provided)")
-    setup_parser.add_argument("--tag", action="append", metavar="KEY=VALUE", help="Additional tags (can be used multiple times)")
+    # Cluster create command
+    cluster_create_parser = subparsers.add_parser("cluster-create", help="Create EKS cluster (one-time)")
+    cluster_create_parser.add_argument("--config", type=Path, default=CONFIG_DIR / "infrastructure.yaml", help="Infrastructure config")
+    cluster_create_parser.add_argument("--experiment-id", help="Experiment ID")
+    cluster_create_parser.add_argument("--tag", action="append", metavar="KEY=VALUE", help="Additional tags")
 
-    # Teardown command
-    teardown_parser = subparsers.add_parser("teardown", help="Destroy infrastructure")
-    teardown_parser.add_argument("--experiment-id", required=True, help="Experiment ID (or 'latest')")
+    # Cluster destroy command
+    cluster_destroy_parser = subparsers.add_parser("cluster-destroy", help="Destroy EKS cluster")
+    cluster_destroy_parser.add_argument("--experiment-id", required=True, help="Experiment ID")
 
-    # List command
-    list_parser = subparsers.add_parser("list", help="List all experiments")
+    # Deploy command
+    deploy_parser = subparsers.add_parser("deploy", help="Deploy Pulsar via Helm")
+    deploy_parser.add_argument("--config", type=Path, default=CONFIG_DIR / "infrastructure.yaml", help="Infrastructure config")
+    deploy_parser.add_argument("--experiment-id", help="Experiment ID")
+
+    # Undeploy command
+    undeploy_parser = subparsers.add_parser("undeploy", help="Remove Pulsar from cluster")
+    undeploy_parser.add_argument("--experiment-id", required=True, help="Experiment ID")
 
     # Run tests command
-    run_parser = subparsers.add_parser("run", help="Run test plan")
+    run_parser = subparsers.add_parser("run", help="Run benchmark tests")
     run_parser.add_argument("--test-plan", type=Path, required=True, help="Test plan file")
     run_parser.add_argument("--experiment-id", required=True, help="Experiment ID")
 
@@ -1148,11 +1021,14 @@ def main():
     report_parser.add_argument("--experiment-id", required=True, help="Experiment ID")
 
     # Full lifecycle command
-    full_parser = subparsers.add_parser("full", help="Execute full lifecycle")
-    full_parser.add_argument("--config", type=Path, default=CONFIG_DIR / "infrastructure.yaml", help="Infrastructure config file")
+    full_parser = subparsers.add_parser("full", help="Full test cycle (deploy→test→undeploy)")
+    full_parser.add_argument("--config", type=Path, default=CONFIG_DIR / "infrastructure.yaml", help="Infrastructure config")
     full_parser.add_argument("--test-plan", type=Path, required=True, help="Test plan file")
-    full_parser.add_argument("--experiment-id", help="Experiment ID (auto-generated if not provided)")
-    full_parser.add_argument("--tag", action="append", metavar="KEY=VALUE", help="Additional tags (can be used multiple times)")
+    full_parser.add_argument("--experiment-id", help="Experiment ID")
+    full_parser.add_argument("--tag", action="append", metavar="KEY=VALUE", help="Additional tags")
+
+    # List command
+    list_parser = subparsers.add_parser("list", help="List experiments")
 
     args = parser.parse_args()
 
@@ -1161,32 +1037,36 @@ def main():
         sys.exit(1)
 
     try:
-        # Handle list command separately (doesn't need orchestrator)
+        # Handle list command
         if args.command == "list":
             Orchestrator.list_experiments()
             return
 
-        # Resolve experiment ID for commands that need it
+        # Resolve experiment ID
         experiment_id = getattr(args, "experiment_id", None)
-        if experiment_id and args.command in ["teardown", "run", "report"]:
+        if experiment_id and args.command in ["cluster-destroy", "undeploy", "run", "report"]:
             experiment_id = Orchestrator.resolve_experiment_id(experiment_id)
 
         orchestrator = Orchestrator(experiment_id)
 
-        # Parse runtime tags if provided
+        # Parse runtime tags
         runtime_tags = {}
         if hasattr(args, 'tag') and args.tag:
             for tag in args.tag:
                 if '=' not in tag:
-                    raise OrchestratorError(f"Invalid tag format: {tag}. Expected KEY=VALUE")
+                    raise OrchestratorError(f"Invalid tag format: {tag}")
                 key, value = tag.split('=', 1)
                 runtime_tags[key] = value
-            logger.info(f"Runtime tags: {runtime_tags}")
 
-        if args.command == "setup":
-            orchestrator.setup(args.config, runtime_tags=runtime_tags)
-        elif args.command == "teardown":
-            orchestrator.teardown()
+        # Execute command
+        if args.command == "cluster-create":
+            orchestrator.deploy_eks_cluster(args.config, runtime_tags=runtime_tags)
+        elif args.command == "cluster-destroy":
+            orchestrator.destroy_eks_cluster()
+        elif args.command == "deploy":
+            orchestrator.deploy_pulsar(args.config)
+        elif args.command == "undeploy":
+            orchestrator.undeploy_pulsar()
         elif args.command == "run":
             orchestrator.run_tests(args.test_plan)
         elif args.command == "report":
