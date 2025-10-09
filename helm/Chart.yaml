@@ -1,0 +1,19 @@
+apiVersion: v2
+appVersion: "4.0.7"
+description: Apache Pulsar Helm chart for Kubernetes
+name: pulsar
+version: 4.3.0
+kubeVersion: ">=1.25.0-0"
+home: https://pulsar.apache.org
+sources:
+  - https://github.com/apache/pulsar
+  - https://github.com/apache/pulsar-helm-chart
+icon: https://pulsar.apache.org/img/pulsar.svg
+maintainers:
+  - name: The Apache Pulsar Team
+    email: dev@pulsar.apache.org
+dependencies:
+  - name: victoria-metrics-k8s-stack
+    version: 0.38.x
+    repository: https://victoriametrics.github.io/helm-charts/
+    condition: victoria-metrics-k8s-stack.enabled

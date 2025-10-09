@@ -18,9 +18,6 @@ from typing import Dict, List, Optional
 import boto3
 import yaml
 
-# Import cleanup functions
-from cleanup_by_tag import get_resources_by_experiment_id, cleanup_resources
-
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +29,7 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
 TERRAFORM_DIR = PROJECT_ROOT / "terraform"
-HELM_DIR = PROJECT_ROOT / "helm" / "pulsar-eks-lab"
+HELM_DIR = PROJECT_ROOT / "helm"
 RESULTS_DIR = Path.home() / ".pulsar-aws-lab"
 
 
@@ -98,7 +95,8 @@ class Orchestrator:
         cmd: List[str],
         description: str,
         capture_output: bool = False,
-        check: bool = True
+        check: bool = True,
+        timeout: Optional[int] = None
     ) -> subprocess.CompletedProcess:
         """
         Run shell command with logging.
@@ -108,6 +106,7 @@ class Orchestrator:
             description: Human-readable description
             capture_output: Whether to capture stdout/stderr
             check: Whether to raise exception on non-zero exit
+            timeout: Optional timeout in seconds
 
         Returns:
             CompletedProcess object
@@ -123,11 +122,19 @@ class Orchestrator:
                 cmd,
                 capture_output=capture_output,
                 text=True,
-                check=check
+                check=check,
+                timeout=timeout
             )
             if capture_output and result.stdout:
                 logger.debug(f"Output: {result.stdout[:500]}")
             return result
+        except subprocess.TimeoutExpired as e:
+            error_msg = f"Command timed out after {timeout}s: {description}"
+            logger.error(error_msg)
+            if check:
+                raise OrchestratorError(error_msg) from e
+            # Return a dummy result for non-checked commands
+            return subprocess.CompletedProcess(cmd, returncode=124, stdout="", stderr=str(e))
         except subprocess.CalledProcessError as e:
             error_msg = f"Command failed: {description}"
             if capture_output and e.stderr:
@@ -198,6 +205,34 @@ class Orchestrator:
         releases = json.loads(result.stdout) if result.stdout else []
         release_exists = any(r['name'] == self.helm_release_name for r in releases)
 
+        # Delete existing OMB Jobs if upgrading (Jobs are immutable and can't be patched)
+        if release_exists:
+            logger.info("Checking for existing OMB Jobs to delete...")
+            try:
+                # Get OMB Jobs
+                result = self.run_command(
+                    ["kubectl", "get", "jobs", "-n", self.namespace,
+                     "-l", f"app.kubernetes.io/instance={self.helm_release_name}",
+                     "-l", "component in (omb-producer,omb-consumer)",
+                     "-o", "name"],
+                    "List existing OMB Jobs",
+                    capture_output=True,
+                    check=False
+                )
+
+                if result.stdout:
+                    jobs = result.stdout.strip().split('\n')
+                    for job in jobs:
+                        if job:
+                            logger.info(f"Deleting {job}...")
+                            self.run_command(
+                                ["kubectl", "delete", job, "-n", self.namespace, "--wait=false"],
+                                f"Delete {job}",
+                                check=False
+                            )
+            except Exception as e:
+                logger.warning(f"Failed to delete existing OMB Jobs: {e}")
+
         # Prepare Helm command
         if release_exists:
             cmd = ["helm", "upgrade", self.helm_release_name]
@@ -223,7 +258,14 @@ class Orchestrator:
 
         # Execute Helm deploy
         logger.info(f"{action} {self.helm_release_name}...")
-        self.run_command(cmd, f"{action} Helm release")
+        logger.info("This may take up to 15 minutes. Helm will wait for all pods to be ready.")
+        logger.info(f"To monitor progress in another terminal:")
+        logger.info(f"  kubectl get pods -n {self.namespace} -w")
+        logger.info(f"  kubectl get events -n {self.namespace} --sort-by='.lastTimestamp'")
+        logger.info(f"Command: {' '.join(cmd)}")
+
+        # Run without capturing output so we see Helm's progress
+        self.run_command(cmd, f"{action} Helm release", capture_output=False)
 
         logger.info(f"✓ Helm release {self.helm_release_name} deployed successfully")
 
@@ -268,6 +310,285 @@ class Orchestrator:
 
             logger.info(f"Waiting for {pod_count} pods to terminate...")
             time.sleep(5)
+
+    def wipe_namespace(self, force: bool = False) -> None:
+        """
+        Force delete namespace and all resources within it.
+        This function will aggressively remove everything without manual intervention.
+
+        Args:
+            force: Skip confirmation prompt
+
+        Raises:
+            OrchestratorError: If wipe operation fails
+        """
+        logger.info(f"Wiping namespace: {self.namespace}")
+
+        # Confirmation prompt
+        if not force:
+            print(f"\n⚠️  WARNING: This will forcefully delete the '{self.namespace}' namespace")
+            print("    and ALL resources within it, including:")
+            print("    - Helm releases")
+            print("    - Pods, Deployments, StatefulSets, Jobs")
+            print("    - PersistentVolumeClaims and PersistentVolumes")
+            print("    - Services, ConfigMaps, Secrets")
+            print()
+            response = input("Are you sure you want to continue? [yes/no]: ")
+            if response.lower() not in ["yes", "y"]:
+                logger.info("Wipe cancelled by user")
+                return
+
+        # Check if namespace exists
+        result = self.run_command(
+            ["kubectl", "get", "namespace", self.namespace],
+            "Check if namespace exists",
+            capture_output=True,
+            check=False
+        )
+
+        if result.returncode != 0:
+            logger.info(f"Namespace {self.namespace} does not exist")
+            return
+
+        logger.info("Step 1: Uninstalling Helm releases...")
+        try:
+            result = self.run_command(
+                ["helm", "list", "-n", self.namespace, "-o", "json"],
+                "List Helm releases",
+                capture_output=True,
+                check=False,
+                timeout=10
+            )
+            if result.stdout:
+                releases = json.loads(result.stdout)
+                for release in releases:
+                    release_name = release.get('name')
+                    logger.info(f"  Uninstalling Helm release: {release_name}")
+                    subprocess.run(
+                        ["helm", "uninstall", release_name, "-n", self.namespace, "--no-hooks", "--wait=false"],
+                        capture_output=True,
+                        timeout=15,
+                        check=False
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to uninstall Helm releases: {e}")
+
+        logger.info("Step 2: Scaling down all controllers to prevent recreation...")
+        controller_types = ["deployments", "statefulsets", "daemonsets", "replicasets"]
+        for controller in controller_types:
+            try:
+                subprocess.run(
+                    ["kubectl", "scale", controller, "--all", "--replicas=0", "-n", self.namespace],
+                    capture_output=True,
+                    timeout=10,
+                    check=False
+                )
+            except Exception:
+                pass
+
+        logger.info("Step 3: Removing all finalizers from all resources...")
+        # Get ALL resource types in the namespace
+        try:
+            result = subprocess.run(
+                ["kubectl", "api-resources", "--verbs=list", "--namespaced", "-o", "name"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False
+            )
+            if result.stdout:
+                all_resource_types = result.stdout.strip().split('\n')
+                for resource_type in all_resource_types:
+                    if resource_type and not resource_type.startswith('events'):
+                        try:
+                            result = subprocess.run(
+                                ["kubectl", "get", resource_type, "-n", self.namespace, "-o", "name"],
+                                capture_output=True,
+                                text=True,
+                                timeout=5,
+                                check=False
+                            )
+                            if result.stdout:
+                                resources = result.stdout.strip().split('\n')
+                                for resource in resources:
+                                    if resource:
+                                        subprocess.run(
+                                            ["kubectl", "patch", resource, "-n", self.namespace,
+                                             "-p", '{"metadata":{"finalizers":null}}',
+                                             "--type=merge"],
+                                            capture_output=True,
+                                            timeout=3,
+                                            check=False
+                                        )
+                        except Exception:
+                            continue
+        except Exception as e:
+            logger.warning(f"Bulk finalizer removal failed: {e}")
+
+        logger.info("Step 4: Force deleting all resources...")
+        # Delete everything in parallel with aggressive flags
+        delete_commands = [
+            ["kubectl", "delete", "all", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+            ["kubectl", "delete", "pvc", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+            ["kubectl", "delete", "configmaps", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+            ["kubectl", "delete", "secrets", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+            ["kubectl", "delete", "serviceaccounts", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+            ["kubectl", "delete", "roles", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+            ["kubectl", "delete", "rolebindings", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+        ]
+
+        for cmd in delete_commands:
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=20, check=False)
+            except Exception:
+                pass
+
+        # Give deletions a moment to process
+        time.sleep(5)
+
+        logger.info("Step 5: Force deleting PersistentVolumes bound to this namespace...")
+        try:
+            result = subprocess.run(
+                ["kubectl", "get", "pv", "-o", "json"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False
+            )
+            if result.stdout:
+                pvs = json.loads(result.stdout)
+                for pv in pvs.get('items', []):
+                    claim_ref = pv.get('spec', {}).get('claimRef', {})
+                    if claim_ref.get('namespace') == self.namespace:
+                        pv_name = pv['metadata']['name']
+                        logger.info(f"  Deleting PV: {pv_name}")
+                        # Remove finalizers first
+                        subprocess.run(
+                            ["kubectl", "patch", "pv", pv_name,
+                             "-p", '{"metadata":{"finalizers":null}}',
+                             "--type=merge"],
+                            capture_output=True,
+                            timeout=5,
+                            check=False
+                        )
+                        # Delete
+                        subprocess.run(
+                            ["kubectl", "delete", "pv", pv_name, "--grace-period=0", "--force"],
+                            capture_output=True,
+                            timeout=10,
+                            check=False
+                        )
+        except Exception as e:
+            logger.warning(f"PV cleanup failed: {e}")
+
+        logger.info("Step 6: Deleting namespace...")
+        subprocess.run(
+            ["kubectl", "delete", "namespace", self.namespace, "--wait=false"],
+            capture_output=True,
+            timeout=10,
+            check=False
+        )
+
+        # Aggressive retry loop for namespace deletion
+        logger.info("Step 7: Waiting for namespace deletion (with retries)...")
+        max_attempts = 10
+        for attempt in range(max_attempts):
+            time.sleep(2)
+
+            result = subprocess.run(
+                ["kubectl", "get", "namespace", self.namespace],
+                capture_output=True,
+                timeout=5,
+                check=False
+            )
+
+            if result.returncode != 0:
+                logger.info(f"✓ Namespace {self.namespace} successfully wiped")
+                return
+
+            # Namespace still exists, try patching finalizers again
+            logger.info(f"  Attempt {attempt + 1}/{max_attempts}: Removing namespace finalizers...")
+            try:
+                subprocess.run(
+                    ["kubectl", "patch", "namespace", self.namespace,
+                     "-p", '{"metadata":{"finalizers":null}}',
+                     "--type=merge"],
+                    capture_output=True,
+                    timeout=5,
+                    check=False
+                )
+                subprocess.run(
+                    ["kubectl", "patch", "namespace", self.namespace,
+                     "-p", '{"spec":{"finalizers":null}}',
+                     "--type=merge"],
+                    capture_output=True,
+                    timeout=5,
+                    check=False
+                )
+            except Exception:
+                pass
+
+        # Final check with detailed error if still exists
+        result = subprocess.run(
+            ["kubectl", "get", "namespace", self.namespace, "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False
+        )
+
+        if result.returncode == 0:
+            # Try one last nuclear option: direct API call
+            logger.info("Step 8: Using direct API to force delete namespace...")
+            try:
+                subprocess.run(
+                    ["kubectl", "get", "namespace", self.namespace, "-o", "json"],
+                    stdout=subprocess.PIPE,
+                    text=True
+                ).stdout
+
+                # Use kubectl proxy approach
+                import threading
+                def run_proxy():
+                    subprocess.run(["kubectl", "proxy", "--port=8765"], check=False)
+
+                proxy_thread = threading.Thread(target=run_proxy, daemon=True)
+                proxy_thread.start()
+                time.sleep(2)
+
+                # Direct API call
+                import urllib.request
+                import json as json_lib
+                req = urllib.request.Request(
+                    f"http://localhost:8765/api/v1/namespaces/{self.namespace}/finalize",
+                    data=json_lib.dumps({"kind":"Namespace","apiVersion":"v1","metadata":{"name":self.namespace},"spec":{"finalizers":[]}}).encode(),
+                    headers={'Content-Type': 'application/json'},
+                    method='PUT'
+                )
+                urllib.request.urlopen(req, timeout=5)
+                time.sleep(2)
+            except Exception as e:
+                logger.debug(f"API call approach failed: {e}")
+
+            # Final final check
+            result = subprocess.run(
+                ["kubectl", "get", "namespace", self.namespace],
+                capture_output=True,
+                timeout=5,
+                check=False
+            )
+
+            if result.returncode == 0:
+                logger.error(f"✗ Failed to delete namespace {self.namespace} after all attempts")
+                logger.error("This is unusual. Check for:")
+                logger.error("  1. Admission webhooks blocking deletion")
+                logger.error("  2. Custom resource definitions with stuck finalizers")
+                logger.error("  3. Cluster-level issues")
+                raise OrchestratorError(f"Could not delete namespace {self.namespace}")
+            else:
+                logger.info(f"✓ Namespace {self.namespace} successfully wiped")
+        else:
+            logger.info(f"✓ Namespace {self.namespace} successfully wiped")
 
     def wait_for_pods_ready(self, timeout_seconds: int = 600) -> None:
         """
@@ -1023,6 +1344,11 @@ def main():
     undeploy_parser = subparsers.add_parser("undeploy", help="Remove Pulsar from cluster")
     undeploy_parser.add_argument("--experiment-id", required=True, help="Experiment ID")
 
+    # Wipe command
+    wipe_parser = subparsers.add_parser("wipe", help="Force delete namespace and all resources")
+    wipe_parser.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+    wipe_parser.add_argument("--namespace", default="pulsar", help="Namespace to wipe (default: pulsar)")
+
     # Run tests command
     run_parser = subparsers.add_parser("run", help="Run benchmark tests")
     run_parser.add_argument("--test-plan", type=Path, required=True, help="Test plan file")
@@ -1052,6 +1378,14 @@ def main():
         # Handle list command
         if args.command == "list":
             Orchestrator.list_experiments()
+            return
+
+        # Handle wipe command (doesn't need experiment ID)
+        if args.command == "wipe":
+            # Create temporary orchestrator with specified namespace
+            temp_orchestrator = Orchestrator()
+            temp_orchestrator.namespace = args.namespace
+            temp_orchestrator.wipe_namespace(force=args.force)
             return
 
         # Resolve experiment ID

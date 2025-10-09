@@ -12,14 +12,6 @@ Pulsar AWS Lab is a reproducible, ephemeral Apache Pulsar testing framework on A
 
 ### High-Level Components
 
-1. **EKS Infrastructure** (`terraform/modules/eks/`, `terraform/modules/network/`, `terraform/modules/iam/`)
-   - Modular Terraform design for EKS cluster provisioning
-   - Creates VPC, subnets, security groups, and IAM roles
-   - EKS cluster with managed node groups (default: Kubernetes 1.31)
-   - Default node configuration: t3.medium instances, 3 nodes (1-5 scaling)
-   - OIDC provider for Kubernetes service account integration
-   - Cost allocation tags on all resources (experiment-id, component, timestamp)
-   - State management (local by default, S3 backend optional)
 
 2. **Helm Chart** (`helm/pulsar-eks-lab/`)
    - Self-contained Helm chart wrapping Apache Pulsar chart (v4.3.0)
@@ -60,14 +52,13 @@ Pulsar AWS Lab is a reproducible, ephemeral Apache Pulsar testing framework on A
 
 ### Workflow
 
-1. **Setup** (one-time): Terraform provisions EKS cluster and node groups
 2. **Build Docker Image** (one-time): Build custom OMB image and push to registry
 3. **Deploy**: Helm installs Pulsar chart with OMB pods to EKS cluster
 4. **Wait**: Orchestrator waits for all pods to reach Ready state
 5. **Test**: Run test matrix via OMB pods, collect metrics and logs
 6. **Report**: Generate comprehensive offline report with costs
 7. **Undeploy**: Helm uninstalls Pulsar release (cleanup pods/PVCs)
-8. **Teardown** (optional): Terraform destroys EKS cluster
+
 
 ### Key Design Principles
 
