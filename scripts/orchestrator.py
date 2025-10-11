@@ -638,13 +638,21 @@ class Orchestrator:
                 phase = pod['status'].get('phase', 'Unknown')
                 conditions = pod['status'].get('conditions', [])
 
-                ready = False
-                for condition in conditions:
-                    if condition['type'] == 'Ready':
-                        ready = condition['status'] == 'True'
-                        break
+                # Check if this is an initialization Job (these complete and don't need to be "Ready")
+                is_init_job = 'init' in name.lower() or phase == 'Succeeded'
 
-                status_str = f"{phase} ({'Ready' if ready else 'Not Ready'})"
+                ready = False
+                if is_init_job and phase == 'Succeeded':
+                    # Init jobs that succeeded are considered "ready"
+                    ready = True
+                else:
+                    # Regular pods need Ready condition
+                    for condition in conditions:
+                        if condition['type'] == 'Ready':
+                            ready = condition['status'] == 'True'
+                            break
+
+                status_str = f"{phase} ({'Ready' if ready or is_init_job else 'Not Ready'})"
                 component_status.setdefault(component, []).append((name, status_str, ready))
 
                 if not ready:

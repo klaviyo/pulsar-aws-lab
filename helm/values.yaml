@@ -507,7 +507,7 @@ zookeeper:
       local_storage: false
       ## EKS uses AWS EBS for persistent volumes
       ## gp3 is the recommended storage class (faster and cheaper than gp2)
-      storageClassName: gp3
+      storageClassName: gp3-encrypted
       #
       ## Instead if you want to create a new storage class define it below
       ## If left undefined no storage class will be defined along with PVC
@@ -526,7 +526,7 @@ zookeeper:
       name: datalog
       size: 10Gi
       local_storage: false
-      storageClassName: gp3
+      storageClassName: gp3-encrypted
       #
       ## Instead if you want to create a new storage class define it below
       ## If left undefined no storage class will be defined along with PVC
@@ -773,7 +773,7 @@ bookkeeper:
       name: journal
       size: 10Gi
       local_storage: false
-      storageClassName: gp3
+      storageClassName: gp3-encrypted
       #
       ## Instead if you want to create a new storage class define it below
       ## If left undefined no storage class will be defined along with PVC
@@ -801,7 +801,7 @@ bookkeeper:
       name: ledgers
       size: 30Gi
       local_storage: false
-      storageClassName: gp3
+      storageClassName: gp3-encrypted
       # storageClass:
         # ...
       # selector:
@@ -823,7 +823,7 @@ bookkeeper:
       name: common
       size: 40Gi
       local_storage: false
-      storageClassName: gp3
+      storageClassName: gp3-encrypted
       # storageClass: ## this is common too
         # ...
       # selector:
@@ -1860,7 +1860,7 @@ pulsar_manager:
       name: data
       size: 1Gi
       local_storage: false
-      storageClassName: gp3
+      storageClassName: gp3-encrypted
       ## If you want to bind static persistent volumes via selectors, e.g.:
       # selector:
         # matchLabels:
