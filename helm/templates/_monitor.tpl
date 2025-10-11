@@ -33,12 +33,12 @@ under the License.
   {{- $valuesPath = index $valuesPath . }}
 {{- end }}
 
-{{- if index $root.Values "victoria-metrics-k8s-stack" "enabled" }}
-apiVersion: operator.victoriametrics.com/v1beta1
-kind: VMPodScrape
-{{- else }}
+{{- if index $root.Values "kube-prometheus-stack" "enabled" }}
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
+{{- else }}
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
 {{- end }}
 metadata:
   name: {{ template "pulsar.fullname" $root }}-{{ replace "." "-" $component }}
@@ -54,10 +54,10 @@ spec:
       scrapeTimeout: {{ $valuesPath.podMonitor.scrapeTimeout }}
       # Set honor labels to true to allow overriding namespace label with Pulsar's namespace label
       honorLabels: true
-      {{- if index $root.Values "victoria-metrics-k8s-stack" "enabled" }}
-      relabelConfigs:
-      {{- else }}
+      {{- if index $root.Values "kube-prometheus-stack" "enabled" }}
       relabelings:
+      {{- else }}
+      relabelConfigs:
       {{- end }}
         - action: labelmap
           regex: __meta_kubernetes_pod_label_(.+)
@@ -71,10 +71,10 @@ spec:
           action: replace
           targetLabel: kubernetes_pod_name
       {{- if or $valuesPath.podMonitor.metricRelabelings (and $valuesPath.podMonitor.dropUnderscoreCreatedMetrics (index $valuesPath.podMonitor.dropUnderscoreCreatedMetrics "enabled")) }}
-      {{- if index $root.Values "victoria-metrics-k8s-stack" "enabled" }}
-      metricRelabelConfigs:
-      {{- else }}
+      {{- if index $root.Values "kube-prometheus-stack" "enabled" }}
       metricRelabelings:
+      {{- else }}
+      metricRelabelConfigs:
       {{- end }}
       {{- if and $valuesPath.podMonitor.dropUnderscoreCreatedMetrics (index $valuesPath.podMonitor.dropUnderscoreCreatedMetrics "enabled") }}
         # Drop metrics that end with _created, auto-created by metrics library to match OpenMetrics format
