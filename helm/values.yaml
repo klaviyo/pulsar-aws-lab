@@ -190,7 +190,7 @@ images:
     # uses defaultPullPolicy when unspecified
     pullPolicy:
   proxy:
-    # uses defaultPulsarImageRepository when unspecified
+    # uses defaultPulsarImageRepository when unspecified 
     repository:
     # uses defaultPulsarImageTag when unspecified
     tag:
@@ -437,8 +437,8 @@ zookeeper:
     follower: 2888
     leaderElection: 3888
     # admin: 9990
-  # nodeSelector:
-    # cloud.google.com/gke-nodepool: default-pool
+  nodeSelector:
+    klaviyo.com/pool-name: zookeepers
   probe:
     liveness:
       enabled: true
@@ -470,7 +470,11 @@ zookeeper:
   # annotations for the app (statefulset/deployment)
   appAnnotations: {}
   annotations: {}
-  tolerations: []
+  tolerations:
+    - key: "zookeepers"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
   gracePeriod: 30
   resources:
     requests:
@@ -700,8 +704,8 @@ bookkeeper:
     http: 8000
     bookie: 3181
     statestore: 4181
-  # nodeSelector:
-    # cloud.google.com/gke-nodepool: default-pool
+  nodeSelector:
+    klaviyo.com/pool-name: bookkeepers
   probe:
     liveness:
       enabled: true
@@ -733,7 +737,11 @@ bookkeeper:
   # annotations for the app (statefulset/deployment)
   appAnnotations: {}
   annotations: {}
-  tolerations: []
+  tolerations:
+    - key: "bookkeepers"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
   gracePeriod: 30
   ## Timeout for waiting for bookkeeper cluster metadata to be initialized before starting a bookie
   waitMetadataTimeout: 600
@@ -1092,8 +1100,8 @@ broker:
     https: 8443
     pulsar: 6650
     pulsarssl: 6651
-  # nodeSelector:
-    # cloud.google.com/gke-nodepool: default-pool
+  nodeSelector:
+    klaviyo.com/pool-name: brokers
   probe:
     liveness:
       enabled: true
@@ -1125,7 +1133,11 @@ broker:
   # annotations for the app (statefulset/deployment)
   appAnnotations: {}
   annotations: {}
-  tolerations: []
+  tolerations:
+    - key: "brokers"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
   gracePeriod: 30
   ## Timeout for waiting for zookeeper to become available before starting a broker
   waitZookeeperTimeout: 600
@@ -1339,8 +1351,8 @@ proxy:
       #   regex: cluster
   # True includes annotation for statefulset that contains hash of corresponding configmap, which will cause pods to restart on configmap change
   restartPodsOnConfigMapChange: false
-  # nodeSelector:
-    # cloud.google.com/gke-nodepool: default-pool
+  nodeSelector:
+    klaviyo.com/pool-name: proxies
   probe:
     liveness:
       enabled: true
@@ -1372,7 +1384,11 @@ proxy:
   # annotations for the app (statefulset/deployment)
   appAnnotations: {}
   annotations: {}
-  tolerations: []
+  tolerations:
+    - key: "proxies"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
   gracePeriod: 30
   ## Timeout for waiting for zookeeper to become available before starting a proxy
   waitZookeeperTimeout: 600

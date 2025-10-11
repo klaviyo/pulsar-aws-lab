@@ -9,7 +9,7 @@
 #   --push              Push image to ECR after build
 #   --registry REPO     Docker registry/repository (default: ECR sre/pulsar-omb)
 #   --tag TAG           Additional image tag (timestamp tag is always added)
-#   --platform PLATFORM Build for specific platform (e.g., linux/amd64,linux/arm64)
+#   --platform PLATFORM Build for specific platform (default: linux/amd64)
 #
 
 set -euo pipefail
@@ -24,7 +24,7 @@ PUSH=false
 REGISTRY="439508887365.dkr.ecr.us-east-1.amazonaws.com/sre/pulsar-omb"
 AWS_REGION="us-east-1"
 TAG=""
-PLATFORM=""
+PLATFORM="linux/amd64"  # Default to x86_64 for AWS compatibility
 
 # Generate timestamp tag: YYYYMMDDHHmm
 TIMESTAMP_TAG=$(date -u +"%Y%m%d%H%M")
@@ -56,7 +56,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --registry REPO     Docker registry/repository"
             echo "                      (default: 439508887365.dkr.ecr.us-east-1.amazonaws.com/sre/pulsar-omb)"
             echo "  --tag TAG           Additional image tag (timestamp tag is always created)"
-            echo "  --platform PLATFORM Build for specific platform"
+            echo "  --platform PLATFORM Build for specific platform (default: linux/amd64)"
             echo "  -h, --help          Show this help message"
             echo ""
             echo "Image is always tagged with timestamp (YYYYMMDDHHmm) and 'latest'"
