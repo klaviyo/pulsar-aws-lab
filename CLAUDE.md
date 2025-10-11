@@ -34,7 +34,12 @@ Pulsar AWS Lab is a reproducible, ephemeral Apache Pulsar testing framework on A
    - Test plans: workload matrices and variation strategies
    - Workload definitions: topics, partitions, message sizes, rates
 
-5. **Orchestration** (`scripts/orchestrator.py`)
+5. **Custom Resource Definitions** (`crds/`)
+   - VictoriaMetrics Operator CRDs (v0.63.0) for monitoring stack
+   - Local copies ensure reproducibility and offline capability
+   - Auto-installed by orchestrator before Helm deployment
+
+6. **Orchestration** (`scripts/orchestrator.py`)
    - Python-based workflow: setup → helm_install → wait → test → report → helm_uninstall → teardown
    - Terraform automation for EKS cluster lifecycle
    - kubectl and Helm integration for Pulsar deployment
@@ -42,7 +47,7 @@ Pulsar AWS Lab is a reproducible, ephemeral Apache Pulsar testing framework on A
    - AWS cost tracking integration
    - Emergency cleanup via tag-based resource discovery
 
-6. **Testing**
+7. **Testing**
    - OpenMessaging Benchmark framework deployed as Kubernetes pods
    - Producer and consumer pods deployed via Helm chart
    - Workload configurations passed via ConfigMaps

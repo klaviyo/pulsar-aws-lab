@@ -182,6 +182,51 @@ class Orchestrator:
         node_count = len(nodes.get('items', []))
         logger.info(f"✓ Cluster has {node_count} nodes")
 
+    def install_prometheus_operator_crds(self) -> None:
+        """
+        Install Prometheus Operator CRDs if monitoring is enabled.
+
+        This is required before deploying the Helm chart with kube-prometheus-stack enabled.
+        Uses local CRD file from crds/ directory for reproducibility.
+        """
+        logger.info("Checking if Prometheus Operator CRDs need to be installed...")
+
+        # Check if CRDs already exist
+        result = self.run_command(
+            ["kubectl", "get", "crd", "prometheuses.monitoring.coreos.com"],
+            "Check for Prometheus Operator CRDs",
+            capture_output=True,
+            check=False
+        )
+
+        if result.returncode == 0:
+            logger.info("✓ Prometheus Operator CRDs already installed")
+            return
+
+        logger.info("Installing Prometheus Operator CRDs from local file...")
+
+        # Path to local CRD file
+        crd_file = PROJECT_ROOT / "crds" / "prometheus-operator-crds.yaml"
+
+        if not crd_file.exists():
+            raise OrchestratorError(
+                f"Prometheus Operator CRD file not found: {crd_file}\n"
+                f"Download it with:\n"
+                f"  PROM_VERSION=$(curl -fs -o /dev/null -w '%{{redirect_url}}' "
+                f"https://github.com/prometheus-operator/prometheus-operator/releases/latest | xargs basename)\n"
+                f"  curl -sL https://github.com/prometheus-operator/prometheus-operator/releases/download/$PROM_VERSION/stripped-down-crds.yaml "
+                f"-o {crd_file}"
+            )
+
+        # Install CRDs from local file
+        self.run_command(
+            ["kubectl", "apply", "-f", str(crd_file)],
+            "Install Prometheus Operator CRDs",
+            check=True
+        )
+
+        logger.info("✓ Prometheus Operator CRDs installed")
+
     def helm_deploy(self, values_overrides: Optional[Dict] = None) -> None:
         """
         Deploy or upgrade Pulsar using Helm.
@@ -193,6 +238,9 @@ class Orchestrator:
             OrchestratorError: If Helm deployment fails
         """
         logger.info(f"Deploying Helm chart: {self.helm_release_name}")
+
+        # Install Prometheus Operator CRDs if monitoring is enabled
+        self.install_prometheus_operator_crds()
 
         # Check if release exists
         result = self.run_command(

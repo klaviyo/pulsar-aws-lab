@@ -1586,58 +1586,49 @@ toolset:
   additionalCommand:
 
 #############################################################
-### Monitoring Stack : victoria-metrics-k8s-stack chart
+### Monitoring Stack : kube-prometheus-stack chart
 #############################################################
 
-## Victoria Metrics, Grafana, and the rest of the monitoring stack are managed by the dependent chart here:
-## https://github.com/VictoriaMetrics/helm-charts/blob/master/charts/victoria-metrics-k8s-stack
-## For sample values, please see: https://github.com/VictoriaMetrics/helm-charts/blob/master/charts/victoria-metrics-k8s-stack/values.yaml
-victoria-metrics-k8s-stack:
-  ## Enable the victoria-metrics-k8s-stack chart
-  enabled: false
+## Prometheus, Grafana, and the rest of the monitoring stack are managed by the dependent chart here:
+## https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack
+## For sample values, please see: https://github.com/prometheus-community/helm-charts/blob/main/charts/kube-prometheus-stack/values.yaml
+kube-prometheus-stack:
+  ## Enable the kube-prometheus-stack chart
+  enabled: true
 
-  ## VictoriaMetrics Operator dependency chart configuration
-  victoria-metrics-operator:
+  ## Prometheus Operator configuration
+  ## CRDs are installed from local crds/ directory by orchestrator
+  crds:
+    enabled: false  # CRDs managed externally for version control
+
+  ## Prometheus server configuration
+  prometheus:
     enabled: true
-    # Install CRDs for VictoriaMetrics Operator
-    crds:
-      plain: true
-    operator:
-      ## By default, operator is configured to not convert Prometheus Operator monitoring.coreos.com/v1 objects
-      ## to Victoria Metrics operator operator.victoriametrics.com/v1beta1 objects.
-      # Enable this if you want to use Prometheus Operator objects for other purposes.
-      disable_prometheus_converter: true
-
-  ## Single-node VM instance
-  vmsingle:
-    enabled: true
-    ## -- Full spec for VMSingle CRD. Allowed values describe [here](https://docs.victoriametrics.com/operator/api#vmsinglespec)
-    spec:
-      retentionPeriod: "10d"
-      storage:
-        accessModes:
-          - ReadWriteOnce
-        resources:
-          requests:
-            storage: 50Gi
-
-  ## VM Agent for scraping metrics
-  vmagent:
-    enabled: true
-    ## Minikube specific settings - uncomment when using minikube
-    # spec:
-    #   volumes:
-    #     - hostPath:
-    #         path: /var/lib/minikube/certs/etcd
-    #         type: DirectoryOrCreate
-    #       name: etcd-certs
-    #   volumeMounts:
-    #     - mountPath: /var/lib/minikube/certs/etcd
-    #       name: etcd-certs
-
-  ## VM Alert for alerting rules - disabled by default
-  vmalert:
-    enabled: false
+    prometheusSpec:
+      retention: 10d
+      resources:
+        requests:
+          cpu: 200m
+          memory: 512Mi
+        limits:
+          cpu: 500m
+          memory: 1Gi
+      storageSpec:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: gp3-encrypted
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 50Gi
+      ## PodMonitor selector - discover all PodMonitors
+      podMonitorSelectorNilUsesHelmValues: false
+      podMonitorSelector: {}
+      podMonitorNamespaceSelector: {}
+      ## ServiceMonitor selector - discover all ServiceMonitors
+      serviceMonitorSelectorNilUsesHelmValues: false
+      serviceMonitorSelector: {}
+      serviceMonitorNamespaceSelector: {}
 
   ## Alertmanager component - disabled by default
   alertmanager:
@@ -1700,13 +1691,13 @@ victoria-metrics-k8s-stack:
             path: /var/lib/grafana/dashboards/pulsar
     dashboards:
       default:
-        victoriametrics:
-          gnetId: 10229
-          revision: 38
-          datasource: VictoriaMetrics
+        prometheus:
+          gnetId: 3662
+          revision: 2
+          datasource: Prometheus
         kubernetes:
-          gnetId: 14205
-          datasource: VictoriaMetrics
+          gnetId: 15758
+          datasource: Prometheus
       oxia:
         oxia-containers:
           url: https://raw.githubusercontent.com/lhotari/pulsar-grafana-dashboards/master/oxia/oxia-containers.json
@@ -1780,45 +1771,19 @@ victoria-metrics-k8s-stack:
 
   kubeControllerManager:
     enabled: true
-    ## Additional settings for minikube environments
-    vmScrape:
-      spec:
-        endpoints:
-          - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
-            port: http-metrics
-            scheme: https
-            tlsConfig:
-              caFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-              insecureSkipVerify: true  # For development environments like minikube
 
   coreDns:
     enabled: true
 
   kubeEtcd:
     enabled: true
-    ## Minikube specific settings - uncomment or adjust when using minikube
-    # service:
-    #   port: 2381
-    #   targetPort: 2381
-    # vmScrape:
-    #   spec:
-    #     endpoints:
-    #       - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
-    #         port: http-metrics
-    #         scheme: http  # Minikube often uses http instead of https for etcd
 
   kubeScheduler:
     enabled: true
-    ## Additional settings for minikube environments
-    vmScrape:
-      spec:
-        endpoints:
-          - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
-            port: http-metrics
-            scheme: https
-            tlsConfig:
-              caFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-              insecureSkipVerify: true  # For development environments like minikube
+
+  ## Prometheus Operator - manages Prometheus and ServiceMonitor/PodMonitor CRDs
+  prometheusOperator:
+    enabled: true
 
 ## Components Stack: pulsar_manager
 ## templates/pulsar-manager.yaml
