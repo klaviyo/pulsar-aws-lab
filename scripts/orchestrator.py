@@ -25,6 +25,9 @@ from rich.table import Table
 from rich.text import Text
 from rich import box
 
+# Import OMB worker manager
+from omb.workers import WorkerManager
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -87,6 +90,13 @@ class Orchestrator:
 
         # Store test results from immediate collection
         self.test_results = ""
+
+        # Initialize worker manager for persistent worker pools
+        self.worker_manager = WorkerManager(
+            namespace=self.namespace,
+            omb_image=self.omb_image,
+            results_dir=self.experiment_dir
+        )
 
         # Ensure K8s namespace exists
         self._ensure_namespace_exists()
@@ -749,38 +759,8 @@ spec:
                 check=False
             )
 
-        # Delete all OMB worker StatefulSets
-        result = self.run_command(
-            ["kubectl", "get", "statefulsets", "-n", self.namespace, "-l", "app=omb-worker", "-o", "name"],
-            "List OMB worker StatefulSets",
-            capture_output=True,
-            check=False
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            statefulsets = result.stdout.strip().split('\n')
-            logger.info(f"Found {len(statefulsets)} OMB worker StatefulSets to clean up")
-            self.run_command(
-                ["kubectl", "delete", "statefulsets", "-n", self.namespace, "-l", "app=omb-worker"],
-                "Delete OMB worker StatefulSets",
-                check=False
-            )
-
-        # Delete all OMB worker Services
-        result = self.run_command(
-            ["kubectl", "get", "services", "-n", self.namespace, "-o", "name"],
-            "List Services",
-            capture_output=True,
-            check=False
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            for service in result.stdout.strip().split('\n'):
-                if 'omb-workers-' in service:
-                    svc_name = service.split('/')[-1]
-                    self.run_command(
-                        ["kubectl", "delete", "service", svc_name, "-n", self.namespace],
-                        f"Delete Service {svc_name}",
-                        check=False
-                    )
+        # Note: OMB workers are persistent across test runs and NOT cleaned up here
+        # To clean up workers explicitly, use: python scripts/orchestrator.py cleanup-workers
 
         # Delete all OMB workload ConfigMaps
         result = self.run_command(
@@ -942,8 +922,16 @@ spec:
 
         self._add_status(f"Starting test: {test_name}", 'info')
         live.update(self._create_layout())
-        self._add_status(f"Deploying {num_workers} worker pods", 'info')
+
+        # Ensure we have enough workers (persistent across all tests)
+        self._add_status(f"Ensuring {num_workers} worker pods are available", 'info')
         live.update(self._create_layout())
+        try:
+            self.worker_manager.ensure_workers(num_workers)
+            self._add_status(f"✓ Workers ready (persistent pool)", 'success')
+            live.update(self._create_layout())
+        except Exception as e:
+            raise OrchestratorError(f"Failed to ensure workers: {e}")
 
         # Generate workload ConfigMap
         workload_yaml = self._generate_omb_workload_yaml(test_name, workload_config)
@@ -959,70 +947,6 @@ spec:
             ["kubectl", "apply", "-f", str(workload_file)],
             f"Apply workload ConfigMap for {test_name}"
         )
-
-        # Deploy OMB workers StatefulSet (with parallel pod creation)
-        workers_yaml = self._generate_omb_workers_yaml(test_name, num_workers)
-        workers_file = self.experiment_dir / f"omb_workers_{test_name}.yaml"
-
-        with open(workers_file, 'w') as f:
-            f.write(workers_yaml)
-
-        self._add_status("Deploying worker StatefulSet", 'info')
-        live.update(self._create_layout())
-        self.run_command(
-            ["kubectl", "apply", "-f", str(workers_file)],
-            f"Deploy OMB workers for {test_name}"
-        )
-
-        # Wait for workers to be ready
-        self._add_status(f"Waiting for {num_workers} workers to be ready...", 'info')
-        live.update(self._create_layout())
-        logger.info(f"Waiting for {num_workers} worker pods to be ready...")
-        timeout_seconds = 5 * 60  # 5 minutes
-        start_time = time.time()
-        poll_interval = 5
-
-        while time.time() - start_time < timeout_seconds:
-            result = self.run_command(
-                ["kubectl", "get", "pods", "-n", self.namespace,
-                 "-l", f"app=omb-worker,test={test_name}",
-                 "-o", "json"],
-                "Check worker pods status",
-                capture_output=True,
-                check=False
-            )
-
-            if result.returncode == 0:
-                pods = json.loads(result.stdout)
-                pod_items = pods.get('items', [])
-
-                if len(pod_items) == num_workers:
-                    # Check if all are ready
-                    ready_count = 0
-                    for pod in pod_items:
-                        conditions = pod.get('status', {}).get('conditions', [])
-                        for condition in conditions:
-                            if condition['type'] == 'Ready' and condition['status'] == 'True':
-                                ready_count += 1
-                                break
-
-                    if ready_count == num_workers:
-                        self._add_status(f"✓ All {num_workers} workers are ready", 'success')
-                        live.update(self._create_layout())
-                        logger.info(f"✓ All {num_workers} workers are ready")
-                        break
-                    else:
-                        self._add_status(f"Workers ready: {ready_count}/{num_workers}", 'info')
-                        live.update(self._create_layout())
-                        logger.info(f"Workers ready: {ready_count}/{num_workers}")
-                else:
-                    self._add_status(f"Workers created: {len(pod_items)}/{num_workers}", 'info')
-                    live.update(self._create_layout())
-                    logger.info(f"Workers created: {len(pod_items)}/{num_workers}")
-
-            time.sleep(poll_interval)
-        else:
-            raise OrchestratorError(f"Timeout waiting for worker pods to be ready after {timeout_seconds}s")
 
         # Create OMB driver Job
         job_yaml = self._generate_omb_job_yaml(test_name, num_workers)
@@ -1183,7 +1107,7 @@ spec:
         # Cleanup Pulsar topics created during test
         self._cleanup_test_topics(test_name, workload_config, live)
 
-        # Cleanup Job and workers
+        # Cleanup ephemeral test resources (workers are persistent and reused)
         logger.info(f"Cleaning up test resources for {test_name}...")
         self.run_command(
             ["kubectl", "delete", "job", f"omb-{test_name}", "-n", self.namespace],
@@ -1191,20 +1115,11 @@ spec:
             check=False
         )
         self.run_command(
-            ["kubectl", "delete", "statefulset", f"omb-workers-{test_name}", "-n", self.namespace],
-            f"Delete OMB workers StatefulSet {test_name}",
-            check=False
-        )
-        self.run_command(
-            ["kubectl", "delete", "service", f"omb-workers-{test_name}", "-n", self.namespace],
-            f"Delete OMB workers Service {test_name}",
-            check=False
-        )
-        self.run_command(
             ["kubectl", "delete", "configmap", f"omb-workload-{test_name}", "-n", self.namespace],
             f"Delete workload ConfigMap {test_name}",
             check=False
         )
+        # Note: Workers are persistent and reused across tests - not deleted here
 
         return results
 
@@ -1233,81 +1148,13 @@ data:
       blockIfQueueFull: true
       pendingQueueSize: 1000
     consumer:
-      subscriptionType: Exclusive
-"""
-
-    def _generate_omb_workers_yaml(self, test_name: str, num_workers: int = 3) -> str:
-        """Generate Kubernetes StatefulSet YAML for OMB workers (required for predictable DNS names)"""
-        return f"""apiVersion: v1
-kind: Service
-metadata:
-  name: omb-workers-{test_name}
-  namespace: {self.namespace}
-spec:
-  clusterIP: None  # Headless service for StatefulSet DNS
-  selector:
-    app: omb-worker
-    test: {test_name}
-  ports:
-  - name: http
-    port: 8080
-    targetPort: 8080
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: omb-workers-{test_name}
-  namespace: {self.namespace}
-spec:
-  serviceName: omb-workers-{test_name}
-  replicas: {num_workers}
-  podManagementPolicy: Parallel  # Create all pods in parallel instead of sequentially
-  selector:
-    matchLabels:
-      app: omb-worker
-      test: {test_name}
-  template:
-    metadata:
-      labels:
-        app: omb-worker
-        test: {test_name}
-    spec:
-      containers:
-      - name: worker
-        image: {self.omb_image}
-        imagePullPolicy: Always
-        command: ["/bin/bash", "-c"]
-        args:
-          - |
-            set -x
-            echo "Starting OMB worker on $(hostname)"
-            echo "Worker will listen on 0.0.0.0:8080"
-
-            # Start worker and keep it running
-            exec /app/bin/benchmark-worker --port 8080
-        ports:
-        - containerPort: 8080
-          name: http
-        readinessProbe:
-          tcpSocket:
-            port: 8080
-          initialDelaySeconds: 5
-          periodSeconds: 5
-          failureThreshold: 3
-        livenessProbe:
-          tcpSocket:
-            port: 8080
-          initialDelaySeconds: 10
-          periodSeconds: 10
-          failureThreshold: 3
+      subscriptionType: Shared
 """
 
     def _generate_omb_job_yaml(self, test_name: str, num_workers: int = 3) -> str:
         """Generate Kubernetes Job YAML for OMB driver"""
-        # Generate worker addresses for the StatefulSet
-        worker_addresses = []
-        for i in range(num_workers):
-            worker_addresses.append(f"http://omb-workers-{test_name}-{i}.omb-workers-{test_name}.{self.namespace}.svc.cluster.local:8080")
+        # Get worker addresses from persistent worker pool
+        worker_addresses = self.worker_manager.get_worker_addresses(num_workers)
         workers_list = ",".join(worker_addresses)
 
         return f"""apiVersion: batch/v1
@@ -1400,6 +1247,10 @@ spec:
             if [ $EXIT_CODE -eq 0 ]; then
               echo "Results saved to /results/{self.experiment_id}/{test_name}.json"
               cat /results/{self.experiment_id}/{test_name}.json
+
+              # Sleep to keep pod alive for results collection
+              echo "Sleeping 30 seconds to allow results collection..."
+              sleep 30
             else
               echo "Benchmark failed with exit code $EXIT_CODE"
             fi
@@ -2169,6 +2020,10 @@ def main():
     # List command
     list_parser = subparsers.add_parser("list", help="List experiments")
 
+    # Cleanup workers command
+    cleanup_workers_parser = subparsers.add_parser("cleanup-workers", help="Delete persistent worker pods")
+    cleanup_workers_parser.add_argument("--namespace", default="omb", help="Kubernetes namespace (default: omb)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -2179,6 +2034,15 @@ def main():
         # Handle list command
         if args.command == "list":
             Orchestrator.list_experiments()
+            return
+
+        # Handle cleanup-workers command (doesn't need experiment ID)
+        if args.command == "cleanup-workers":
+            from omb.workers import WorkerManager
+            namespace = args.namespace
+            worker_manager = WorkerManager(namespace=namespace, omb_image="", results_dir=Path("/tmp"))
+            worker_manager.cleanup_workers()
+            print(f"✓ Workers cleaned up in namespace '{namespace}'")
             return
 
         # Resolve experiment ID
