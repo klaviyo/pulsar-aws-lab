@@ -1428,7 +1428,7 @@ spec:
 
         logger.info(f"Logs saved to: {log_file}")
 
-        # Copy JSON results from pod if test succeeded
+        # Copy JSON results from pod if test succeeded (pod should still exist since we collect before cleanup)
         json_data = ""
         if success:
             results_dir = self.experiment_dir / "benchmark_results"
@@ -1436,21 +1436,53 @@ spec:
 
             result_file = results_dir / f"{test_name}.json"
 
-            # Copy result file from pod
+            # Try kubectl cp first (fastest and most reliable)
+            logger.info(f"Attempting to copy results from pod {pod_name}...")
             result = self.run_command(
                 ["kubectl", "cp",
                  f"{self.namespace}/{pod_name}:/results/result.json",
                  str(result_file)],
                 f"Copy results for {test_name}",
-                check=False
+                check=False,
+                capture_output=True
             )
 
-            if result.returncode == 0 and result_file.exists():
-                logger.info(f"Results saved to: {result_file}")
+            if result.returncode == 0 and result_file.exists() and result_file.stat().st_size > 0:
+                logger.info(f"Results copied successfully to: {result_file}")
                 with open(result_file, 'r') as f:
                     json_data = f.read()
             else:
-                logger.warning(f"Failed to copy results file for {test_name}")
+                # Fallback: extract JSON from logs (OMB cats the file to stdout)
+                logger.warning(f"kubectl cp failed ({result.stderr}), extracting from logs instead...")
+                try:
+                    # Find JSON in logs - it starts with { and OMB prints it after the cat command
+                    json_start = logs.rfind('Results saved to /results/result.json')
+                    if json_start != -1:
+                        remaining = logs[json_start:]
+                        brace_start = remaining.find('{')
+                        if brace_start != -1:
+                            json_portion = remaining[brace_start:]
+                            brace_end = json_portion.rfind('}')
+                            if brace_end != -1:
+                                json_data = json_portion[:brace_end + 1]
+
+                                # Validate JSON
+                                import json as json_module
+                                json_module.loads(json_data)
+
+                                # Save to file
+                                with open(result_file, 'w') as f:
+                                    f.write(json_data)
+                                logger.info(f"Extracted {len(json_data)} bytes of JSON from logs to: {result_file}")
+                            else:
+                                logger.warning("Could not find closing brace in JSON output")
+                        else:
+                            logger.warning("Could not find JSON start in logs")
+                    else:
+                        logger.warning("Could not find 'Results saved' marker in logs")
+                except Exception as e:
+                    logger.warning(f"Error extracting JSON from logs: {e}")
+                    json_data = ""
 
         return json_data
 
