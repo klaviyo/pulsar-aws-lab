@@ -37,7 +37,7 @@ python scripts/orchestrator.py list
 python scripts/orchestrator.py report --experiment-id latest
 ```
 
-Results are saved to `~/.pulsar-aws-lab/latest/` with detailed metrics, latency percentiles, and cost analysis.
+Results are saved to `results/latest/` with detailed metrics, latency percentiles, and HTML reports with Grafana links.
 
 ## Installation
 
@@ -99,7 +99,7 @@ python scripts/orchestrator.py run \
 2. Creates OMB producer/consumer Jobs in Kubernetes
 3. Runs each test variation sequentially
 4. Collects metrics: throughput, latency (p50/p95/p99/p99.9/max), errors
-5. Saves results to `~/.pulsar-aws-lab/<experiment-id>/`
+5. Saves results to `results/<experiment-id>/`
 
 ### 2. Generate Reports
 
@@ -225,31 +225,28 @@ test_runs:
 
 ## Results
 
-All experiment data is saved to `~/.pulsar-aws-lab/<experiment-id>/`:
+All experiment data is saved to `results/<experiment-id>/`:
 
 ```
-~/.pulsar-aws-lab/my-experiment-123/
-├── report.html                    # Interactive HTML report with charts
+results/exp-20241013-120000/
+├── test_report.html               # Interactive HTML report with Grafana links
 ├── benchmark_results/
-│   ├── baseline-test-1.json       # Raw OMB metrics
-│   ├── baseline-test-2.json
-│   └── summary.csv                # Aggregated results
-├── configs/
-│   ├── test-plan.yaml             # Test plan used
-│   └── workload-*.yaml            # Workload definitions
-├── costs/
-│   └── cost-report.json           # AWS cost breakdown
+│   ├── poc-20k.log                # OMB test results
+│   └── ...
+├── workload_poc-20k.yaml          # Generated workload ConfigMap
+├── omb_workers_poc-20k.yaml       # Generated workers StatefulSet
+├── omb_job_poc-20k.yaml           # Generated driver Job
 └── orchestrator.log               # Execution log
 ```
 
 **Quick access to latest results:**
 ```bash
 # Latest experiment is symlinked
-cd ~/.pulsar-aws-lab/latest
+cd results/latest
 
 # Open report in browser
-open report.html  # macOS
-xdg-open report.html  # Linux
+open test_report.html  # macOS
+xdg-open test_report.html  # Linux
 ```
 
 ## Common Workflows

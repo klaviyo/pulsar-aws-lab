@@ -272,15 +272,15 @@ python scripts/orchestrator.py run \
 ```
 
 **What Happens:**
-1. Creates experiment directory: `~/.pulsar-omb-lab/<experiment-id>/`
+1. Creates experiment directory: `results/<experiment-id>/`
 2. Generates Kubernetes Job manifests for each test in the plan
 3. Creates ConfigMaps with workload configurations
-4. Submits Jobs to `pulsar-omb` namespace
+4. Submits Jobs to `omb` namespace
 5. Monitors Jobs until completion (success or failure)
 6. Collects logs from all Job pods
 7. Saves logs to experiment directory
 8. Deletes Jobs and ConfigMaps
-9. Creates symlink: `~/.pulsar-omb-lab/latest` → experiment directory
+9. Creates symlink: `results/latest` → experiment directory
 
 **Monitoring Progress:**
 ```bash
@@ -318,9 +318,9 @@ python scripts/orchestrator.py report --format json
 - **Test Configurations**: Workload definitions and test plan parameters
 
 **Report Location:**
-- HTML report: `~/.pulsar-omb-lab/<experiment-id>/report.html`
-- Raw data: `~/.pulsar-omb-lab/<experiment-id>/results/`
-- Logs: `~/.pulsar-omb-lab/<experiment-id>/logs/`
+- HTML report: `results/<experiment-id>/test_report.html`
+- Raw data: `results/<experiment-id>/benchmark_results/`
+- Logs: `results/<experiment-id>/orchestrator.log`
 
 #### List Experiments
 
@@ -476,28 +476,18 @@ warmupDuration: 60  # seconds
 
 ### Result Directory Structure
 
-Each experiment creates a directory at `~/.pulsar-omb-lab/<experiment-id>/`:
+Each experiment creates a directory at `results/<experiment-id>/`:
 
 ```
-~/.pulsar-omb-lab/<experiment-id>/
+results/<experiment-id>/
 ├── orchestrator.log           # Orchestrator execution log
-├── report.html                # Generated HTML report
-├── report.json                # Machine-readable results
-├── test-plan.yaml             # Copy of test plan used
-├── logs/
-│   ├── omb-workload-001/
-│   │   └── pod.log            # Complete OMB output
-│   ├── omb-workload-002/
-│   │   └── pod.log
+├── test_report.html           # Generated HTML report with Grafana links
+├── benchmark_results/
+│   ├── poc-20k.log            # Test results from OMB driver
 │   └── ...
-├── results/
-│   ├── workload-001.json      # Parsed metrics
-│   ├── workload-002.json
-│   └── summary.json           # Aggregated statistics
-└── manifests/
-    ├── job-workload-001.yaml  # Generated Job manifests
-    ├── configmap-workload-001.yaml
-    └── ...
+├── workload_poc-20k.yaml      # Generated workload ConfigMap
+├── omb_workers_poc-20k.yaml   # Generated workers StatefulSet
+└── omb_job_poc-20k.yaml       # Generated driver Job manifest
 ```
 
 ### Metrics Collected
@@ -634,40 +624,40 @@ kubectl logs -n pulsar-omb <pod-name>
 **Diagnosis**:
 ```bash
 # Check experiment directory
-ls -la ~/.pulsar-omb-lab/<experiment-id>/
+ls -la results/<experiment-id>/
 
-# Check for logs
-ls -la ~/.pulsar-omb-lab/<experiment-id>/logs/
+# Check for benchmark results
+ls -la results/<experiment-id>/benchmark_results/
 
-# Verify logs contain metrics
-cat ~/.pulsar-omb-lab/<experiment-id>/logs/*/pod.log | grep -i "throughput\|latency"
+# View orchestrator logs
+tail -f results/<experiment-id>/orchestrator.log
 ```
 
 **Solutions**:
-- Check orchestrator logs: `~/.pulsar-omb-lab/<experiment-id>/orchestrator.log`
-- Verify OMB output format matches parser expectations
-- Re-run report generation: `python scripts/orchestrator.py report --experiment-id <id>`
-- Check for parsing errors in orchestrator output
+- Check orchestrator logs: `results/<experiment-id>/orchestrator.log`
+- View HTML report: `results/<experiment-id>/test_report.html`
+- Check benchmark results: `results/<experiment-id>/benchmark_results/`
+- Check for empty log files or collection failures
 
 ### Stuck Jobs Cleanup
 
 If Jobs get stuck or need manual cleanup:
 
 ```bash
-# Delete all Jobs in namespace
-kubectl delete jobs -n pulsar-omb --all
+# Delete all Jobs in OMB namespace
+kubectl delete jobs -n omb --all
 
 # Delete all ConfigMaps
-kubectl delete configmaps -n pulsar-omb --all
+kubectl delete configmaps -n omb --all
 
 # Force delete stuck pods
-kubectl delete pods -n pulsar-omb --all --grace-period=0 --force
+kubectl delete pods -n omb --all --grace-period=0 --force
 
 # Nuclear option: delete entire namespace
-kubectl delete namespace pulsar-omb
+kubectl delete namespace omb
 
 # Recreate namespace for next run
-kubectl create namespace pulsar-omb
+kubectl create namespace omb
 ```
 
 ### Debugging Job Execution
@@ -721,29 +711,31 @@ pulsar-aws-lab/
 
 ### Runtime Locations
 
-- **Experiment results**: `~/.pulsar-omb-lab/<experiment-id>/`
-- **Latest experiment symlink**: `~/.pulsar-omb-lab/latest`
-- **Orchestrator logs**: `~/.pulsar-omb-lab/<experiment-id>/orchestrator.log`
-- **Test logs**: `~/.pulsar-omb-lab/<experiment-id>/logs/`
-- **Generated reports**: `~/.pulsar-omb-lab/<experiment-id>/report.html`
-- **Job manifests**: `~/.pulsar-omb-lab/<experiment-id>/manifests/`
+- **Experiment results**: `results/<experiment-id>/`
+- **Latest experiment symlink**: `results/latest`
+- **Orchestrator logs**: `results/<experiment-id>/orchestrator.log`
+- **Test results**: `results/<experiment-id>/benchmark_results/`
+- **Generated reports**: `results/<experiment-id>/test_report.html`
+- **Job manifests**: `results/<experiment-id>/*.yaml`
 
 ### Kubernetes Resources
 
-- **Namespace**: `pulsar-omb` (created automatically)
-- **Jobs**: `omb-<workload>-<variation>-<timestamp>`
-- **ConfigMaps**: `omb-workload-<hash>`
+- **Namespace**: `omb` (created automatically)
+- **StatefulSets**: `omb-workers-<test-name>` (3 worker pods by default)
+- **Jobs**: `omb-<test-name>` (single driver pod)
+- **ConfigMaps**: `omb-workload-<test-name>`
+- **Services**: `omb-workers-<test-name>` (headless service for worker discovery)
 - **Service Account**: `default` (no special permissions required)
 
 ## Development Guidelines
 
 When working with this codebase:
 
-1. **OMB is ephemeral** - Always use Jobs, never Deployments/StatefulSets
+1. **OMB uses driver/worker architecture** - Driver Job + Worker StatefulSet for distributed load
 2. **Pulsar is external** - Never include Pulsar deployment code
 3. **Config is immutable** - Each test creates new ConfigMaps, doesn't modify existing
-4. **Results are local** - Store results in experiment directory, not in cluster
-5. **Cleanup is automatic** - Jobs self-cleanup, orchestrator handles ConfigMap cleanup
+4. **Results are local** - Store results in project `results/` directory, not in home directory
+5. **Cleanup is automatic** - Jobs/StatefulSets deleted after test completion
 6. **Hardcoded connection** - Pulsar URL is fixed in orchestrator constants
 
 ## Adding New Features

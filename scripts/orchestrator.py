@@ -17,6 +17,13 @@ from typing import Dict, List, Optional
 
 import boto3
 import yaml
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich import box
 
 # Setup logging
 logging.basicConfig(
@@ -28,11 +35,12 @@ logger = logging.getLogger(__name__)
 # Project directories
 PROJECT_ROOT = Path(__file__).parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
-RESULTS_DIR = Path.home() / ".pulsar-omb-lab"
+RESULTS_DIR = PROJECT_ROOT / "results"
 
 # Pulsar cluster connection details
 PULSAR_SERVICE_URL = "pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650"
 PULSAR_HTTP_URL = "http://pulsar-proxy.pulsar.svc.cluster.local:80"
+PULSAR_TEST_NAMESPACE = "public/omb-test"  # Fixed namespace for OMB test topics
 
 # OMB Docker image
 DEFAULT_OMB_IMAGE = "439508887365.dkr.ecr.us-east-1.amazonaws.com/sre/pulsar-omb:latest"
@@ -63,8 +71,17 @@ class Orchestrator:
         self.pulsar_http_url = PULSAR_HTTP_URL
         self.omb_image = omb_image or DEFAULT_OMB_IMAGE
 
-        # Ensure OMB namespace exists
+        # Rich console for UI
+        self.console = Console()
+        self.status_messages = []  # Track status updates
+        self.current_test = None
+        self.pulsar_tenant_namespace = PULSAR_TEST_NAMESPACE  # Fixed namespace for all tests
+
+        # Ensure K8s namespace exists
         self._ensure_namespace_exists()
+
+        # Ensure Pulsar namespace exists
+        self._ensure_pulsar_namespace_exists()
 
         # Create/update "latest" symlink
         latest_link = RESULTS_DIR / "latest"
@@ -81,32 +98,178 @@ class Orchestrator:
         logger.addHandler(file_handler)
 
         logger.info(f"Initialized orchestrator for experiment: {self.experiment_id}")
-        print(f"\n{'='*60}")
-        print(f"Experiment ID: {self.experiment_id}")
-        print(f"OMB Namespace: {self.namespace}")
-        print(f"Pulsar Namespace: pulsar")
-        print(f"Pulsar URL: {self.pulsar_service_url}")
-        print(f"Results will be saved to: {self.experiment_dir}")
-        print(f"{'='*60}\n")
+        self._display_initial_info()
+
+    def _display_initial_info(self) -> None:
+        """Display initial experiment information"""
+        table = Table(show_header=False, box=box.ROUNDED, border_style="cyan")
+        table.add_column("Key", style="bold cyan")
+        table.add_column("Value", style="white")
+
+        table.add_row("Experiment ID", self.experiment_id)
+        table.add_row("OMB Namespace", self.namespace)
+        table.add_row("Pulsar Namespace", "pulsar")
+        table.add_row("Pulsar URL", self.pulsar_service_url)
+        table.add_row("Results Directory", str(self.experiment_dir))
+
+        self.console.print()
+        self.console.print(Panel(table, title="[bold cyan]Experiment Configuration[/bold cyan]", border_style="cyan"))
+        self.console.print()
+
+    def _create_metadata_panel(self) -> Panel:
+        """Create static metadata panel for left side"""
+        # Experiment info
+        exp_table = Table(show_header=False, box=None, padding=(0, 1))
+        exp_table.add_column("Key", style="bold cyan", width=18)
+        exp_table.add_column("Value", style="white")
+
+        exp_table.add_row("Experiment ID", self.experiment_id)
+        exp_table.add_row("K8s Namespace", self.namespace)
+        exp_table.add_row("Pulsar K8s NS", "pulsar")
+        exp_table.add_row("Pulsar Tenant/NS", self.pulsar_tenant_namespace)
+
+        # Test info
+        if self.current_test:
+            test_table = Table(show_header=False, box=None, padding=(0, 1), title="[bold yellow]Current Test[/bold yellow]", title_justify="left")
+            test_table.add_column("Key", style="bold yellow", width=18)
+            test_table.add_column("Value", style="white")
+
+            test_table.add_row("Test Name", self.current_test.get('name', 'N/A'))
+            test_table.add_row("Workers", str(self.current_test.get('workers', 'N/A')))
+            test_table.add_row("Type", self.current_test.get('type', 'N/A'))
+
+            content = Table.grid()
+            content.add_row(exp_table)
+            content.add_row("")
+            content.add_row(test_table)
+        else:
+            content = exp_table
+
+        # Monitoring info
+        monitor_text = Text()
+        monitor_text.append("\n\nMonitoring:\n", style="bold green")
+        monitor_text.append("kubectl port-forward -n pulsar \\\n", style="dim")
+        monitor_text.append("  svc/pulsar-grafana 3000:3000\n", style="dim")
+        monitor_text.append("http://localhost:3000", style="blue underline")
+
+        final_content = Table.grid()
+        final_content.add_row(content)
+        final_content.add_row(monitor_text)
+
+        return Panel(
+            final_content,
+            title="[bold cyan]Experiment Info[/bold cyan]",
+            border_style="cyan",
+            padding=(1, 2)
+        )
+
+    def _create_status_panel(self) -> Panel:
+        """Create live status panel for right side"""
+        if not self.status_messages:
+            content = Text("Waiting for test to start...", style="dim italic")
+        else:
+            # Show last 20 status messages
+            content = Text()
+            for msg in self.status_messages[-20:]:
+                timestamp = msg.get('time', '')
+                message = msg.get('message', '')
+                level = msg.get('level', 'info')
+
+                style_map = {
+                    'info': 'white',
+                    'success': 'green',
+                    'warning': 'yellow',
+                    'error': 'red'
+                }
+                style = style_map.get(level, 'white')
+
+                content.append(f"[dim]{timestamp}[/dim] ", style="dim")
+                content.append(f"{message}\n", style=style)
+
+        return Panel(
+            content,
+            title="[bold green]Status Log[/bold green]",
+            border_style="green",
+            padding=(1, 2)
+        )
+
+    def _add_status(self, message: str, level: str = 'info') -> None:
+        """Add a status message to the log"""
+        self.status_messages.append({
+            'time': datetime.now().strftime('%H:%M:%S'),
+            'message': message,
+            'level': level
+        })
+
+    def _create_layout(self) -> Layout:
+        """Create the split-pane layout"""
+        layout = Layout()
+        layout.split_row(
+            Layout(name="left", ratio=1),
+            Layout(name="right", ratio=2)
+        )
+
+        layout["left"].update(self._create_metadata_panel())
+        layout["right"].update(self._create_status_panel())
+
+        return layout
 
     def _ensure_namespace_exists(self) -> None:
-        """Ensure the OMB namespace exists, create it if not."""
+        """Ensure the K8s OMB namespace exists, create it if not."""
         result = self.run_command(
             ["kubectl", "get", "namespace", self.namespace],
-            f"Check if namespace {self.namespace} exists",
+            f"Check if K8s namespace {self.namespace} exists",
             capture_output=True,
             check=False
         )
 
         if result.returncode != 0:
-            logger.info(f"Creating namespace: {self.namespace}")
+            logger.info(f"Creating K8s namespace: {self.namespace}")
             self.run_command(
                 ["kubectl", "create", "namespace", self.namespace],
-                f"Create namespace {self.namespace}"
+                f"Create K8s namespace {self.namespace}"
             )
-            logger.info(f"✓ Namespace '{self.namespace}' created")
+            logger.info(f"✓ K8s namespace '{self.namespace}' created")
         else:
-            logger.debug(f"Namespace '{self.namespace}' already exists")
+            logger.debug(f"K8s namespace '{self.namespace}' already exists")
+
+    def _ensure_pulsar_namespace_exists(self) -> None:
+        """Ensure the Pulsar tenant/namespace for tests exists, create it if not."""
+        # Check if namespace exists
+        result = self.run_command(
+            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+             "bin/pulsar-admin", "namespaces", "list", "public"],
+            f"List Pulsar namespaces in public tenant",
+            capture_output=True,
+            check=False
+        )
+
+        if result.returncode == 0:
+            namespaces = [line.strip().strip('"') for line in result.stdout.strip().split('\n')
+                         if line.strip() and line.strip().startswith('public/')]
+
+            if self.pulsar_tenant_namespace in namespaces:
+                logger.debug(f"Pulsar namespace '{self.pulsar_tenant_namespace}' already exists")
+                return
+
+        # Create the namespace
+        logger.info(f"Creating Pulsar namespace: {self.pulsar_tenant_namespace}")
+        result = self.run_command(
+            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+             "bin/pulsar-admin", "namespaces", "create", self.pulsar_tenant_namespace],
+            f"Create Pulsar namespace {self.pulsar_tenant_namespace}",
+            check=False,
+            capture_output=True
+        )
+
+        if result.returncode == 0:
+            logger.info(f"✓ Pulsar namespace '{self.pulsar_tenant_namespace}' created")
+        else:
+            # If it already exists, that's fine
+            if "already exists" in result.stderr.lower():
+                logger.debug(f"Pulsar namespace '{self.pulsar_tenant_namespace}' already exists")
+            else:
+                logger.warning(f"Failed to create Pulsar namespace: {result.stderr}")
 
     def load_config(self, config_file: Path) -> Dict:
         """
@@ -393,61 +556,87 @@ class Orchestrator:
 
         logger.info(f"✓ Namespace '{self.namespace}' cleanup completed")
 
-    def _cleanup_test_topics(self, test_name: str, workload_config: Dict) -> None:
+    def _cleanup_test_topics(self, test_name: str = "", workload_config: Optional[Dict] = None, live: Optional[Live] = None) -> None:
         """
-        Delete Pulsar topics created during the test.
+        Delete all Pulsar topics in the test namespace.
+        OMB creates topics in the fixed namespace 'public/omb-test'.
 
         Args:
-            test_name: Name of the test
-            workload_config: Workload configuration containing topic count and naming
+            test_name: Name of the test (unused, kept for compatibility)
+            workload_config: Workload configuration (unused, kept for compatibility)
+            live: Rich Live display instance for UI updates
         """
-        logger.info(f"Cleaning up Pulsar topics for test '{test_name}'...")
+        _ = test_name, workload_config  # Keep for backward compatibility, unused
 
-        # Get workload details
-        workload_name = workload_config.get('name', test_name)
-        num_topics = workload_config.get('topics', 1)
-        num_partitions = workload_config.get('partitionsPerTopic', 1)
+        if live:
+            self._add_status(f"Cleaning up topics in {self.pulsar_tenant_namespace}...", 'info')
+            live.update(self._create_layout())
 
-        # OMB creates topics with pattern: benchmark-{workload_name}-{topic_index}
+        logger.info(f"Cleaning up Pulsar topics in namespace '{self.pulsar_tenant_namespace}'...")
+
+        # List all topics in the detected namespace
+        result = self.run_command(
+            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+             "bin/pulsar-admin", "topics", "list", self.pulsar_tenant_namespace],
+            f"List topics in {self.pulsar_tenant_namespace}",
+            check=False,
+            capture_output=True
+        )
+
+        if result.returncode != 0:
+            logger.warning(f"Failed to list topics in {self.pulsar_tenant_namespace}: {result.stderr}")
+            if live:
+                self._add_status("⚠ Failed to list topics for cleanup", 'warning')
+                live.update(self._create_layout())
+            return
+
+        # Parse topic list (filter out kubectl stderr messages)
+        lines = result.stdout.strip().split('\n')
+        topics = []
+        for line in lines:
+            line = line.strip()
+            if line and line.startswith('persistent://') and 'Defaulted container' not in line:
+                topics.append(line)
+
+        if not topics:
+            logger.info(f"No topics to delete in namespace '{self.pulsar_tenant_namespace}'")
+            if live:
+                self._add_status("✓ No topics to clean up", 'success')
+                live.update(self._create_layout())
+            return
+
+        logger.info(f"Found {len(topics)} topic(s) to delete")
+
+        # Delete each topic
         topics_deleted = 0
-        for topic_idx in range(num_topics):
-            topic_name = f"benchmark-{workload_name}-{topic_idx}"
-
-            # For partitioned topics, delete the parent topic (this cascades to partitions)
-            if num_partitions > 1:
-                topic_url = f"persistent://public/default/{topic_name}"
-            else:
-                topic_url = f"persistent://public/default/{topic_name}"
-
-            # Delete topic via pulsar-admin (broker is in pulsar namespace)
+        for topic_url in topics:
             result = self.run_command(
                 ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                 "bin/pulsar-admin", "topics", "delete", topic_url],
-                f"Delete topic {topic_name}",
+                 "bin/pulsar-admin", "topics", "delete", topic_url, "-f"],  # -f for force delete
+                f"Delete topic {topic_url.split('/')[-1]}",
                 check=False,
                 capture_output=True
             )
 
             if result.returncode == 0:
                 topics_deleted += 1
-                logger.info(f"  ✓ Deleted topic: {topic_name}")
-            elif "does not exist" in result.stderr or "TopicNotFound" in result.stderr:
-                logger.debug(f"  ⊗ Topic {topic_name} doesn't exist (already deleted or never created)")
+                logger.debug(f"  ✓ Deleted: {topic_url.split('/')[-1]}")
             else:
-                logger.warning(f"  ✗ Failed to delete topic {topic_name}: {result.stderr}")
+                logger.warning(f"  ✗ Failed to delete {topic_url.split('/')[-1]}: {result.stderr}")
 
-        if topics_deleted > 0:
-            logger.info(f"✓ Deleted {topics_deleted} topic(s) for test '{test_name}'")
-        else:
-            logger.info(f"No topics to delete for test '{test_name}'")
+        logger.info(f"✓ Deleted {topics_deleted}/{len(topics)} topic(s) from '{self.pulsar_tenant_namespace}'")
+        if live:
+            self._add_status(f"✓ Cleaned up {topics_deleted}/{len(topics)} topics", 'success')
+            live.update(self._create_layout())
 
-    def run_omb_job(self, test_config: Dict, workload_config: Dict) -> str:
+    def run_omb_job(self, test_config: Dict, workload_config: Dict, live: Live) -> str:
         """
         Run OpenMessaging Benchmark job with distributed workers.
 
         Args:
             test_config: Test run configuration
             workload_config: Workload specification
+            live: Rich Live display instance
 
         Returns:
             Test results as JSON string
@@ -459,17 +648,17 @@ class Orchestrator:
         num_workers = test_config.get('num_workers', 3)  # Default to 3 workers
         logger.info(f"Running OMB test: {test_name} (with {num_workers} workers)")
 
-        # Print monitoring information
-        print(f"\n{'='*60}")
-        print(f"Test: {test_name}")
-        print(f"Workers: {num_workers}")
-        print(f"\nMonitoring Information:")
-        print(f"  Pulsar Namespace: pulsar")
-        print(f"  OMB Namespace: {self.namespace}")
-        print(f"\n  To access Grafana dashboards:")
-        print(f"  kubectl port-forward -n pulsar svc/pulsar-grafana 3000:3000")
-        print(f"  Then open: http://localhost:3000")
-        print(f"{'='*60}\n")
+        # Set current test info for UI
+        self.current_test = {
+            'name': test_name,
+            'workers': num_workers,
+            'type': test_config.get('type', 'unknown')
+        }
+
+        self._add_status(f"Starting test: {test_name}", 'info')
+        live.update(self._create_layout())
+        self._add_status(f"Deploying {num_workers} worker pods", 'info')
+        live.update(self._create_layout())
 
         # Generate workload ConfigMap
         workload_yaml = self._generate_omb_workload_yaml(test_name, workload_config)
@@ -479,6 +668,8 @@ class Orchestrator:
             f.write(workload_yaml)
 
         # Apply workload ConfigMap
+        self._add_status("Creating workload ConfigMap", 'info')
+        live.update(self._create_layout())
         self.run_command(
             ["kubectl", "apply", "-f", str(workload_file)],
             f"Apply workload ConfigMap for {test_name}"
@@ -491,12 +682,16 @@ class Orchestrator:
         with open(workers_file, 'w') as f:
             f.write(workers_yaml)
 
+        self._add_status("Deploying worker StatefulSet", 'info')
+        live.update(self._create_layout())
         self.run_command(
             ["kubectl", "apply", "-f", str(workers_file)],
             f"Deploy OMB workers for {test_name}"
         )
 
         # Wait for workers to be ready
+        self._add_status(f"Waiting for {num_workers} workers to be ready...", 'info')
+        live.update(self._create_layout())
         logger.info(f"Waiting for {num_workers} worker pods to be ready...")
         timeout_seconds = 5 * 60  # 5 minutes
         start_time = time.time()
@@ -527,11 +722,17 @@ class Orchestrator:
                                 break
 
                     if ready_count == num_workers:
+                        self._add_status(f"✓ All {num_workers} workers are ready", 'success')
+                        live.update(self._create_layout())
                         logger.info(f"✓ All {num_workers} workers are ready")
                         break
                     else:
+                        self._add_status(f"Workers ready: {ready_count}/{num_workers}", 'info')
+                        live.update(self._create_layout())
                         logger.info(f"Workers ready: {ready_count}/{num_workers}")
                 else:
+                    self._add_status(f"Workers created: {len(pod_items)}/{num_workers}", 'info')
+                    live.update(self._create_layout())
                     logger.info(f"Workers created: {len(pod_items)}/{num_workers}")
 
             time.sleep(poll_interval)
@@ -546,12 +747,16 @@ class Orchestrator:
             f.write(job_yaml)
 
         # Apply Job
+        self._add_status("Starting driver Job", 'info')
+        live.update(self._create_layout())
         self.run_command(
             ["kubectl", "apply", "-f", str(job_file)],
             f"Create OMB driver Job for {test_name}"
         )
 
         # Wait for Job completion or failure
+        self._add_status(f"Running benchmark test (this may take several minutes)...", 'info')
+        live.update(self._create_layout())
         logger.info(f"Waiting for test {test_name} to complete...")
 
         # Poll Job status until complete or failed
@@ -581,12 +786,16 @@ class Orchestrator:
 
                 if succeeded_count > 0:
                     job_succeeded = True
+                    self._add_status(f"✓ Benchmark completed successfully", 'success')
+                    live.update(self._create_layout())
                     logger.info(f"✓ Job {test_name} completed successfully (succeeded: {succeeded_count})")
                     # Give pod a moment to fully terminate before collecting logs
                     time.sleep(2)
                     break
                 elif failed_count > 0:
                     job_failed = True
+                    self._add_status(f"✗ Benchmark failed", 'error')
+                    live.update(self._create_layout())
                     logger.error(f"✗ Job {test_name} failed (failed: {failed_count})")
                     # Give pod a moment to fully terminate before collecting logs
                     time.sleep(2)
@@ -594,6 +803,10 @@ class Orchestrator:
 
                 # Still running - log progress
                 elapsed = int(time.time() - start_time)
+                minutes = elapsed // 60
+                seconds = elapsed % 60
+                self._add_status(f"Test running... ({minutes}m {seconds}s elapsed)", 'info')
+                live.update(self._create_layout())
                 logger.info(f"Job {test_name} still running... ({elapsed}s elapsed, active: {active_count}, succeeded: {succeeded_count}, failed: {failed_count})")
 
             time.sleep(poll_interval)
@@ -608,11 +821,19 @@ class Orchestrator:
             raise OrchestratorError(f"OMB test {test_name} failed")
 
         # Collect results from Job logs
+        self._add_status("Collecting test results...", 'info')
+        live.update(self._create_layout())
         logger.info(f"Collecting results for {test_name}...")
         results = self._collect_job_logs(test_name, success=True)
 
+        if results:
+            self._add_status(f"✓ Results collected ({len(results)} bytes)", 'success')
+        else:
+            self._add_status("⚠ No results data collected", 'warning')
+        live.update(self._create_layout())
+
         # Cleanup Pulsar topics created during test
-        self._cleanup_test_topics(test_name, workload_config)
+        self._cleanup_test_topics(test_name, workload_config, live)
 
         # Cleanup Job and workers
         logger.info(f"Cleaning up test resources for {test_name}...")
@@ -657,7 +878,7 @@ data:
     client:
       serviceUrl: {self.pulsar_service_url}
       httpUrl: {self.pulsar_http_url}
-      namespacePrefix: public/default
+      namespacePrefix: {self.pulsar_tenant_namespace}
     producer:
       batchingEnabled: true
       batchingMaxPublishDelayMs: 1
@@ -986,36 +1207,47 @@ spec:
         results_dir = self.experiment_dir / "benchmark_results"
         results_dir.mkdir(exist_ok=True)
 
-        # Run each test
-        for idx, test_run in enumerate(test_plan['test_runs']):
-            test_name = test_run['name']
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Test {idx + 1}/{len(test_plan['test_runs'])}: {test_name}")
-            logger.info(f"{'='*60}\n")
+        # Run tests with Rich Live display
+        with Live(self._create_layout(), refresh_per_second=2, console=self.console) as live:
+            # Run each test
+            for idx, test_run in enumerate(test_plan['test_runs']):
+                test_name = test_run['name']
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Test {idx + 1}/{len(test_plan['test_runs'])}: {test_name}")
+                logger.info(f"{'='*60}\n")
 
-            # Generate workload
-            workload = self._generate_workload(test_plan['base_workload'], test_run)
+                # Generate workload
+                workload = self._generate_workload(test_plan['base_workload'], test_run)
 
-            # Run OMB job
-            try:
-                results = self.run_omb_job(test_run, workload)
+                # Run OMB job
+                try:
+                    results = self.run_omb_job(test_run, workload, live)
 
-                # Save results
-                result_file = results_dir / f"{test_name}.log"
-                with open(result_file, 'w') as f:
-                    f.write(results)
+                    # Save results
+                    result_file = results_dir / f"{test_name}.log"
+                    with open(result_file, 'w') as f:
+                        f.write(results)
 
-                logger.info(f"✓ Test '{test_name}' completed")
-                logger.info(f"Results: {result_file}")
+                    self._add_status(f"✓ Test '{test_name}' completed", 'success')
+                    live.update(self._create_layout())
+                    logger.info(f"✓ Test '{test_name}' completed")
+                    logger.info(f"Results: {result_file}")
 
-            except OrchestratorError as e:
-                logger.error(f"Test '{test_name}' failed: {e}")
-                continue
+                except OrchestratorError as e:
+                    self._add_status(f"✗ Test '{test_name}' failed: {e}", 'error')
+                    live.update(self._create_layout())
+                    logger.error(f"Test '{test_name}' failed: {e}")
+                    continue
 
         logger.info(f"\n{'='*60}")
         logger.info(f"ALL TESTS COMPLETED")
         logger.info(f"Results: {results_dir}")
         logger.info(f"{'='*60}\n")
+
+        # Generate HTML report
+        self.console.print("\n[bold cyan]Generating test report...[/bold cyan]")
+        report_file = self.generate_html_report(test_plan, results_dir)
+        self.console.print(f"[bold green]✓ Report generated:[/bold green] {report_file}\n")
 
         # Cleanup any leftover resources in namespace
         self.cleanup_namespace()
@@ -1040,6 +1272,262 @@ spec:
             workload['producerRate'] = overrides['producer_rate']
 
         return workload
+
+    def generate_html_report(self, test_plan: Dict, results_dir: Path) -> Path:
+        """
+        Generate comprehensive HTML report with test results and Grafana links.
+
+        Args:
+            test_plan: Test plan configuration
+            results_dir: Directory containing test result files
+
+        Returns:
+            Path to generated HTML report
+        """
+        report_file = self.experiment_dir / "test_report.html"
+
+        # Collect all result files
+        log_files = list(results_dir.glob("*.log"))
+        json_files = list(results_dir.glob("*.json"))
+
+        # Build HTML
+        html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OMB Test Report - {self.experiment_id}</title>
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }}
+        h1 {{
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }}
+        h2 {{
+            color: #34495e;
+            margin-top: 30px;
+            border-left: 4px solid #3498db;
+            padding-left: 15px;
+        }}
+        .metadata {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }}
+        .metadata table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        .metadata td {{
+            padding: 8px;
+            border-bottom: 1px solid #ecf0f1;
+        }}
+        .metadata td:first-child {{
+            font-weight: bold;
+            color: #7f8c8d;
+            width: 200px;
+        }}
+        .grafana-link {{
+            display: inline-block;
+            background: #e74c3c;
+            color: white;
+            padding: 12px 24px;
+            text-decoration: none;
+            border-radius: 5px;
+            font-weight: bold;
+            margin: 10px 10px 10px 0;
+        }}
+        .grafana-link:hover {{
+            background: #c0392b;
+        }}
+        .test-results {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }}
+        .test-card {{
+            background: #ecf0f1;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 10px 0;
+            border-left: 4px solid #27ae60;
+        }}
+        .test-card.failed {{
+            border-left-color: #e74c3c;
+        }}
+        .log-viewer {{
+            background: #2c3e50;
+            color: #ecf0f1;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }}
+        .status-badge {{
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+        }}
+        .status-success {{
+            background: #27ae60;
+            color: white;
+        }}
+        .status-failed {{
+            background: #e74c3c;
+            color: white;
+        }}
+        code {{
+            background: #ecf0f1;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+        }}
+    </style>
+</head>
+<body>
+    <h1>OpenMessaging Benchmark Test Report</h1>
+
+    <div class="metadata">
+        <h2>Experiment Information</h2>
+        <table>
+            <tr>
+                <td>Experiment ID</td>
+                <td><code>{self.experiment_id}</code></td>
+            </tr>
+            <tr>
+                <td>Test Plan</td>
+                <td>{test_plan.get('name', 'N/A')}</td>
+            </tr>
+            <tr>
+                <td>Description</td>
+                <td>{test_plan.get('description', 'N/A')}</td>
+            </tr>
+            <tr>
+                <td>K8s Namespace (OMB)</td>
+                <td><code>{self.namespace}</code></td>
+            </tr>
+            <tr>
+                <td>K8s Namespace (Pulsar)</td>
+                <td><code>pulsar</code></td>
+            </tr>
+            <tr>
+                <td>Pulsar Tenant/Namespace</td>
+                <td><code>{self.pulsar_tenant_namespace}</code></td>
+            </tr>
+            <tr>
+                <td>Pulsar Service URL</td>
+                <td><code>{self.pulsar_service_url}</code></td>
+            </tr>
+            <tr>
+                <td>Results Directory</td>
+                <td><code>{self.experiment_dir}</code></td>
+            </tr>
+            <tr>
+                <td>Generated</td>
+                <td>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</td>
+            </tr>
+        </table>
+    </div>
+
+    <div class="metadata">
+        <h2>Monitoring & Dashboards</h2>
+        <p>To view real-time metrics in Grafana, run the following command:</p>
+        <code style="display: block; padding: 10px; background: #2c3e50; color: #ecf0f1; border-radius: 5px;">
+            kubectl port-forward -n pulsar svc/pulsar-grafana 3000:3000
+        </code>
+        <p style="margin-top: 10px;">Then access Grafana at:</p>
+        <a href="http://localhost:3000" target="_blank" class="grafana-link">Open Grafana Dashboard</a>
+        <p style="color: #7f8c8d; font-size: 14px; margin-top: 10px;">
+            Note: You'll need to port-forward to access Grafana. Default credentials are usually admin/admin.
+        </p>
+    </div>
+
+    <div class="test-results">
+        <h2>Test Results</h2>
+        <p>Total tests executed: {len(test_plan.get('test_runs', []))}</p>
+        <p>Log files found: {len(log_files)}</p>
+        <p>JSON results found: {len(json_files)}</p>
+"""
+
+        # Add test cards for each test
+        for test_run in test_plan.get('test_runs', []):
+            test_name = test_run['name']
+            log_file = results_dir / f"{test_name}.log"
+            json_file = results_dir / f"{test_name}.json"
+
+            has_log = log_file.exists()
+            has_json = json_file.exists()
+            status = "success" if (has_log or has_json) else "failed"
+
+            html_content += f"""
+        <div class="test-card {status}">
+            <h3>{test_name} <span class="status-badge status-{status}">{'COMPLETED' if status == 'success' else 'NO RESULTS'}</span></h3>
+            <p><strong>Type:</strong> {test_run.get('type', 'N/A')}</p>
+            <p><strong>Description:</strong> {test_run.get('description', 'N/A')}</p>
+"""
+
+            if has_log:
+                with open(log_file, 'r') as f:
+                    log_content = f.read()
+                    # Truncate if too long
+                    if len(log_content) > 5000:
+                        log_content = log_content[:5000] + f"\n\n... (truncated, full log: {log_file}) ..."
+
+                html_content += f"""
+            <h4>Test Logs</h4>
+            <div class="log-viewer">{log_content if log_content else 'No log content'}</div>
+"""
+
+            if has_json:
+                html_content += f"""
+            <p style="margin-top: 10px;">
+                <strong>JSON Results:</strong> <code>{json_file}</code>
+            </p>
+"""
+
+            html_content += """
+        </div>
+"""
+
+        html_content += """
+    </div>
+
+    <div class="metadata">
+        <h2>Next Steps</h2>
+        <ul>
+            <li>Review test logs above for detailed benchmark output</li>
+            <li>Access Grafana dashboards to see real-time metrics during test execution</li>
+            <li>Check JSON result files for detailed performance metrics</li>
+            <li>Run additional tests with different configurations to compare results</li>
+        </ul>
+    </div>
+</body>
+</html>
+"""
+
+        # Write report
+        with open(report_file, 'w') as f:
+            f.write(html_content)
+
+        logger.info(f"HTML report generated: {report_file}")
+        return report_file
 
     def parse_omb_results(self, result_files: List[Path]) -> Dict:
         """

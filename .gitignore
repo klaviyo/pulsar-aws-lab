@@ -38,9 +38,8 @@ terraform/*.tfvars.json
 *.tfstate
 *.tfstate.backup
 
-# Experiment data (stored in home directory)
-# But keep the structure
-!.pulsar-aws-lab/.gitkeep
+# Experiment results (now stored in project directory)
+results/
 
 # SSH Keys
 *.pem

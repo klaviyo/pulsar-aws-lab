@@ -171,9 +171,9 @@ Future (not yet implemented):
 
 ### Interpreting Results
 
-Results are saved to `~/.pulsar-omb-lab/<experiment-id>/`:
-- `report.html` - Visual dashboard with charts
-- `benchmark_results/*.json` - Raw OMB metrics
+Results are saved to `results/<experiment-id>/`:
+- `test_report.html` - Interactive HTML report with Grafana links
+- `benchmark_results/*.log` - OMB test results
 - `orchestrator.log` - Detailed execution log
 
 Key metrics to watch:
