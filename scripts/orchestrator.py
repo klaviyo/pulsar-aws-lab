@@ -832,6 +832,46 @@ class Orchestrator:
             self._add_status(f"✓ Cleaned up {topics_deleted}/{len(topics)} topics", 'success')
             live.update(self._create_layout())
 
+        # Now delete the Pulsar namespace itself
+        self._cleanup_pulsar_namespace(live)
+
+    def _cleanup_pulsar_namespace(self, live: Optional[Live] = None) -> None:
+        """
+        Delete the Pulsar tenant/namespace after topics are cleaned up.
+        This should be called after _cleanup_test_topics().
+
+        Args:
+            live: Rich Live display instance for UI updates
+        """
+        if not self.pulsar_tenant_namespace or self.pulsar_tenant_namespace == PULSAR_TEST_NAMESPACE:
+            logger.debug("No specific Pulsar namespace to clean up")
+            return
+
+        if live:
+            self._add_status(f"Deleting Pulsar namespace {self.pulsar_tenant_namespace}...", 'info')
+            live.update(self._create_layout())
+
+        logger.info(f"Deleting Pulsar namespace '{self.pulsar_tenant_namespace}'...")
+
+        result = self.run_command(
+            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+             "bin/pulsar-admin", "namespaces", "delete", self.pulsar_tenant_namespace],
+            f"Delete Pulsar namespace {self.pulsar_tenant_namespace}",
+            check=False,
+            capture_output=True
+        )
+
+        if result.returncode == 0:
+            logger.info(f"✓ Deleted Pulsar namespace '{self.pulsar_tenant_namespace}'")
+            if live:
+                self._add_status(f"✓ Deleted Pulsar namespace", 'success')
+                live.update(self._create_layout())
+        else:
+            logger.warning(f"Failed to delete Pulsar namespace '{self.pulsar_tenant_namespace}': {result.stderr}")
+            if live:
+                self._add_status(f"⚠ Failed to delete Pulsar namespace", 'warning')
+                live.update(self._create_layout())
+
     def run_omb_job(self, test_config: Dict, workload_config: Dict, live: Live) -> str:
         """
         Run OpenMessaging Benchmark job with distributed workers.
@@ -878,7 +918,7 @@ class Orchestrator:
             f"Apply workload ConfigMap for {test_name}"
         )
 
-        # Deploy OMB workers StatefulSet
+        # Deploy OMB workers StatefulSet (with parallel pod creation)
         workers_yaml = self._generate_omb_workers_yaml(test_name, num_workers)
         workers_file = self.experiment_dir / f"omb_workers_{test_name}.yaml"
 
@@ -958,13 +998,44 @@ class Orchestrator:
         )
 
         # Wait for Job pod to start and read logs to detect namespace
+        self._add_status("Waiting for Job pod to start...", 'info')
+        live.update(self._create_layout())
+
+        # Wait for Job pod to be running and producing logs
+        max_wait = 60  # 60 seconds
+        wait_start = time.time()
+        pod_running = False
+
+        while time.time() - wait_start < max_wait:
+            result = self.run_command(
+                ["kubectl", "get", "pods", "-n", "omb",
+                 "-l", f"job-name=omb-{test_name}",
+                 "-o", "jsonpath={.items[0].status.phase}"],
+                "Check Job pod status",
+                capture_output=True,
+                check=False
+            )
+
+            if result.returncode == 0 and result.stdout.strip() == "Running":
+                pod_running = True
+                break
+
+            time.sleep(2)
+
+        if not pod_running:
+            logger.warning("Job pod did not reach Running state within timeout")
+            self._add_status("⚠ Job pod not running yet, may not detect namespace", 'warning')
+            live.update(self._create_layout())
+        else:
+            # Wait additional time for OMB to initialize and create topics
+            self._add_status("Job running, waiting for namespace creation...", 'info')
+            live.update(self._create_layout())
+            time.sleep(15)  # OMB needs time to initialize and create namespace
+
+        # Try to get namespace from Job logs (OMB prints namespace when creating topics)
         self._add_status("Detecting Pulsar namespace from Job logs...", 'info')
         live.update(self._create_layout())
 
-        # Wait a bit for pod to start and produce logs
-        time.sleep(5)
-
-        # Try to get namespace from Job logs (OMB prints namespace when creating topics)
         detected_ns = self._detect_namespace_from_job_logs(test_name)
         if detected_ns:
             self.pulsar_tenant_namespace = detected_ns
@@ -1116,14 +1187,14 @@ data:
 """
 
     def _generate_omb_workers_yaml(self, test_name: str, num_workers: int = 3) -> str:
-        """Generate Kubernetes StatefulSet YAML for OMB workers"""
+        """Generate Kubernetes StatefulSet YAML for OMB workers (required for predictable DNS names)"""
         return f"""apiVersion: v1
 kind: Service
 metadata:
   name: omb-workers-{test_name}
   namespace: {self.namespace}
 spec:
-  clusterIP: None  # Headless service for StatefulSet
+  clusterIP: None  # Headless service for StatefulSet DNS
   selector:
     app: omb-worker
     test: {test_name}
@@ -1140,6 +1211,7 @@ metadata:
 spec:
   serviceName: omb-workers-{test_name}
   replicas: {num_workers}
+  podManagementPolicy: Parallel  # Create all pods in parallel instead of sequentially
   selector:
     matchLabels:
       app: omb-worker
