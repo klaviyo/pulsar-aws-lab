@@ -32,7 +32,7 @@ FROM eclipse-temurin:17-jdk
 
 # Install runtime dependencies
 RUN apt-get update && \
-    apt-get install -y ca-certificates curl && \
+    apt-get install -y ca-certificates curl netcat-openbsd dnsutils && \
     update-ca-certificates -f && \
     rm -rf /var/lib/apt/lists/*
 

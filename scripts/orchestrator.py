@@ -32,7 +32,7 @@ RESULTS_DIR = Path.home() / ".pulsar-omb-lab"
 
 # Pulsar cluster connection details
 PULSAR_SERVICE_URL = "pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650"
-PULSAR_HTTP_URL = "http://pulsar-proxy.pulsar.svc.cluster.local:8080"
+PULSAR_HTTP_URL = "http://pulsar-proxy.pulsar.svc.cluster.local:80"
 
 # OMB Docker image
 DEFAULT_OMB_IMAGE = "439508887365.dkr.ecr.us-east-1.amazonaws.com/sre/pulsar-omb:latest"
@@ -80,6 +80,7 @@ class Orchestrator:
         logger.info(f"Initialized orchestrator for experiment: {self.experiment_id}")
         print(f"\n{'='*60}")
         print(f"Experiment ID: {self.experiment_id}")
+        print(f"Namespace: {self.namespace}")
         print(f"Results will be saved to: {self.experiment_dir}")
         print(f"{'='*60}\n")
 
@@ -293,9 +294,132 @@ class Orchestrator:
                 return component
         return 'other'
 
+    def cleanup_namespace(self) -> None:
+        """
+        Clean up any leftover OMB test resources in the namespace.
+        This removes Jobs, StatefulSets, Services, and ConfigMaps created during testing.
+        """
+        logger.info(f"Cleaning up OMB resources in namespace '{self.namespace}'...")
+
+        # Delete all OMB Jobs
+        result = self.run_command(
+            ["kubectl", "get", "jobs", "-n", self.namespace, "-l", "app=omb-driver", "-o", "name"],
+            "List OMB Jobs",
+            capture_output=True,
+            check=False
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            jobs = result.stdout.strip().split('\n')
+            logger.info(f"Found {len(jobs)} OMB Jobs to clean up")
+            self.run_command(
+                ["kubectl", "delete", "jobs", "-n", self.namespace, "-l", "app=omb-driver"],
+                "Delete OMB Jobs",
+                check=False
+            )
+
+        # Delete all OMB worker StatefulSets
+        result = self.run_command(
+            ["kubectl", "get", "statefulsets", "-n", self.namespace, "-l", "app=omb-worker", "-o", "name"],
+            "List OMB worker StatefulSets",
+            capture_output=True,
+            check=False
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            statefulsets = result.stdout.strip().split('\n')
+            logger.info(f"Found {len(statefulsets)} OMB worker StatefulSets to clean up")
+            self.run_command(
+                ["kubectl", "delete", "statefulsets", "-n", self.namespace, "-l", "app=omb-worker"],
+                "Delete OMB worker StatefulSets",
+                check=False
+            )
+
+        # Delete all OMB worker Services
+        result = self.run_command(
+            ["kubectl", "get", "services", "-n", self.namespace, "-o", "name"],
+            "List Services",
+            capture_output=True,
+            check=False
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for service in result.stdout.strip().split('\n'):
+                if 'omb-workers-' in service:
+                    svc_name = service.split('/')[-1]
+                    self.run_command(
+                        ["kubectl", "delete", "service", svc_name, "-n", self.namespace],
+                        f"Delete Service {svc_name}",
+                        check=False
+                    )
+
+        # Delete all OMB workload ConfigMaps
+        result = self.run_command(
+            ["kubectl", "get", "configmaps", "-n", self.namespace, "-o", "name"],
+            "List ConfigMaps",
+            capture_output=True,
+            check=False
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for configmap in result.stdout.strip().split('\n'):
+                if 'omb-workload-' in configmap:
+                    cm_name = configmap.split('/')[-1]
+                    self.run_command(
+                        ["kubectl", "delete", "configmap", cm_name, "-n", self.namespace],
+                        f"Delete ConfigMap {cm_name}",
+                        check=False
+                    )
+
+        logger.info(f"✓ Namespace '{self.namespace}' cleanup completed")
+
+    def _cleanup_test_topics(self, test_name: str, workload_config: Dict) -> None:
+        """
+        Delete Pulsar topics created during the test.
+
+        Args:
+            test_name: Name of the test
+            workload_config: Workload configuration containing topic count and naming
+        """
+        logger.info(f"Cleaning up Pulsar topics for test '{test_name}'...")
+
+        # Get workload details
+        workload_name = workload_config.get('name', test_name)
+        num_topics = workload_config.get('topics', 1)
+        num_partitions = workload_config.get('partitionsPerTopic', 1)
+
+        # OMB creates topics with pattern: benchmark-{workload_name}-{topic_index}
+        topics_deleted = 0
+        for topic_idx in range(num_topics):
+            topic_name = f"benchmark-{workload_name}-{topic_idx}"
+
+            # For partitioned topics, delete the parent topic (this cascades to partitions)
+            if num_partitions > 1:
+                topic_url = f"persistent://public/default/{topic_name}"
+            else:
+                topic_url = f"persistent://public/default/{topic_name}"
+
+            # Delete topic via pulsar-admin
+            result = self.run_command(
+                ["kubectl", "exec", "-n", self.namespace, "pulsar-broker-0", "--",
+                 "bin/pulsar-admin", "topics", "delete", topic_url],
+                f"Delete topic {topic_name}",
+                check=False,
+                capture_output=True
+            )
+
+            if result.returncode == 0:
+                topics_deleted += 1
+                logger.info(f"  ✓ Deleted topic: {topic_name}")
+            elif "does not exist" in result.stderr or "TopicNotFound" in result.stderr:
+                logger.debug(f"  ⊗ Topic {topic_name} doesn't exist (already deleted or never created)")
+            else:
+                logger.warning(f"  ✗ Failed to delete topic {topic_name}: {result.stderr}")
+
+        if topics_deleted > 0:
+            logger.info(f"✓ Deleted {topics_deleted} topic(s) for test '{test_name}'")
+        else:
+            logger.info(f"No topics to delete for test '{test_name}'")
+
     def run_omb_job(self, test_config: Dict, workload_config: Dict) -> str:
         """
-        Run OpenMessaging Benchmark job.
+        Run OpenMessaging Benchmark job with distributed workers.
 
         Args:
             test_config: Test run configuration
@@ -308,7 +432,8 @@ class Orchestrator:
             OrchestratorError: If test execution fails
         """
         test_name = test_config['name']
-        logger.info(f"Running OMB test: {test_name}")
+        num_workers = test_config.get('num_workers', 3)  # Default to 3 workers
+        logger.info(f"Running OMB test: {test_name} (with {num_workers} workers)")
 
         # Generate workload ConfigMap
         workload_yaml = self._generate_omb_workload_yaml(test_name, workload_config)
@@ -323,8 +448,30 @@ class Orchestrator:
             f"Apply workload ConfigMap for {test_name}"
         )
 
-        # Create OMB Job (modify from template)
-        job_yaml = self._generate_omb_job_yaml(test_name)
+        # Deploy OMB workers StatefulSet
+        workers_yaml = self._generate_omb_workers_yaml(test_name, num_workers)
+        workers_file = self.experiment_dir / f"omb_workers_{test_name}.yaml"
+
+        with open(workers_file, 'w') as f:
+            f.write(workers_yaml)
+
+        self.run_command(
+            ["kubectl", "apply", "-f", str(workers_file)],
+            f"Deploy OMB workers for {test_name}"
+        )
+
+        # Wait for workers to be ready
+        logger.info(f"Waiting for {num_workers} worker pods to be ready...")
+        self.run_command(
+            ["kubectl", "wait", "--for=condition=ready",
+             f"pod", "-l", f"app=omb-worker,test={test_name}",
+             "-n", self.namespace, "--timeout=5m"],
+            f"Wait for worker pods to be ready"
+        )
+        logger.info(f"✓ All {num_workers} workers are ready")
+
+        # Create OMB driver Job
+        job_yaml = self._generate_omb_job_yaml(test_name, num_workers)
         job_file = self.experiment_dir / f"omb_job_{test_name}.yaml"
 
         with open(job_file, 'w') as f:
@@ -333,22 +480,62 @@ class Orchestrator:
         # Apply Job
         self.run_command(
             ["kubectl", "apply", "-f", str(job_file)],
-            f"Create OMB Job for {test_name}"
+            f"Create OMB driver Job for {test_name}"
         )
 
-        # Wait for Job completion
+        # Wait for Job completion or failure
         logger.info(f"Waiting for test {test_name} to complete...")
-        result = self.run_command(
-            ["kubectl", "wait", "--for=condition=complete",
-             f"job/omb-{test_name}", "-n", self.namespace,
-             "--timeout=30m"],
-            f"Wait for Job {test_name} completion",
-            check=False
-        )
 
-        if result.returncode != 0:
-            # Check if Job failed
-            logger.error(f"Job {test_name} did not complete successfully")
+        # Poll Job status until complete or failed
+        timeout_seconds = 30 * 60  # 30 minutes
+        start_time = time.time()
+        poll_interval = 10  # seconds
+
+        job_succeeded = False
+        job_failed = False
+
+        while time.time() - start_time < timeout_seconds:
+            result = self.run_command(
+                ["kubectl", "get", "job", f"omb-{test_name}", "-n", self.namespace, "-o", "json"],
+                f"Get Job {test_name} status",
+                capture_output=True,
+                check=False
+            )
+
+            if result.returncode == 0:
+                job_status = json.loads(result.stdout)
+                status = job_status.get('status', {})
+
+                # Check for completion via succeeded/failed counts (more reliable than conditions)
+                succeeded_count = status.get('succeeded', 0)
+                failed_count = status.get('failed', 0)
+                active_count = status.get('active', 0)
+
+                if succeeded_count > 0:
+                    job_succeeded = True
+                    logger.info(f"✓ Job {test_name} completed successfully (succeeded: {succeeded_count})")
+                    # Give pod a moment to fully terminate before collecting logs
+                    time.sleep(2)
+                    break
+                elif failed_count > 0:
+                    job_failed = True
+                    logger.error(f"✗ Job {test_name} failed (failed: {failed_count})")
+                    # Give pod a moment to fully terminate before collecting logs
+                    time.sleep(2)
+                    break
+
+                # Still running - log progress
+                elapsed = int(time.time() - start_time)
+                logger.info(f"Job {test_name} still running... ({elapsed}s elapsed, active: {active_count}, succeeded: {succeeded_count}, failed: {failed_count})")
+
+            time.sleep(poll_interval)
+
+        if not (job_succeeded or job_failed):
+            logger.error(f"Timeout waiting for Job {test_name} after {timeout_seconds}s")
+            self._collect_job_logs(test_name, success=False)
+            raise OrchestratorError(f"OMB test {test_name} timed out")
+
+        if job_failed:
             self._collect_job_logs(test_name, success=False)
             raise OrchestratorError(f"OMB test {test_name} failed")
 
@@ -356,10 +543,29 @@ class Orchestrator:
         logger.info(f"Collecting results for {test_name}...")
         results = self._collect_job_logs(test_name, success=True)
 
-        # Cleanup Job
+        # Cleanup Pulsar topics created during test
+        self._cleanup_test_topics(test_name, workload_config)
+
+        # Cleanup Job and workers
+        logger.info(f"Cleaning up test resources for {test_name}...")
         self.run_command(
             ["kubectl", "delete", "job", f"omb-{test_name}", "-n", self.namespace],
-            f"Delete OMB Job {test_name}",
+            f"Delete OMB driver Job {test_name}",
+            check=False
+        )
+        self.run_command(
+            ["kubectl", "delete", "statefulset", f"omb-workers-{test_name}", "-n", self.namespace],
+            f"Delete OMB workers StatefulSet {test_name}",
+            check=False
+        )
+        self.run_command(
+            ["kubectl", "delete", "service", f"omb-workers-{test_name}", "-n", self.namespace],
+            f"Delete OMB workers Service {test_name}",
+            check=False
+        )
+        self.run_command(
+            ["kubectl", "delete", "configmap", f"omb-workload-{test_name}", "-n", self.namespace],
+            f"Delete workload ConfigMap {test_name}",
             check=False
         )
 
@@ -383,6 +589,7 @@ data:
     client:
       serviceUrl: {self.pulsar_service_url}
       httpUrl: {self.pulsar_http_url}
+      namespacePrefix: public/default
     producer:
       batchingEnabled: true
       batchingMaxPublishDelayMs: 1
@@ -392,31 +599,166 @@ data:
       subscriptionType: Exclusive
 """
 
-    def _generate_omb_job_yaml(self, test_name: str) -> str:
-        """Generate Kubernetes Job YAML for OMB test"""
-        return f"""apiVersion: batch/v1
-kind: Job
+    def _generate_omb_workers_yaml(self, test_name: str, num_workers: int = 3) -> str:
+        """Generate Kubernetes StatefulSet YAML for OMB workers"""
+        return f"""apiVersion: v1
+kind: Service
 metadata:
-  name: omb-{test_name}
+  name: omb-workers-{test_name}
   namespace: {self.namespace}
 spec:
-  backoffLimit: 0
+  clusterIP: None  # Headless service for StatefulSet
+  selector:
+    app: omb-worker
+    test: {test_name}
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: omb-workers-{test_name}
+  namespace: {self.namespace}
+spec:
+  serviceName: omb-workers-{test_name}
+  replicas: {num_workers}
+  selector:
+    matchLabels:
+      app: omb-worker
+      test: {test_name}
   template:
+    metadata:
+      labels:
+        app: omb-worker
+        test: {test_name}
     spec:
-      restartPolicy: Never
       containers:
-      - name: omb
+      - name: worker
         image: {self.omb_image}
         imagePullPolicy: Always
         command: ["/bin/bash", "-c"]
         args:
           - |
-            echo "Starting OMB test: {test_name}"
+            echo "Starting OMB worker on $(hostname)"
+            /app/bin/benchmark-worker --port 8080
+        ports:
+        - containerPort: 8080
+          name: http
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+"""
+
+    def _generate_omb_job_yaml(self, test_name: str, num_workers: int = 3) -> str:
+        """Generate Kubernetes Job YAML for OMB driver"""
+        # Generate worker addresses for the StatefulSet
+        worker_addresses = []
+        for i in range(num_workers):
+            worker_addresses.append(f"http://omb-workers-{test_name}-{i}.omb-workers-{test_name}.{self.namespace}.svc.cluster.local:8080")
+        workers_list = ",".join(worker_addresses)
+
+        return f"""apiVersion: batch/v1
+kind: Job
+metadata:
+  name: omb-{test_name}
+  namespace: {self.namespace}
+  labels:
+    app: omb-driver
+    test: {test_name}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: omb-driver
+        test: {test_name}
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: omb-driver
+        image: {self.omb_image}
+        imagePullPolicy: Always
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -x  # Enable debug output
+            echo "===== OMB Debug Information ====="
+            echo "Test name: {test_name}"
+            echo "Timestamp: $(date)"
+            echo "Hostname: $(hostname)"
+            echo ""
+
+            echo "===== DNS Resolution ====="
+            nslookup pulsar-proxy.pulsar.svc.cluster.local || echo "DNS lookup failed"
+            echo ""
+
+            echo "===== Network Connectivity ====="
+            echo "Testing binary protocol port (6650)..."
+            timeout 5 nc -zv pulsar-proxy.pulsar.svc.cluster.local 6650 || echo "Port 6650 not reachable"
+            echo "Testing HTTP port (80)..."
+            timeout 5 nc -zv pulsar-proxy.pulsar.svc.cluster.local 80 || echo "Port 80 not reachable"
+            echo ""
+
+            echo "===== HTTP Endpoint Tests ====="
+            echo "Testing /admin/v2/brokers/health..."
+            curl -v -m 10 http://pulsar-proxy.pulsar.svc.cluster.local:80/admin/v2/brokers/health || echo "Health check failed"
+            echo ""
+            echo "Testing /admin/v2/namespaces/public/default..."
+            curl -v -m 10 http://pulsar-proxy.pulsar.svc.cluster.local:80/admin/v2/namespaces/public/default || echo "Namespace check failed"
+            echo ""
+
+            echo "===== Configuration Files ====="
+            echo "Driver configuration:"
+            cat /workload/driver.yaml
+            echo ""
+            echo "Workload configuration:"
+            cat /workload/workload.yaml
+            echo ""
+
+            echo "===== Java Environment ====="
+            java -version
+            echo "JAVA_HOME: $JAVA_HOME"
+            echo "PATH: $PATH"
+            echo ""
+
+            echo "===== Worker Connectivity Tests ====="
+            echo "Testing worker endpoints..."
+            WORKERS="{workers_list}"
+            IFS=',' read -ra WORKER_ARRAY <<< "$WORKERS"
+            for worker in "${{WORKER_ARRAY[@]}}"; do
+              echo "Testing $worker..."
+              curl -m 5 "$worker" || echo "Worker $worker not reachable"
+            done
+            echo ""
+
+            echo "===== Starting OMB Benchmark (Driver Mode) ====="
             /app/bin/benchmark \\
               --drivers /workload/driver.yaml \\
+              --workers {workers_list} \\
               --output /results/result.json \\
               /workload/workload.yaml
-            echo "Results saved to /results/result.json"
+
+            EXIT_CODE=$?
+            echo ""
+            echo "===== Benchmark Exit Code: $EXIT_CODE ====="
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "Results saved to /results/result.json"
+              cat /results/result.json
+            else
+              echo "Benchmark failed with exit code $EXIT_CODE"
+            fi
+            exit $EXIT_CODE
         volumeMounts:
         - name: workload
           mountPath: /workload
@@ -437,20 +779,45 @@ spec:
         Returns:
             JSON results as string
         """
-        # Get Job pod name
-        result = self.run_command(
-            ["kubectl", "get", "pods", "-n", self.namespace,
-             "-l", f"job-name=omb-{test_name}",
-             "-o", "jsonpath={.items[0].metadata.name}"],
-            f"Get Job pod for {test_name}",
-            capture_output=True,
-            check=False
-        )
+        # Get Job pod name - retry a few times if not found immediately
+        pod_name = ""
+        for attempt in range(5):
+            result = self.run_command(
+                ["kubectl", "get", "pods", "-n", self.namespace,
+                 "-l", f"job-name=omb-{test_name}",
+                 "-o", "jsonpath={.items[0].metadata.name}"],
+                f"Get Job pod for {test_name} (attempt {attempt + 1})",
+                capture_output=True,
+                check=False
+            )
+            pod_name = result.stdout.strip()
+            if pod_name:
+                break
+            time.sleep(1)
 
-        pod_name = result.stdout.strip()
         if not pod_name:
             logger.warning(f"Could not find pod for Job {test_name}")
             return ""
+
+        logger.info(f"Found pod: {pod_name}")
+
+        # Wait for pod to be in a terminal state (Succeeded or Failed)
+        for attempt in range(10):
+            result = self.run_command(
+                ["kubectl", "get", "pod", pod_name, "-n", self.namespace,
+                 "-o", "jsonpath={.status.phase}"],
+                f"Check pod {pod_name} phase",
+                capture_output=True,
+                check=False
+            )
+            phase = result.stdout.strip()
+            logger.info(f"Pod phase: {phase}")
+
+            if phase in ["Succeeded", "Failed"]:
+                break
+
+            logger.info(f"Waiting for pod to reach terminal state (currently {phase})...")
+            time.sleep(2)
 
         # Get pod logs
         result = self.run_command(
@@ -578,6 +945,9 @@ spec:
         logger.info(f"Results: {results_dir}")
         logger.info(f"{'='*60}\n")
 
+        # Cleanup any leftover resources in namespace
+        self.cleanup_namespace()
+
     def _generate_workload(self, base: Dict, overrides: Dict) -> Dict:
         """Generate OMB workload from test plan"""
         workload = {
@@ -585,6 +955,7 @@ spec:
             'topics': overrides.get('workload_overrides', {}).get('topics', base['topics']),
             'partitionsPerTopic': overrides.get('workload_overrides', {}).get('partitions_per_topic', base['partitions_per_topic']),
             'messageSize': overrides.get('workload_overrides', {}).get('message_size', base['message_size']),
+            'payloadFile': 'payload/payload-1Kb.data',  # Use OMB's built-in payload file
             'subscriptionsPerTopic': base.get('subscriptions_per_topic', 1),
             'consumerPerSubscription': overrides.get('workload_overrides', {}).get('consumers_per_topic', base.get('consumers_per_topic', 1)),
             'producersPerTopic': overrides.get('workload_overrides', {}).get('producers_per_topic', base.get('producers_per_topic', 1)),
