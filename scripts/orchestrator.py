@@ -278,10 +278,91 @@ class Orchestrator:
             else:
                 logger.warning(f"Failed to create Pulsar namespace: {result.stderr}")
 
+    def _detect_namespace_from_job_logs(self, test_name: str) -> Optional[str]:
+        """
+        Detect Pulsar namespace by reading OMB driver Job logs.
+        OMB prints the namespace when creating topics, giving us definitive data.
+
+        Args:
+            test_name: Name of the test (used to find Job pod)
+
+        Returns:
+            Namespace string like 'public/omb-test-7Wv9Uqc' or None if not found
+        """
+        try:
+            # Get the pod name for the OMB driver Job
+            result = self.run_command(
+                ["kubectl", "get", "pods", "-n", "omb",
+                 "-l", f"job-name=omb-{test_name}",
+                 "-o", "jsonpath={.items[0].metadata.name}"],
+                f"Get OMB driver pod for {test_name}",
+                capture_output=True,
+                check=False
+            )
+
+            if result.returncode != 0 or not result.stdout.strip():
+                logger.warning("Could not find OMB driver pod")
+                return None
+
+            pod_name = result.stdout.strip()
+            logger.debug(f"Found OMB driver pod: {pod_name}")
+
+            # Read pod logs
+            result = self.run_command(
+                ["kubectl", "logs", pod_name, "-n", "omb"],
+                f"Read logs from {pod_name}",
+                capture_output=True,
+                check=False
+            )
+
+            if result.returncode != 0:
+                logger.warning("Could not read OMB driver pod logs")
+                return None
+
+            logs = result.stdout
+
+            # Parse logs to find namespace
+            # Look for patterns like:
+            # - "Creating topic: persistent://public/omb-test-7Wv9Uqc/test-topic-0"
+            # - "namespace: public/omb-test-7Wv9Uqc"
+            import re
+
+            # Try pattern 1: topic URL in logs
+            topic_pattern = r'persistent://([^/]+/[^/]+)/'
+            matches = re.findall(topic_pattern, logs)
+
+            if matches:
+                # Find first match that starts with our prefix
+                for match in matches:
+                    if match.startswith(PULSAR_TEST_NAMESPACE + '-') or match.startswith('public/omb-test-'):
+                        logger.info(f"Detected namespace from Job logs: {match}")
+                        return match
+
+            # Try pattern 2: direct namespace mention
+            ns_pattern = r'namespace[:\s]+([^/\s]+/[^\s,]+)'
+            matches = re.findall(ns_pattern, logs, re.IGNORECASE)
+
+            if matches:
+                for match in matches:
+                    if match.startswith(PULSAR_TEST_NAMESPACE + '-') or match.startswith('public/omb-test-'):
+                        logger.info(f"Detected namespace from Job logs: {match}")
+                        return match
+
+            logger.warning("Could not find namespace in OMB driver logs")
+            return None
+
+        except Exception as e:
+            logger.warning(f"Error detecting namespace from logs: {e}")
+            return None
+
     def _detect_pulsar_namespace(self) -> Optional[str]:
         """
-        Detect the actual Pulsar namespace being used for the test.
+        Detect the actual Pulsar namespace being used for the current test.
         OMB appends random suffixes like 'omb-test-yDPSfpI' to the namespace prefix.
+
+        Strategy: Find the last (most recently listed) namespace with topics.
+        This is called right after the Job starts, so the newest namespace should be the one
+        OMB just created for this test.
 
         Returns:
             The full namespace string (e.g., 'public/omb-test-yDPSfpI') or None if not detected
@@ -308,31 +389,31 @@ class Orchestrator:
             # Look for namespaces starting with our prefix
             omb_namespaces = [ns for ns in namespaces if ns.startswith(PULSAR_TEST_NAMESPACE + '-')]
 
-            if omb_namespaces:
-                # Find namespace with the most topics (most likely the active test)
-                max_topics = 0
-                best_namespace = omb_namespaces[0]
+            if not omb_namespaces:
+                return None
 
-                for ns in omb_namespaces:
-                    topic_result = self.run_command(
-                        ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                         "bin/pulsar-admin", "topics", "list", ns],
-                        f"List topics in {ns}",
-                        capture_output=True,
-                        check=False
-                    )
+            # Check namespaces in reverse order (newest first) and return the first one with topics
+            for ns in reversed(omb_namespaces):
+                topic_result = self.run_command(
+                    ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+                     "bin/pulsar-admin", "topics", "list", ns],
+                    f"List topics in {ns}",
+                    capture_output=True,
+                    check=False
+                )
 
-                    if topic_result.returncode == 0:
-                        topics = [l.strip() for l in topic_result.stdout.strip().split('\n')
-                                 if l.strip() and l.strip().startswith('persistent://')]
-                        if len(topics) > max_topics:
-                            max_topics = len(topics)
-                            best_namespace = ns
+                if topic_result.returncode == 0:
+                    topics = [l.strip() for l in topic_result.stdout.strip().split('\n')
+                             if l.strip() and l.strip().startswith('persistent://')]
 
-                logger.info(f"Detected Pulsar namespace: {best_namespace} (with {max_topics} topics)")
-                return best_namespace
+                    if topics:
+                        logger.info(f"Detected Pulsar namespace: {ns} (with {len(topics)} topics)")
+                        return ns
 
-            return None
+            # If no namespace has topics yet, return the last one (newest)
+            last_ns = omb_namespaces[-1]
+            logger.info(f"Detected Pulsar namespace: {last_ns} (no topics yet, but newest)")
+            return last_ns
 
         except Exception as e:
             logger.warning(f"Error detecting Pulsar namespace: {e}")
@@ -847,18 +928,6 @@ class Orchestrator:
                         self._add_status(f"✓ All {num_workers} workers are ready", 'success')
                         live.update(self._create_layout())
                         logger.info(f"✓ All {num_workers} workers are ready")
-
-                        # Detect actual Pulsar namespace (OMB appends random suffix)
-                        self._add_status("Detecting Pulsar namespace...", 'info')
-                        live.update(self._create_layout())
-                        detected_ns = self._detect_pulsar_namespace()
-                        if detected_ns:
-                            self.pulsar_tenant_namespace = detected_ns
-                            self._add_status(f"✓ Pulsar namespace: {detected_ns}", 'success')
-                        else:
-                            self._add_status("⚠ Could not detect Pulsar namespace", 'warning')
-                        live.update(self._create_layout())
-
                         break
                     else:
                         self._add_status(f"Workers ready: {ready_count}/{num_workers}", 'info')
@@ -887,6 +956,30 @@ class Orchestrator:
             ["kubectl", "apply", "-f", str(job_file)],
             f"Create OMB driver Job for {test_name}"
         )
+
+        # Wait for Job pod to start and read logs to detect namespace
+        self._add_status("Detecting Pulsar namespace from Job logs...", 'info')
+        live.update(self._create_layout())
+
+        # Wait a bit for pod to start and produce logs
+        time.sleep(5)
+
+        # Try to get namespace from Job logs (OMB prints namespace when creating topics)
+        detected_ns = self._detect_namespace_from_job_logs(test_name)
+        if detected_ns:
+            self.pulsar_tenant_namespace = detected_ns
+            self._add_status(f"✓ Pulsar namespace: {detected_ns}", 'success')
+            logger.info(f"Using Pulsar namespace: {detected_ns}")
+        else:
+            # Fallback to guessing from topic list
+            logger.warning("Could not detect namespace from logs, falling back to topic search")
+            detected_ns = self._detect_pulsar_namespace()
+            if detected_ns:
+                self.pulsar_tenant_namespace = detected_ns
+                self._add_status(f"✓ Pulsar namespace: {detected_ns} (detected from topics)", 'success')
+            else:
+                self._add_status("⚠ Could not detect Pulsar namespace", 'warning')
+        live.update(self._create_layout())
 
         # Wait for Job completion or failure
         self._add_status(f"Running benchmark test (this may take several minutes)...", 'info')
