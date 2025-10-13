@@ -209,15 +209,15 @@ class Orchestrator:
         })
 
     def _create_layout(self) -> Layout:
-        """Create the split-pane layout"""
+        """Create the split-pane layout (horizontal split: metadata on top, status on bottom)"""
         layout = Layout()
-        layout.split_row(
-            Layout(name="left", ratio=1),
-            Layout(name="right", ratio=2)
+        layout.split_column(
+            Layout(name="top", ratio=1),
+            Layout(name="bottom", ratio=2)
         )
 
-        layout["left"].update(self._create_metadata_panel())
-        layout["right"].update(self._create_status_panel())
+        layout["top"].update(self._create_metadata_panel())
+        layout["bottom"].update(self._create_status_panel())
 
         return layout
 
