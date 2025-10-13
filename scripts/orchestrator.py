@@ -40,7 +40,11 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 # Pulsar cluster connection details
 PULSAR_SERVICE_URL = "pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650"
 PULSAR_HTTP_URL = "http://pulsar-proxy.pulsar.svc.cluster.local:80"
-PULSAR_TEST_NAMESPACE = "public/omb-test"  # Fixed namespace for OMB test topics
+PULSAR_TEST_NAMESPACE = "public/omb-test"  # Namespace prefix for OMB test topics (OMB appends random suffix)
+
+# Grafana dashboard URL
+GRAFANA_BASE_URL = "https://grafana.dev-pulsar-lab.clovesoftware-dev.com"
+GRAFANA_DASHBOARD_PATH = "/d/EetmjdhnA/pulsar-messaging"
 
 # OMB Docker image
 DEFAULT_OMB_IMAGE = "439508887365.dkr.ecr.us-east-1.amazonaws.com/sre/pulsar-omb:latest"
@@ -75,7 +79,11 @@ class Orchestrator:
         self.console = Console()
         self.status_messages = []  # Track status updates
         self.current_test = None
-        self.pulsar_tenant_namespace = PULSAR_TEST_NAMESPACE  # Fixed namespace for all tests
+        self.pulsar_tenant_namespace = PULSAR_TEST_NAMESPACE  # Will be updated with actual namespace after detection
+
+        # Track test run times for Grafana links
+        self.test_start_time = None
+        self.test_end_time = None
 
         # Ensure K8s namespace exists
         self._ensure_namespace_exists()
@@ -145,12 +153,11 @@ class Orchestrator:
         else:
             content = exp_table
 
-        # Monitoring info
+        # Monitoring info with Grafana link
         monitor_text = Text()
         monitor_text.append("\n\nMonitoring:\n", style="bold green")
-        monitor_text.append("kubectl port-forward -n pulsar \\\n", style="dim")
-        monitor_text.append("  svc/pulsar-grafana 3000:3000\n", style="dim")
-        monitor_text.append("http://localhost:3000", style="blue underline")
+        grafana_url = self._get_grafana_url()
+        monitor_text.append(f"{grafana_url}\n", style="blue underline")
 
         final_content = Table.grid()
         final_content.add_row(content)
@@ -270,6 +277,121 @@ class Orchestrator:
                 logger.debug(f"Pulsar namespace '{self.pulsar_tenant_namespace}' already exists")
             else:
                 logger.warning(f"Failed to create Pulsar namespace: {result.stderr}")
+
+    def _detect_pulsar_namespace(self) -> Optional[str]:
+        """
+        Detect the actual Pulsar namespace being used for the test.
+        OMB appends random suffixes like 'omb-test-yDPSfpI' to the namespace prefix.
+
+        Returns:
+            The full namespace string (e.g., 'public/omb-test-yDPSfpI') or None if not detected
+        """
+        try:
+            result = self.run_command(
+                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+                 "bin/pulsar-admin", "namespaces", "list", "public"],
+                "List Pulsar namespaces",
+                capture_output=True,
+                check=False
+            )
+
+            if result.returncode != 0:
+                logger.warning("Failed to query Pulsar namespaces")
+                return None
+
+            # Parse namespaces
+            lines = result.stdout.strip().split('\n')
+            namespaces = [line.strip().strip('"') for line in lines
+                         if line.strip() and line.strip().startswith('public/')
+                         and 'Defaulted container' not in line]
+
+            # Look for namespaces starting with our prefix
+            omb_namespaces = [ns for ns in namespaces if ns.startswith(PULSAR_TEST_NAMESPACE + '-')]
+
+            if omb_namespaces:
+                # Find namespace with the most topics (most likely the active test)
+                max_topics = 0
+                best_namespace = omb_namespaces[0]
+
+                for ns in omb_namespaces:
+                    topic_result = self.run_command(
+                        ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+                         "bin/pulsar-admin", "topics", "list", ns],
+                        f"List topics in {ns}",
+                        capture_output=True,
+                        check=False
+                    )
+
+                    if topic_result.returncode == 0:
+                        topics = [l.strip() for l in topic_result.stdout.strip().split('\n')
+                                 if l.strip() and l.strip().startswith('persistent://')]
+                        if len(topics) > max_topics:
+                            max_topics = len(topics)
+                            best_namespace = ns
+
+                logger.info(f"Detected Pulsar namespace: {best_namespace} (with {max_topics} topics)")
+                return best_namespace
+
+            return None
+
+        except Exception as e:
+            logger.warning(f"Error detecting Pulsar namespace: {e}")
+            return None
+
+    def _get_grafana_url(self, from_time: str = 'now-15m', to_time: str = 'now', dashboard_path: Optional[str] = None) -> str:
+        """
+        Generate Grafana dashboard URL with the correct parameters for each dashboard type.
+
+        Args:
+            from_time: Start time for dashboard (e.g., 'now-15m' or timestamp in ms)
+            to_time: End time for dashboard (e.g., 'now' or timestamp in ms)
+            dashboard_path: Override default dashboard path
+
+        Returns:
+            Full Grafana dashboard URL
+        """
+        # Extract just the namespace part (without 'public/' prefix) for Grafana
+        namespace_part = self.pulsar_tenant_namespace.replace('public/', '')
+
+        # Base parameters for all dashboards
+        params = {
+            'orgId': '1',
+            'from': from_time,
+            'to': to_time,
+            'timezone': 'utc',
+        }
+
+        path = dashboard_path or GRAFANA_DASHBOARD_PATH
+
+        # Add dashboard-specific parameters
+        if 'pulsar-messaging' in path:
+            params.update({
+                'var-cluster': '$__all',
+                'var-tenant': 'public',
+                'var-namespace': namespace_part,
+                'refresh': '30s'
+            })
+        elif 'pulsar-jvm' in path:
+            params.update({
+                'var-cluster': '$__all',
+                'var-job': '$__all',
+                'var-instance': '$__all',
+                'refresh': '30s'
+            })
+        elif 'pulsar-proxy' in path:
+            params.update({
+                'var-proxy': '$__all',
+                'refresh': '30s'
+            })
+        else:
+            # Default parameters
+            params.update({
+                'var-cluster': '$__all',
+                'refresh': '10s'
+            })
+
+        param_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+        return f"{GRAFANA_BASE_URL}{path}?{param_string}"
 
     def load_config(self, config_file: Path) -> Dict:
         """
@@ -725,6 +847,18 @@ class Orchestrator:
                         self._add_status(f"✓ All {num_workers} workers are ready", 'success')
                         live.update(self._create_layout())
                         logger.info(f"✓ All {num_workers} workers are ready")
+
+                        # Detect actual Pulsar namespace (OMB appends random suffix)
+                        self._add_status("Detecting Pulsar namespace...", 'info')
+                        live.update(self._create_layout())
+                        detected_ns = self._detect_pulsar_namespace()
+                        if detected_ns:
+                            self.pulsar_tenant_namespace = detected_ns
+                            self._add_status(f"✓ Pulsar namespace: {detected_ns}", 'success')
+                        else:
+                            self._add_status("⚠ Could not detect Pulsar namespace", 'warning')
+                        live.update(self._create_layout())
+
                         break
                     else:
                         self._add_status(f"Workers ready: {ready_count}/{num_workers}", 'info')
@@ -1207,6 +1341,9 @@ spec:
         results_dir = self.experiment_dir / "benchmark_results"
         results_dir.mkdir(exist_ok=True)
 
+        # Track test execution times for Grafana links
+        self.test_start_time = datetime.now()
+
         # Run tests with Rich Live display
         with Live(self._create_layout(), refresh_per_second=2, console=self.console) as live:
             # Run each test
@@ -1243,6 +1380,9 @@ spec:
         logger.info(f"ALL TESTS COMPLETED")
         logger.info(f"Results: {results_dir}")
         logger.info(f"{'='*60}\n")
+
+        # Track end time for Grafana links
+        self.test_end_time = datetime.now()
 
         # Generate HTML report
         self.console.print("\n[bold cyan]Generating test report...[/bold cyan]")
@@ -1448,14 +1588,31 @@ spec:
 
     <div class="metadata">
         <h2>Monitoring & Dashboards</h2>
-        <p>To view real-time metrics in Grafana, run the following command:</p>
-        <code style="display: block; padding: 10px; background: #2c3e50; color: #ecf0f1; border-radius: 5px;">
-            kubectl port-forward -n pulsar svc/pulsar-grafana 3000:3000
-        </code>
-        <p style="margin-top: 10px;">Then access Grafana at:</p>
-        <a href="http://localhost:3000" target="_blank" class="grafana-link">Open Grafana Dashboard</a>
+        <p>View test metrics in Grafana (VPN required):</p>
+"""
+
+        # Generate time range for dashboards (5 min before start to 5 min after end)
+        if self.test_start_time and self.test_end_time:
+            from_timestamp = int((self.test_start_time.timestamp() - 300) * 1000)  # -5 min in ms
+            to_timestamp = int((self.test_end_time.timestamp() + 300) * 1000)      # +5 min in ms
+            from_time = str(from_timestamp)
+            to_time = str(to_timestamp)
+        else:
+            from_time = 'now-15m'
+            to_time = 'now'
+
+        # Generate dashboard links with test time range
+        messaging_url = self._get_grafana_url(from_time, to_time, "/d/EetmjdhnA/pulsar-messaging")
+        jvm_url = self._get_grafana_url(from_time, to_time, "/d/ystagDCsB/pulsar-jvm")
+        proxy_url = self._get_grafana_url(from_time, to_time, "/d/vgnAupsuh/pulsar-proxy")
+
+        html_content += f"""
+        <a href="{messaging_url}" target="_blank" class="grafana-link">Pulsar Messaging</a>
+        <a href="{jvm_url}" target="_blank" class="grafana-link">JVM Metrics</a>
+        <a href="{proxy_url}" target="_blank" class="grafana-link">Proxy Metrics</a>
         <p style="color: #7f8c8d; font-size: 14px; margin-top: 10px;">
-            Note: You'll need to port-forward to access Grafana. Default credentials are usually admin/admin.
+            Namespace: <strong>{self.pulsar_tenant_namespace.replace('public/', '')}</strong><br>
+            Time range: Test execution ± 5 minutes
         </p>
     </div>
 
@@ -1507,16 +1664,6 @@ spec:
 """
 
         html_content += """
-    </div>
-
-    <div class="metadata">
-        <h2>Next Steps</h2>
-        <ul>
-            <li>Review test logs above for detailed benchmark output</li>
-            <li>Access Grafana dashboards to see real-time metrics during test execution</li>
-            <li>Check JSON result files for detailed performance metrics</li>
-            <li>Run additional tests with different configurations to compare results</li>
-        </ul>
     </div>
 </body>
 </html>
