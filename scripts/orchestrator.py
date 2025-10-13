@@ -85,6 +85,9 @@ class Orchestrator:
         self.test_start_time = None
         self.test_end_time = None
 
+        # Store test results from immediate collection
+        self.test_results = ""
+
         # Ensure K8s namespace exists
         self._ensure_namespace_exists()
 
@@ -239,6 +242,45 @@ class Orchestrator:
             logger.info(f"✓ K8s namespace '{self.namespace}' created")
         else:
             logger.debug(f"K8s namespace '{self.namespace}' already exists")
+
+    def _ensure_results_pvc_exists(self) -> None:
+        """Ensure shared PVC for OMB results exists, create it if not."""
+        pvc_name = "omb-results"
+
+        result = self.run_command(
+            ["kubectl", "get", "pvc", pvc_name, "-n", self.namespace],
+            f"Check if PVC {pvc_name} exists",
+            capture_output=True,
+            check=False
+        )
+
+        if result.returncode != 0:
+            logger.info(f"Creating PVC: {pvc_name}")
+
+            pvc_yaml = f"""apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {pvc_name}
+  namespace: {self.namespace}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: gp2
+"""
+            pvc_file = self.experiment_dir / f"{pvc_name}.yaml"
+            with open(pvc_file, 'w') as f:
+                f.write(pvc_yaml)
+
+            self.run_command(
+                ["kubectl", "apply", "-f", str(pvc_file)],
+                f"Create PVC {pvc_name}"
+            )
+            logger.info(f"✓ PVC '{pvc_name}' created")
+        else:
+            logger.debug(f"PVC '{pvc_name}' already exists")
 
     def _ensure_pulsar_namespace_exists(self) -> None:
         """Ensure the Pulsar tenant/namespace for tests exists, create it if not."""
@@ -1087,7 +1129,23 @@ class Orchestrator:
                     self._add_status(f"✓ Benchmark completed successfully", 'success')
                     live.update(self._create_layout())
                     logger.info(f"✓ Job {test_name} completed successfully (succeeded: {succeeded_count})")
-                    # Give pod a moment to fully terminate before collecting logs
+
+                    # Collect results immediately while pod is still accessible
+                    # (don't wait for pod to fully terminate)
+                    self._add_status("Collecting test results...", 'info')
+                    live.update(self._create_layout())
+                    logger.info(f"Collecting results for {test_name}...")
+                    results = self._collect_job_results_immediately(test_name)
+
+                    if results:
+                        self._add_status(f"✓ Results collected ({len(results)} bytes)", 'success')
+                        self.test_results = results  # Store for later use
+                    else:
+                        self._add_status("⚠ No results data collected", 'warning')
+                        self.test_results = ""
+                    live.update(self._create_layout())
+
+                    # Now can safely wait for pod to terminate
                     time.sleep(2)
                     break
                 elif failed_count > 0:
@@ -1118,17 +1176,9 @@ class Orchestrator:
             self._collect_job_logs(test_name, success=False)
             raise OrchestratorError(f"OMB test {test_name} failed")
 
-        # Collect results from Job logs
-        self._add_status("Collecting test results...", 'info')
-        live.update(self._create_layout())
-        logger.info(f"Collecting results for {test_name}...")
-        results = self._collect_job_logs(test_name, success=True)
-
-        if results:
-            self._add_status(f"✓ Results collected ({len(results)} bytes)", 'success')
-        else:
-            self._add_status("⚠ No results data collected", 'warning')
-        live.update(self._create_layout())
+        # Results were already collected immediately after Job succeeded
+        # Use the stored results
+        results = self.test_results
 
         # Cleanup Pulsar topics created during test
         self._cleanup_test_topics(test_name, workload_config, live)
@@ -1334,19 +1384,22 @@ spec:
             done
             echo ""
 
+            # Create experiment-specific directory
+            mkdir -p /results/{self.experiment_id}
+
             echo "===== Starting OMB Benchmark (Driver Mode) ====="
             /app/bin/benchmark \\
               --drivers /workload/driver.yaml \\
               --workers {workers_list} \\
-              --output /results/result.json \\
+              --output /results/{self.experiment_id}/{test_name}.json \\
               /workload/workload.yaml
 
             EXIT_CODE=$?
             echo ""
             echo "===== Benchmark Exit Code: $EXIT_CODE ====="
             if [ $EXIT_CODE -eq 0 ]; then
-              echo "Results saved to /results/result.json"
-              cat /results/result.json
+              echo "Results saved to /results/{self.experiment_id}/{test_name}.json"
+              cat /results/{self.experiment_id}/{test_name}.json
             else
               echo "Benchmark failed with exit code $EXIT_CODE"
             fi
@@ -1363,6 +1416,55 @@ spec:
       - name: results
         emptyDir: {{}}
 """
+
+    def _collect_job_results_immediately(self, test_name: str) -> str:
+        """
+        Collect results from OMB Job pod immediately after Job succeeds.
+        Uses kubectl exec to cat the results file while pod is still accessible.
+
+        Returns:
+            JSON results as string
+        """
+        # Get Job pod name
+        result = self.run_command(
+            ["kubectl", "get", "pods", "-n", self.namespace,
+             "-l", f"job-name=omb-{test_name}",
+             "-o", "jsonpath={{.items[0].metadata.name}}"],
+            f"Get Job pod for {test_name}",
+            capture_output=True,
+            check=False
+        )
+
+        pod_name = result.stdout.strip()
+        if not pod_name:
+            logger.warning(f"Could not find pod for Job {test_name}")
+            return ""
+
+        logger.info(f"Found pod: {pod_name}, collecting results immediately")
+
+        results_dir = self.experiment_dir / "benchmark_results"
+        results_dir.mkdir(exist_ok=True)
+        result_file = results_dir / f"{test_name}.json"
+
+        # Use kubectl exec to cat the results file (works even when pod is completing)
+        result = self.run_command(
+            ["kubectl", "exec", pod_name, "-n", self.namespace, "--",
+             "cat", f"/results/{self.experiment_id}/{test_name}.json"],
+            f"Get results from {pod_name}",
+            capture_output=True,
+            check=False
+        )
+
+        if result.returncode == 0 and result.stdout.strip():
+            json_data = result.stdout.strip()
+            # Save to file
+            with open(result_file, 'w') as f:
+                f.write(json_data)
+            logger.info(f"Results saved to: {result_file} ({len(json_data)} bytes)")
+            return json_data
+        else:
+            logger.warning(f"Failed to get results from pod: {result.stderr}")
+            return ""
 
     def _collect_job_logs(self, test_name: str, success: bool) -> str:
         """
