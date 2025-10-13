@@ -1,9 +1,9 @@
-# Infrastructure Configuration - EKS Setup
+# OMB Load Testing Configuration
 
 experiment:
-  id: "pulsar-eks-test-001"
-  name: "Baseline Pulsar Performance Test on EKS"
-  description: "Initial performance baseline with EKS and Helm-based deployment"
+  id: "pulsar-omb-test-001"
+  name: "Pulsar OMB Load Test"
+  description: "OpenMessaging Benchmark load testing against existing Pulsar cluster"
   tags:
     environment: "test"
     cost_center: "engineering"
@@ -11,58 +11,18 @@ experiment:
 
 aws:
   region: "us-east-1"
-  availability_zones:
-    - "us-east-1a"
-    - "us-east-1b"
-    - "us-east-1c"
 
-network:
-  vpc_cidr: "10.0.0.0/16"
-  public_subnet_cidrs:
-    - "10.0.1.0/24"
-    - "10.0.2.0/24"
-    - "10.0.3.0/24"
-  private_subnet_cidrs:
-    - "10.0.11.0/24"
-    - "10.0.12.0/24"
-    - "10.0.13.0/24"
+# Kubernetes configuration
+kubernetes:
+  namespace: "pulsar"  # Namespace where OMB jobs will run
 
-eks:
-  # Kubernetes cluster configuration
-  cluster_version: "1.31"
-
-  # Node group configuration
-  node_group:
-    instance_types:
-      - "t3.medium"  # 2 vCPU, 4 GB RAM - suitable for testing
-    disk_size: 50  # GB
-    desired_size: 3
-    min_size: 1
-    max_size: 5
-
-# Pulsar deployment configuration (via Helm)
+# Pulsar cluster connection
 pulsar:
-  # These values override helm/pulsar-eks-lab/values.yaml
-  zookeeper:
-    replicas: 3
-
-  bookkeeper:
-    replicas: 3
-
-  broker:
-    replicas: 3
-
-  proxy:
-    replicas: 2
+  service_url: "pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650"
+  http_url: "http://pulsar-proxy.pulsar.svc.cluster.local:8080"
 
 # OpenMessaging Benchmark configuration
 benchmark:
   image:
-    repository: "pulsar-omb"
+    repository: "439508887365.dkr.ecr.us-east-1.amazonaws.com/sre/pulsar-omb"
     tag: "latest"
-
-  producer:
-    replicas: 1
-
-  consumer:
-    replicas: 1

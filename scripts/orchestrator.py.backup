@@ -34,9 +34,6 @@ RESULTS_DIR = Path.home() / ".pulsar-omb-lab"
 PULSAR_SERVICE_URL = "pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650"
 PULSAR_HTTP_URL = "http://pulsar-proxy.pulsar.svc.cluster.local:8080"
 
-# OMB Docker image
-DEFAULT_OMB_IMAGE = "439508887365.dkr.ecr.us-east-1.amazonaws.com/sre/pulsar-omb:latest"
-
 
 class OrchestratorError(Exception):
     """Base exception for orchestrator errors"""
@@ -46,14 +43,13 @@ class OrchestratorError(Exception):
 class Orchestrator:
     """Main orchestrator for OMB load testing against existing Pulsar clusters"""
 
-    def __init__(self, experiment_id: Optional[str] = None, namespace: str = "pulsar", omb_image: Optional[str] = None):
+    def __init__(self, experiment_id: Optional[str] = None, namespace: str = "pulsar"):
         """
         Initialize orchestrator with experiment tracking.
 
         Args:
             experiment_id: Unique experiment identifier (auto-generated if not provided)
             namespace: Kubernetes namespace where OMB jobs will run (default: pulsar)
-            omb_image: OMB Docker image to use (default: from DEFAULT_OMB_IMAGE)
         """
         self.experiment_id = experiment_id or f"exp-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         self.experiment_dir = RESULTS_DIR / self.experiment_id
@@ -61,7 +57,6 @@ class Orchestrator:
         self.namespace = namespace
         self.pulsar_service_url = PULSAR_SERVICE_URL
         self.pulsar_http_url = PULSAR_HTTP_URL
-        self.omb_image = omb_image or DEFAULT_OMB_IMAGE
 
         # Create/update "latest" symlink
         latest_link = RESULTS_DIR / "latest"
@@ -189,6 +184,462 @@ class Orchestrator:
         node_count = len(nodes.get('items', []))
         logger.info(f"✓ Cluster has {node_count} nodes")
 
+    def install_prometheus_operator_crds(self) -> None:
+        """
+        Install Prometheus Operator CRDs if monitoring is enabled.
+
+        This is required before deploying the Helm chart with kube-prometheus-stack enabled.
+        Uses local CRD file from crds/ directory for reproducibility.
+        """
+        logger.info("Checking if Prometheus Operator CRDs need to be installed...")
+
+        # Check if CRDs already exist
+        result = self.run_command(
+            ["kubectl", "get", "crd", "prometheuses.monitoring.coreos.com"],
+            "Check for Prometheus Operator CRDs",
+            capture_output=True,
+            check=False
+        )
+
+        if result.returncode == 0:
+            logger.info("✓ Prometheus Operator CRDs already installed")
+            return
+
+        logger.info("Installing Prometheus Operator CRDs from local file...")
+
+        # Path to local CRD file
+        crd_file = PROJECT_ROOT / "crds" / "prometheus-operator-crds.yaml"
+
+        if not crd_file.exists():
+            raise OrchestratorError(
+                f"Prometheus Operator CRD file not found: {crd_file}\n"
+                f"Download it with:\n"
+                f"  PROM_VERSION=$(curl -fs -o /dev/null -w '%{{redirect_url}}' "
+                f"https://github.com/prometheus-operator/prometheus-operator/releases/latest | xargs basename)\n"
+                f"  curl -sL https://github.com/prometheus-operator/prometheus-operator/releases/download/$PROM_VERSION/stripped-down-crds.yaml "
+                f"-o {crd_file}"
+            )
+
+        # Install CRDs from local file
+        self.run_command(
+            ["kubectl", "apply", "-f", str(crd_file)],
+            "Install Prometheus Operator CRDs",
+            check=True
+        )
+
+        logger.info("✓ Prometheus Operator CRDs installed")
+
+    def helm_deploy(self, values_overrides: Optional[Dict] = None) -> None:
+        """
+        Deploy or upgrade Pulsar using Helm.
+
+        Args:
+            values_overrides: Optional Helm values to override
+
+        Raises:
+            OrchestratorError: If Helm deployment fails
+        """
+        logger.info(f"Deploying Helm chart: {self.helm_release_name}")
+
+        # Install Prometheus Operator CRDs if monitoring is enabled
+        self.install_prometheus_operator_crds()
+
+        # Check if release exists
+        result = self.run_command(
+            ["helm", "list", "-n", self.namespace, "-o", "json"],
+            "Check existing Helm releases",
+            capture_output=True,
+            check=False
+        )
+
+        releases = json.loads(result.stdout) if result.stdout else []
+        release_exists = any(r['name'] == self.helm_release_name for r in releases)
+
+        # Delete existing OMB Jobs if upgrading (Jobs are immutable and can't be patched)
+        if release_exists:
+            logger.info("Checking for existing OMB Jobs to delete...")
+            try:
+                # Get OMB Jobs
+                result = self.run_command(
+                    ["kubectl", "get", "jobs", "-n", self.namespace,
+                     "-l", f"app.kubernetes.io/instance={self.helm_release_name}",
+                     "-l", "component in (omb-producer,omb-consumer)",
+                     "-o", "name"],
+                    "List existing OMB Jobs",
+                    capture_output=True,
+                    check=False
+                )
+
+                if result.stdout:
+                    jobs = result.stdout.strip().split('\n')
+                    for job in jobs:
+                        if job:
+                            logger.info(f"Deleting {job}...")
+                            self.run_command(
+                                ["kubectl", "delete", job, "-n", self.namespace, "--wait=false"],
+                                f"Delete {job}",
+                                check=False
+                            )
+            except Exception as e:
+                logger.warning(f"Failed to delete existing OMB Jobs: {e}")
+
+        # Prepare Helm command
+        if release_exists:
+            cmd = ["helm", "upgrade", self.helm_release_name]
+            action = "Upgrading"
+        else:
+            cmd = ["helm", "install", self.helm_release_name]
+            action = "Installing"
+
+        cmd.extend([
+            str(HELM_DIR),
+            "-n", self.namespace,
+            "--create-namespace",
+            "--wait",
+            "--timeout", "15m"
+        ])
+
+        # Add custom values if provided
+        if values_overrides:
+            values_file = self.experiment_dir / "helm-values.yaml"
+            with open(values_file, 'w') as f:
+                yaml.dump(values_overrides, f)
+            cmd.extend(["-f", str(values_file)])
+
+        # Execute Helm deploy
+        logger.info(f"{action} {self.helm_release_name}...")
+        logger.info("This may take up to 15 minutes. Helm will wait for all pods to be ready.")
+        logger.info(f"To monitor progress in another terminal:")
+        logger.info(f"  kubectl get pods -n {self.namespace} -w")
+        logger.info(f"  kubectl get events -n {self.namespace} --sort-by='.lastTimestamp'")
+        logger.info(f"Command: {' '.join(cmd)}")
+
+        # Run without capturing output so we see Helm's progress
+        self.run_command(cmd, f"{action} Helm release", capture_output=False)
+
+        logger.info(f"✓ Helm release {self.helm_release_name} deployed successfully")
+
+    def helm_undeploy(self) -> None:
+        """
+        Uninstall Pulsar Helm release.
+
+        Raises:
+            OrchestratorError: If Helm uninstall fails
+        """
+        logger.info(f"Uninstalling Helm release: {self.helm_release_name}")
+
+        self.run_command(
+            ["helm", "uninstall", self.helm_release_name,
+             "-n", self.namespace,
+             "--wait",
+             "--timeout", "10m"],
+            "Uninstall Helm release"
+        )
+
+        logger.info(f"✓ Helm release {self.helm_release_name} uninstalled")
+
+        # Wait for namespace cleanup
+        logger.info("Waiting for pods to terminate...")
+        timeout = 120
+        start = time.time()
+
+        while time.time() - start < timeout:
+            result = self.run_command(
+                ["kubectl", "get", "pods", "-n", self.namespace, "-o", "json"],
+                "Check pod status",
+                capture_output=True,
+                check=False
+            )
+
+            pods = json.loads(result.stdout) if result.stdout else {}
+            pod_count = len(pods.get('items', []))
+
+            if pod_count == 0:
+                logger.info("✓ All pods terminated")
+                break
+
+            logger.info(f"Waiting for {pod_count} pods to terminate...")
+            time.sleep(5)
+
+    def wipe_namespace(self, force: bool = False) -> None:
+        """
+        Force delete namespace and all resources within it.
+        This function will aggressively remove everything without manual intervention.
+
+        Args:
+            force: Skip confirmation prompt
+
+        Raises:
+            OrchestratorError: If wipe operation fails
+        """
+        logger.info(f"Wiping namespace: {self.namespace}")
+
+        # Confirmation prompt
+        if not force:
+            print(f"\n⚠️  WARNING: This will forcefully delete the '{self.namespace}' namespace")
+            print("    and ALL resources within it, including:")
+            print("    - Helm releases")
+            print("    - Pods, Deployments, StatefulSets, Jobs")
+            print("    - PersistentVolumeClaims and PersistentVolumes")
+            print("    - Services, ConfigMaps, Secrets")
+            print()
+            response = input("Are you sure you want to continue? [yes/no]: ")
+            if response.lower() not in ["yes", "y"]:
+                logger.info("Wipe cancelled by user")
+                return
+
+        # Check if namespace exists
+        result = self.run_command(
+            ["kubectl", "get", "namespace", self.namespace],
+            "Check if namespace exists",
+            capture_output=True,
+            check=False
+        )
+
+        if result.returncode != 0:
+            logger.info(f"Namespace {self.namespace} does not exist")
+            return
+
+        logger.info("Step 1: Uninstalling Helm releases...")
+        try:
+            result = self.run_command(
+                ["helm", "list", "-n", self.namespace, "-o", "json"],
+                "List Helm releases",
+                capture_output=True,
+                check=False,
+                timeout=10
+            )
+            if result.stdout:
+                releases = json.loads(result.stdout)
+                for release in releases:
+                    release_name = release.get('name')
+                    logger.info(f"  Uninstalling Helm release: {release_name}")
+                    subprocess.run(
+                        ["helm", "uninstall", release_name, "-n", self.namespace, "--no-hooks", "--wait=false"],
+                        capture_output=True,
+                        timeout=15,
+                        check=False
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to uninstall Helm releases: {e}")
+
+        logger.info("Step 2: Scaling down all controllers to prevent recreation...")
+        controller_types = ["deployments", "statefulsets", "daemonsets", "replicasets"]
+        for controller in controller_types:
+            try:
+                subprocess.run(
+                    ["kubectl", "scale", controller, "--all", "--replicas=0", "-n", self.namespace],
+                    capture_output=True,
+                    timeout=10,
+                    check=False
+                )
+            except Exception:
+                pass
+
+        logger.info("Step 3: Removing all finalizers from all resources...")
+        # Get ALL resource types in the namespace
+        try:
+            result = subprocess.run(
+                ["kubectl", "api-resources", "--verbs=list", "--namespaced", "-o", "name"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False
+            )
+            if result.stdout:
+                all_resource_types = result.stdout.strip().split('\n')
+                for resource_type in all_resource_types:
+                    if resource_type and not resource_type.startswith('events'):
+                        try:
+                            result = subprocess.run(
+                                ["kubectl", "get", resource_type, "-n", self.namespace, "-o", "name"],
+                                capture_output=True,
+                                text=True,
+                                timeout=5,
+                                check=False
+                            )
+                            if result.stdout:
+                                resources = result.stdout.strip().split('\n')
+                                for resource in resources:
+                                    if resource:
+                                        subprocess.run(
+                                            ["kubectl", "patch", resource, "-n", self.namespace,
+                                             "-p", '{"metadata":{"finalizers":null}}',
+                                             "--type=merge"],
+                                            capture_output=True,
+                                            timeout=3,
+                                            check=False
+                                        )
+                        except Exception:
+                            continue
+        except Exception as e:
+            logger.warning(f"Bulk finalizer removal failed: {e}")
+
+        logger.info("Step 4: Force deleting all resources...")
+        # Delete everything in parallel with aggressive flags
+        delete_commands = [
+            ["kubectl", "delete", "all", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+            ["kubectl", "delete", "pvc", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+            ["kubectl", "delete", "configmaps", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+            ["kubectl", "delete", "secrets", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+            ["kubectl", "delete", "serviceaccounts", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+            ["kubectl", "delete", "roles", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+            ["kubectl", "delete", "rolebindings", "--all", "-n", self.namespace, "--grace-period=0", "--force", "--ignore-not-found", "--wait=false"],
+        ]
+
+        for cmd in delete_commands:
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=20, check=False)
+            except Exception:
+                pass
+
+        # Give deletions a moment to process
+        time.sleep(5)
+
+        logger.info("Step 5: Force deleting PersistentVolumes bound to this namespace...")
+        try:
+            result = subprocess.run(
+                ["kubectl", "get", "pv", "-o", "json"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False
+            )
+            if result.stdout:
+                pvs = json.loads(result.stdout)
+                for pv in pvs.get('items', []):
+                    claim_ref = pv.get('spec', {}).get('claimRef', {})
+                    if claim_ref.get('namespace') == self.namespace:
+                        pv_name = pv['metadata']['name']
+                        logger.info(f"  Deleting PV: {pv_name}")
+                        # Remove finalizers first
+                        subprocess.run(
+                            ["kubectl", "patch", "pv", pv_name,
+                             "-p", '{"metadata":{"finalizers":null}}',
+                             "--type=merge"],
+                            capture_output=True,
+                            timeout=5,
+                            check=False
+                        )
+                        # Delete
+                        subprocess.run(
+                            ["kubectl", "delete", "pv", pv_name, "--grace-period=0", "--force"],
+                            capture_output=True,
+                            timeout=10,
+                            check=False
+                        )
+        except Exception as e:
+            logger.warning(f"PV cleanup failed: {e}")
+
+        logger.info("Step 6: Deleting namespace...")
+        subprocess.run(
+            ["kubectl", "delete", "namespace", self.namespace, "--wait=false"],
+            capture_output=True,
+            timeout=10,
+            check=False
+        )
+
+        # Aggressive retry loop for namespace deletion
+        logger.info("Step 7: Waiting for namespace deletion (with retries)...")
+        max_attempts = 10
+        for attempt in range(max_attempts):
+            time.sleep(2)
+
+            result = subprocess.run(
+                ["kubectl", "get", "namespace", self.namespace],
+                capture_output=True,
+                timeout=5,
+                check=False
+            )
+
+            if result.returncode != 0:
+                logger.info(f"✓ Namespace {self.namespace} successfully wiped")
+                return
+
+            # Namespace still exists, try patching finalizers again
+            logger.info(f"  Attempt {attempt + 1}/{max_attempts}: Removing namespace finalizers...")
+            try:
+                subprocess.run(
+                    ["kubectl", "patch", "namespace", self.namespace,
+                     "-p", '{"metadata":{"finalizers":null}}',
+                     "--type=merge"],
+                    capture_output=True,
+                    timeout=5,
+                    check=False
+                )
+                subprocess.run(
+                    ["kubectl", "patch", "namespace", self.namespace,
+                     "-p", '{"spec":{"finalizers":null}}',
+                     "--type=merge"],
+                    capture_output=True,
+                    timeout=5,
+                    check=False
+                )
+            except Exception:
+                pass
+
+        # Final check with detailed error if still exists
+        result = subprocess.run(
+            ["kubectl", "get", "namespace", self.namespace, "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False
+        )
+
+        if result.returncode == 0:
+            # Try one last nuclear option: direct API call
+            logger.info("Step 8: Using direct API to force delete namespace...")
+            try:
+                subprocess.run(
+                    ["kubectl", "get", "namespace", self.namespace, "-o", "json"],
+                    stdout=subprocess.PIPE,
+                    text=True
+                ).stdout
+
+                # Use kubectl proxy approach
+                import threading
+                def run_proxy():
+                    subprocess.run(["kubectl", "proxy", "--port=8765"], check=False)
+
+                proxy_thread = threading.Thread(target=run_proxy, daemon=True)
+                proxy_thread.start()
+                time.sleep(2)
+
+                # Direct API call
+                import urllib.request
+                import json as json_lib
+                req = urllib.request.Request(
+                    f"http://localhost:8765/api/v1/namespaces/{self.namespace}/finalize",
+                    data=json_lib.dumps({"kind":"Namespace","apiVersion":"v1","metadata":{"name":self.namespace},"spec":{"finalizers":[]}}).encode(),
+                    headers={'Content-Type': 'application/json'},
+                    method='PUT'
+                )
+                urllib.request.urlopen(req, timeout=5)
+                time.sleep(2)
+            except Exception as e:
+                logger.debug(f"API call approach failed: {e}")
+
+            # Final final check
+            result = subprocess.run(
+                ["kubectl", "get", "namespace", self.namespace],
+                capture_output=True,
+                timeout=5,
+                check=False
+            )
+
+            if result.returncode == 0:
+                logger.error(f"✗ Failed to delete namespace {self.namespace} after all attempts")
+                logger.error("This is unusual. Check for:")
+                logger.error("  1. Admission webhooks blocking deletion")
+                logger.error("  2. Custom resource definitions with stuck finalizers")
+                logger.error("  3. Cluster-level issues")
+                raise OrchestratorError(f"Could not delete namespace {self.namespace}")
+            else:
+                logger.info(f"✓ Namespace {self.namespace} successfully wiped")
+        else:
+            logger.info(f"✓ Namespace {self.namespace} successfully wiped")
+
     def wait_for_pods_ready(self, timeout_seconds: int = 600) -> None:
         """
         Wait for all Pulsar pods to be ready.
@@ -292,6 +743,51 @@ class Orchestrator:
             if component in pod_name.lower():
                 return component
         return 'other'
+
+    def check_pulsar_health(self) -> None:
+        """
+        Verify Pulsar broker health endpoint.
+
+        Raises:
+            OrchestratorError: If health check fails
+        """
+        logger.info("Checking Pulsar broker health...")
+
+        # Get broker service
+        result = self.run_command(
+            ["kubectl", "get", "svc", "-n", self.namespace,
+             "-l", "component=broker",
+             "-o", "jsonpath={.items[0].metadata.name}"],
+            "Get broker service name",
+            capture_output=True
+        )
+
+        broker_svc = result.stdout.strip()
+        if not broker_svc:
+            raise OrchestratorError("Broker service not found")
+
+        # Check health via kubectl exec on broker pod
+        result = self.run_command(
+            ["kubectl", "get", "pods", "-n", self.namespace,
+             "-l", "component=broker",
+             "-o", "jsonpath={.items[0].metadata.name}"],
+            "Get broker pod name",
+            capture_output=True
+        )
+
+        broker_pod = result.stdout.strip()
+        if not broker_pod:
+            raise OrchestratorError("Broker pod not found")
+
+        # Check health endpoint
+        result = self.run_command(
+            ["kubectl", "exec", "-n", self.namespace, broker_pod, "--",
+             "curl", "-s", "-f", "http://localhost:8080/admin/v2/brokers/health"],
+            "Check broker health endpoint",
+            capture_output=True
+        )
+
+        logger.info("✓ Pulsar broker health check passed")
 
     def run_omb_job(self, test_config: Dict, workload_config: Dict) -> str:
         """
@@ -406,8 +902,8 @@ spec:
       restartPolicy: Never
       containers:
       - name: omb
-        image: {self.omb_image}
-        imagePullPolicy: Always
+        image: pulsar-omb:latest
+        imagePullPolicy: IfNotPresent
         command: ["/bin/bash", "-c"]
         args:
           - |
@@ -529,6 +1025,83 @@ spec:
                 f.write(result.stdout if result.stdout else "No logs available")
 
         logger.info(f"✓ Pod logs collected in: {logs_dir}")
+
+    def deploy_pulsar(
+        self,
+        config_file: Path,
+        values_overrides: Optional[Dict] = None
+    ) -> None:
+        """
+        Deploy Pulsar to EKS using Helm.
+
+        Prerequisites:
+            - EKS cluster must already exist (managed externally)
+            - kubectl must be configured for the target cluster
+
+        Args:
+            config_file: Infrastructure configuration
+            values_overrides: Optional Helm values overrides
+
+        Raises:
+            OrchestratorError: If deployment fails
+        """
+        logger.info("="*60)
+        logger.info("DEPLOYING PULSAR VIA HELM")
+        logger.info("="*60)
+
+        try:
+            # Verify kubectl is configured
+            result = self.run_command(
+                ["kubectl", "cluster-info"],
+                "Verify kubectl configuration",
+                capture_output=True,
+                check=False
+            )
+
+            if result.returncode != 0:
+                raise OrchestratorError(
+                    "kubectl is not configured for a cluster. "
+                    "Please ensure your EKS cluster exists and kubectl is configured:\n"
+                    "  aws eks update-kubeconfig --region <region> --name <cluster-name>"
+                )
+
+            # Load config if not already loaded
+            if not self.infrastructure_config:
+                self.infrastructure_config = self.load_config(config_file)
+
+            # Deploy via Helm
+            self.helm_deploy(values_overrides)
+
+            # Wait for pods
+            self.wait_for_pods_ready()
+
+            # Health check
+            self.check_pulsar_health()
+
+            logger.info("="*60)
+            logger.info("PULSAR DEPLOYED SUCCESSFULLY")
+            logger.info("="*60)
+
+        except Exception as e:
+            logger.error(f"Pulsar deployment failed: {e}")
+            logger.info("Collecting pod logs for troubleshooting...")
+            self.collect_pod_logs()
+            raise
+
+    def undeploy_pulsar(self) -> None:
+        """Remove Pulsar from EKS cluster"""
+        logger.info("="*60)
+        logger.info("UNDEPLOYING PULSAR")
+        logger.info("="*60)
+
+        try:
+            self.helm_undeploy()
+            logger.info("="*60)
+            logger.info("PULSAR UNDEPLOYED SUCCESSFULLY")
+            logger.info("="*60)
+        except Exception as e:
+            logger.error(f"Pulsar undeploy failed: {e}")
+            raise
 
     def run_tests(self, test_plan_file: Path) -> None:
         """
@@ -698,15 +1271,13 @@ spec:
         # Load experiment configuration
         config_file = self.experiment_dir / "infrastructure.yaml"
         config = {}
-        region = "us-east-1"  # Default region
         if config_file.exists():
             config = self.load_config(config_file)
-            region = config.get('region', 'us-east-1')
 
         # Get cost data
         logger.info("Fetching AWS cost data...")
         from cost_tracker import CostTracker
-        cost_tracker = CostTracker(region=region)
+        cost_tracker = CostTracker(region=self.region)
         cost_data = cost_tracker.get_experiment_costs(self.experiment_id)
 
         # Generate report package
@@ -727,6 +1298,48 @@ spec:
         logger.info(f"  CSV:  {report_dir}/metrics.csv")
         logger.info(f"  JSON: {report_dir}/metrics.json")
         logger.info("="*60)
+
+    def full_lifecycle(
+        self,
+        config_file: Path,
+        test_plan_file: Path,
+        runtime_tags: Optional[Dict[str, str]] = None
+    ) -> None:
+        """
+        Execute full test lifecycle: deploy → test → undeploy.
+
+        Args:
+            config_file: Infrastructure configuration
+            test_plan_file: Test plan configuration
+            runtime_tags: Optional runtime tags
+
+        Raises:
+            OrchestratorError: If any phase fails
+        """
+        logger.info("="*60)
+        logger.info("STARTING FULL TEST LIFECYCLE")
+        logger.info("="*60)
+
+        try:
+            # Deploy Pulsar
+            self.deploy_pulsar(config_file)
+
+            # Run tests and generate report
+            try:
+                self.run_tests(test_plan_file)
+                self.generate_report()
+            finally:
+                # Always undeploy
+                logger.info("\nUndeploying Pulsar...")
+                self.undeploy_pulsar()
+
+            logger.info("="*60)
+            logger.info("FULL LIFECYCLE COMPLETED SUCCESSFULLY")
+            logger.info("="*60)
+
+        except Exception as e:
+            logger.error(f"Lifecycle failed: {e}")
+            raise
 
     @staticmethod
     def resolve_experiment_id(experiment_id: str) -> str:
@@ -773,21 +1386,42 @@ spec:
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
-        description="Pulsar OMB Load Testing Orchestrator\n\n"
-                    "Run OpenMessaging Benchmark tests against existing Pulsar clusters.\n"
-                    "NOTE: Pulsar deployment must be managed externally.",
+        description="Pulsar AWS Lab Orchestrator (EKS/Helm)\n\n"
+                    "NOTE: EKS cluster management is handled externally. "
+                    "Ensure your kubectl is configured for the target EKS cluster before running commands.",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
+    # Deploy command
+    deploy_parser = subparsers.add_parser("deploy", help="Deploy Pulsar via Helm")
+    deploy_parser.add_argument("--config", type=Path, default=CONFIG_DIR / "infrastructure.yaml", help="Infrastructure config")
+    deploy_parser.add_argument("--experiment-id", help="Experiment ID")
+
+    # Undeploy command
+    undeploy_parser = subparsers.add_parser("undeploy", help="Remove Pulsar from cluster")
+    undeploy_parser.add_argument("--experiment-id", required=True, help="Experiment ID")
+
+    # Wipe command
+    wipe_parser = subparsers.add_parser("wipe", help="Force delete namespace and all resources")
+    wipe_parser.add_argument("--force", action="store_true", help="Skip confirmation prompt")
+    wipe_parser.add_argument("--namespace", default="pulsar", help="Namespace to wipe (default: pulsar)")
+
     # Run tests command
     run_parser = subparsers.add_parser("run", help="Run benchmark tests")
     run_parser.add_argument("--test-plan", type=Path, required=True, help="Test plan file")
-    run_parser.add_argument("--experiment-id", help="Experiment ID (auto-generated if not provided)")
+    run_parser.add_argument("--experiment-id", required=True, help="Experiment ID")
 
     # Report command
     report_parser = subparsers.add_parser("report", help="Generate report")
-    report_parser.add_argument("--experiment-id", default="latest", help="Experiment ID (default: latest)")
+    report_parser.add_argument("--experiment-id", required=True, help="Experiment ID")
+
+    # Full lifecycle command
+    full_parser = subparsers.add_parser("full", help="Full test cycle (deploy→test→undeploy)")
+    full_parser.add_argument("--config", type=Path, default=CONFIG_DIR / "infrastructure.yaml", help="Infrastructure config")
+    full_parser.add_argument("--test-plan", type=Path, required=True, help="Test plan file")
+    full_parser.add_argument("--experiment-id", help="Experiment ID")
+    full_parser.add_argument("--tag", action="append", metavar="KEY=VALUE", help="Additional tags")
 
     # List command
     list_parser = subparsers.add_parser("list", help="List experiments")
@@ -804,18 +1438,41 @@ def main():
             Orchestrator.list_experiments()
             return
 
+        # Handle wipe command (doesn't need experiment ID)
+        if args.command == "wipe":
+            # Create temporary orchestrator with specified namespace
+            temp_orchestrator = Orchestrator()
+            temp_orchestrator.namespace = args.namespace
+            temp_orchestrator.wipe_namespace(force=args.force)
+            return
+
         # Resolve experiment ID
         experiment_id = getattr(args, "experiment_id", None)
-        if experiment_id:
+        if experiment_id and args.command in ["undeploy", "run", "report"]:
             experiment_id = Orchestrator.resolve_experiment_id(experiment_id)
 
         orchestrator = Orchestrator(experiment_id)
 
+        # Parse runtime tags
+        runtime_tags = {}
+        if hasattr(args, 'tag') and args.tag:
+            for tag in args.tag:
+                if '=' not in tag:
+                    raise OrchestratorError(f"Invalid tag format: {tag}")
+                key, value = tag.split('=', 1)
+                runtime_tags[key] = value
+
         # Execute command
-        if args.command == "run":
+        if args.command == "deploy":
+            orchestrator.deploy_pulsar(args.config)
+        elif args.command == "undeploy":
+            orchestrator.undeploy_pulsar()
+        elif args.command == "run":
             orchestrator.run_tests(args.test_plan)
         elif args.command == "report":
             orchestrator.generate_report()
+        elif args.command == "full":
+            orchestrator.full_lifecycle(args.config, args.test_plan, runtime_tags=runtime_tags)
 
     except OrchestratorError as e:
         logger.error(f"Orchestrator error: {e}")

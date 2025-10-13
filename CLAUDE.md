@@ -4,80 +4,171 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Pulsar AWS Lab is a reproducible, ephemeral Apache Pulsar testing framework on AWS. It automates the complete lifecycle of Pulsar cluster deployment, load testing using OpenMessaging Benchmark framework, comprehensive reporting, and teardown with cost tracking.
+**Pulsar OMB Lab** is a specialized load testing framework for Apache Pulsar using the OpenMessaging Benchmark (OMB) framework. This tool runs performance tests against **existing Pulsar clusters** and generates comprehensive reports.
 
-**Architecture Note**: This project uses **EKS (Elastic Kubernetes Service)** with Helm charts for deployment. Pulsar is deployed via the official Apache Pulsar Helm chart, and OpenMessaging Benchmark runs in Kubernetes pods using a custom Docker image. The EKS cluster is long-lived infrastructure, while Pulsar deployments are ephemeral (installed/uninstalled per test).
+**CRITICAL**: This repository does NOT deploy Pulsar. You must have a running Pulsar cluster accessible at `pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650` before using this framework.
+
+## What This Framework Does
+
+1. **Builds Docker Image**: Custom OMB image with Java 21 and benchmark tooling
+2. **Creates Kubernetes Jobs**: Dynamically generates ephemeral Jobs to run load tests
+3. **Executes Load Tests**: Runs configurable workloads (topics, partitions, rates, message sizes)
+4. **Collects Results**: Aggregates metrics from completed Job pods
+5. **Generates Reports**: Creates comprehensive HTML reports with performance analysis
+
+## What This Framework Does NOT Do
+
+- Deploy Pulsar clusters
+- Provision infrastructure (EKS, EC2, VPC)
+- Install Helm charts
+- Manage Pulsar configuration
+- Create monitoring stacks
 
 ## Architecture
 
-### High-Level Components
+### Core Components
 
-
-2. **Helm Chart** (`helm/pulsar-eks-lab/`)
-   - Self-contained Helm chart wrapping Apache Pulsar chart (v4.3.0)
-   - Includes OpenMessaging Benchmark pod templates (producer/consumer)
-   - Grafana dashboard configurations for monitoring
-   - EKS-optimized values: persistence enabled, anti-affinity, pod monitoring
-   - Default replica counts: 3 ZooKeeper, 3 BookKeeper, 3 Broker, 2 Proxy
-   - Configurable via `values.yaml` or runtime overrides
-
-3. **Docker Image** (`docker/omb/`)
+1. **Docker Image** (`docker/omb/`)
    - Custom OpenMessaging Benchmark Docker image
    - Multi-stage build: Maven 3.9 + Java 21 LTS
-   - Builds OMB from official GitHub repository
-   - Runtime image includes only JRE for smaller footprint
+   - Builds OMB from official GitHub repository: https://github.com/openmessaging/benchmark
+   - Runtime image includes only JRE for minimal footprint
    - Pre-configured with benchmark binary in PATH
+   - Image must be accessible to your Kubernetes cluster
 
-4. **Configuration System** (`config/`)
-   - Infrastructure config: EKS cluster version, node types, VPC networking
-   - Pulsar cluster config: replica counts, JVM settings, storage settings
-   - Test plans: workload matrices and variation strategies
-   - Workload definitions: topics, partitions, message sizes, rates
+2. **Orchestrator** (`scripts/orchestrator.py`)
+   - Python-based CLI for test execution
+   - Creates Kubernetes Jobs dynamically from test plans
+   - Monitors Job completion and collects pod logs
+   - Parses OMB output for metrics extraction
+   - Generates HTML reports with performance data
+   - Three commands: `run`, `report`, `list`
 
-5. **Custom Resource Definitions** (`crds/`)
-   - VictoriaMetrics Operator CRDs (v0.63.0) for monitoring stack
-   - Local copies ensure reproducibility and offline capability
-   - Auto-installed by orchestrator before Helm deployment
+3. **Configuration System** (`config/`)
+   - Test plans: workload matrices and test scenarios
+   - Workload definitions: topics, partitions, message sizes, rates, producer/consumer counts
+   - No infrastructure or cluster configuration (Pulsar must exist externally)
 
-6. **Orchestration** (`scripts/orchestrator.py`)
-   - Python-based workflow: setup → helm_install → wait → test → report → helm_uninstall → teardown
-   - Terraform automation for EKS cluster lifecycle
-   - kubectl and Helm integration for Pulsar deployment
-   - Test matrix execution via Kubernetes Jobs
-   - AWS cost tracking integration
-   - Emergency cleanup via tag-based resource discovery
+4. **Test Plans** (`config/test-plans/*.yaml`)
+   - Define test scenarios and workload variations
+   - Specify which workloads to run and with what parameters
+   - Support for test matrices (e.g., varying message sizes, partition counts)
+   - Each test creates a separate Kubernetes Job
 
-7. **Testing**
-   - OpenMessaging Benchmark framework deployed as Kubernetes pods
-   - Producer and consumer pods deployed via Helm chart
-   - Workload configurations passed via ConfigMaps
-   - Configurable workloads: topics, partitions, message sizes, producer/consumer counts
-   - Test types: fixed rate, ramp up, scale to failure, latency sensitivity
-   - Results collected from pod logs and stored locally
+5. **Test Plans** (`config/test-plans/*.yaml`)
+   - Define base workload parameters and test variations
+   - Specify benchmark type (fixed_rate, ramp_up, etc.)
+   - Configure multiple test runs with different settings
+   - Orchestrator generates OMB workload specs from these plans
+
+### How OMB Jobs Work
+
+When you run a test, the orchestrator:
+
+1. **Reads Test Plan**: Parses test plan YAML to determine workload variations
+2. **Generates Job Manifests**: Creates Kubernetes Job YAML dynamically for each test
+3. **Creates ConfigMaps**: Embeds workload configuration as ConfigMaps mounted to Job pods
+4. **Submits Jobs**: Applies Job manifests to Kubernetes cluster
+5. **Monitors Completion**: Polls Job status until completion (success/failure)
+6. **Collects Logs**: Retrieves logs from completed Job pods
+7. **Parses Results**: Extracts throughput, latency, and error metrics from OMB output
+8. **Cleans Up**: Deletes completed Jobs and ConfigMaps after log collection
+
+**Job Characteristics:**
+- **Namespace**: `pulsar-omb` (created automatically)
+- **Naming**: `omb-<workload-name>-<variation-id>-<timestamp>`
+- **Restart Policy**: `Never` (Jobs do not restart on failure)
+- **Backoff Limit**: 0 (no retries)
+- **TTL**: Jobs are cleaned up after log collection
+- **Service Account**: Uses default service account with minimal permissions
+
+**Hardcoded Pulsar Connection:**
+- Service URL: `pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650`
+- HTTP URL: `http://pulsar-proxy.pulsar.svc.cluster.local:8080`
+- Assumes Pulsar proxy service exists in `pulsar` namespace
+- No authentication configured (modify for production use)
 
 ### Workflow
 
-2. **Build Docker Image** (one-time): Build custom OMB image and push to registry
-3. **Deploy**: Helm installs Pulsar chart with OMB pods to EKS cluster
-4. **Wait**: Orchestrator waits for all pods to reach Ready state
-5. **Test**: Run test matrix via OMB pods, collect metrics and logs
-6. **Report**: Generate comprehensive offline report with costs
-7. **Undeploy**: Helm uninstalls Pulsar release (cleanup pods/PVCs)
-
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Prerequisites                                               │
+│ - Pulsar cluster running in Kubernetes                     │
+│ - Pulsar proxy accessible at expected service name         │
+│ - kubectl configured with cluster access                   │
+│ - OMB Docker image built and pushed to accessible registry │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Step 1: Run Tests                                           │
+│ $ python scripts/orchestrator.py run \                      │
+│     --test-plan config/test-plans/poc.yaml                  │
+│                                                             │
+│ - Creates experiment ID and result directory               │
+│ - Reads test plan and workload definitions                 │
+│ - Generates Kubernetes Job manifests dynamically           │
+│ - Creates ConfigMaps with workload configurations          │
+│ - Submits Jobs to cluster                                  │
+│ - Monitors Job status (polls every 10s)                    │
+│ - Collects logs from completed pods                        │
+│ - Deletes Jobs and ConfigMaps after collection             │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Step 2: Generate Report                                     │
+│ $ python scripts/orchestrator.py report --experiment-id ID │
+│                                                             │
+│ - Parses collected logs for metrics                        │
+│ - Extracts throughput, latency percentiles, error rates    │
+│ - Generates HTML report with charts                        │
+│ - Saves report to experiment directory                     │
+│ - Creates summary statistics                               │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Step 3: Analyze Results                                     │
+│ - Open HTML report in browser                              │
+│ - Review metrics: throughput, latency, errors              │
+│ - Compare test variations                                   │
+│ - Export raw data for further analysis                     │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ### Key Design Principles
 
-- **Kubernetes-Native**: Leverages EKS managed infrastructure, Helm for deployment
-- **Cost Optimization**: Long-lived EKS cluster, ephemeral Pulsar deployments, default t3.medium nodes
-- **Reproducibility**: All configs version controlled, deterministic Helm deployments
-- **Scalability**: Kubernetes auto-scaling for nodes, configurable replica counts for Pulsar components
-- **Observability**: Integrated Grafana dashboards, Prometheus metrics via pod monitors
-- **Safety**: Namespace isolation, RBAC, resource limits, confirmation prompts
-- **Extensibility**: Modular Helm chart, custom values overlays, pluggable workloads
+- **Non-Invasive**: Does not modify or deploy Pulsar, only runs tests against it
+- **Kubernetes-Native**: Uses native Job resources for test execution
+- **Ephemeral**: Jobs are created, run, and deleted automatically
+- **Reproducible**: All configurations version controlled, deterministic test execution
+- **Isolated**: Runs in separate namespace from Pulsar cluster
+- **Lightweight**: Minimal resource footprint (Jobs only exist during tests)
+- **Transparent**: All logs and metrics captured for offline analysis
 
-## Development Commands
+## Prerequisites
 
-### Prerequisites
+### Required External Infrastructure
+
+1. **Running Pulsar Cluster**
+   - Must be deployed in Kubernetes
+   - Proxy service must be accessible at: `pulsar-proxy.pulsar.svc.cluster.local:6650`
+   - HTTP admin API at: `pulsar-proxy.pulsar.svc.cluster.local:8080`
+   - Cluster must be healthy and ready to accept connections
+
+2. **Kubernetes Cluster Access**
+   - kubectl configured with appropriate context
+   - Permission to create Jobs, ConfigMaps, and Namespaces
+   - Sufficient cluster resources for test Jobs (CPU, memory)
+
+3. **Docker Registry Access**
+   - OMB Docker image must be built and pushed
+   - Kubernetes must be able to pull the image
+   - Configure image pull secrets if using private registry
+
+### Software Requirements
+
 ```bash
 # Install Python dependencies
 pip install -r scripts/requirements.txt
@@ -87,366 +178,587 @@ pip install -r scripts/requirements.txt
 # Linux: curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
 # Windows: choco install kubernetes-cli
 
-# Install Helm (Kubernetes package manager)
-# macOS: brew install helm
-# Linux: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-# Windows: choco install kubernetes-helm
-
-# Install Terraform (for EKS infrastructure)
-# macOS: brew install terraform
-# Linux: See https://www.terraform.io/downloads
-# Windows: choco install terraform
-
-# Install AWS CLI
-# macOS: brew install awscli
-# Linux: See https://aws.amazon.com/cli/
-# Windows: choco install awscli
-
 # Install Docker (for building OMB image)
 # macOS: brew install --cask docker
 # Linux: See https://docs.docker.com/engine/install/
 # Windows: choco install docker-desktop
 
-# Configure AWS credentials
-aws configure
-# Or export credentials
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_DEFAULT_REGION=us-east-1
+# Verify kubectl access to cluster
+kubectl cluster-info
+kubectl get nodes
 ```
 
+## Development Commands
+
 ### Docker Image Management
+
+The OMB Docker image must be built and accessible to your Kubernetes cluster:
 
 ```bash
 # Build OpenMessaging Benchmark Docker image
 cd docker/omb
 docker build -t pulsar-omb:latest .
 
-# Tag for ECR (if using AWS container registry)
-docker tag pulsar-omb:latest <account-id>.dkr.ecr.us-east-1.amazonaws.com/pulsar-omb:latest
+# Tag for container registry (adjust for your registry)
+docker tag pulsar-omb:latest <your-registry>/pulsar-omb:latest
 
-# Login to ECR
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-east-1.amazonaws.com
+# Push to registry
+docker push <your-registry>/pulsar-omb:latest
 
-# Push to ECR
-docker push <account-id>.dkr.ecr.us-east-1.amazonaws.com/pulsar-omb:latest
-
-# For local development (minikube), load image directly
+# For local Kubernetes (minikube/kind), load image directly
 minikube image load pulsar-omb:latest
+# OR for kind:
+kind load docker-image pulsar-omb:latest --name <cluster-name>
+
+# Verify image is available
+docker images | grep pulsar-omb
 ```
 
-### kubectl Configuration
-
-**Prerequisites**: EKS cluster must be managed externally (not part of this repository).
-
-```bash
-# Configure kubectl to connect to existing EKS cluster
-aws eks update-kubeconfig --region <region> --name <cluster-name>
-
-# Verify cluster access
-kubectl get nodes
-kubectl cluster-info
+**Important**: Update `config/test-plans/*.yaml` to reference your image location:
+```yaml
+image: <your-registry>/pulsar-omb:latest
 ```
 
-### Helm Operations
+### Verify Pulsar Cluster Access
+
+Before running tests, verify your Pulsar cluster is accessible:
 
 ```bash
-# Download Helm chart dependencies (one-time)
-cd helm/pulsar-eks-lab
-helm dependency update
+# Check Pulsar proxy service exists
+kubectl get svc -n pulsar pulsar-proxy
 
-# Install Pulsar to EKS cluster
-helm install pulsar ./helm/pulsar-eks-lab \
-  --namespace pulsar \
-  --create-namespace \
-  --timeout 15m
+# Expected output should show:
+# NAME           TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)
+# pulsar-proxy   ClusterIP   10.96.xxx.xxx   <none>        6650/TCP,8080/TCP
 
-# Install with custom values
-helm install pulsar ./helm/pulsar-eks-lab \
-  --namespace pulsar \
-  --create-namespace \
-  --values my-custom-values.yaml
+# Test connectivity from a pod
+kubectl run curl-test --image=curlimages/curl -i --rm --restart=Never -- \
+  curl -v http://pulsar-proxy.pulsar.svc.cluster.local:8080/admin/v2/clusters
 
-# Check deployment status
-kubectl get pods -n pulsar
-kubectl get pvc -n pulsar
+# Should return Pulsar cluster information (not connection refused)
 
-# Upgrade running deployment
-helm upgrade pulsar ./helm/pulsar-eks-lab \
-  --namespace pulsar \
-  --values updated-values.yaml
-
-# Uninstall Pulsar (cleanup)
-helm uninstall pulsar --namespace pulsar
-
-# Delete namespace and PVCs
-kubectl delete namespace pulsar
+# Check Pulsar health
+kubectl exec -n pulsar -it <broker-pod-name> -- bin/pulsar-admin brokers healthcheck
 ```
 
-### Main Operations (via Orchestrator)
+If these checks fail, your Pulsar cluster is not properly configured or accessible.
+
+### Running Tests
+
+The orchestrator provides three commands: `run`, `report`, and `list`.
+
+#### Run Tests
+
+Execute load tests against your Pulsar cluster:
 
 ```bash
-# Full lifecycle (setup EKS → deploy Pulsar → test → report → undeploy → teardown)
-python scripts/orchestrator.py full --test-plan config/test-plans/poc.yaml
+# Run tests using a test plan
+python scripts/orchestrator.py run --test-plan config/test-plans/poc.yaml
 
-# With custom tags for cost tracking
-python scripts/orchestrator.py full --test-plan config/test-plans/poc.yaml --tag team=engineering --tag project=perf-testing
+# Specify custom experiment ID
+python scripts/orchestrator.py run \
+  --test-plan config/test-plans/poc.yaml \
+  --experiment-id my-test-2024-01-15
 
-# List experiments
+# Specify custom OMB image
+python scripts/orchestrator.py run \
+  --test-plan config/test-plans/poc.yaml \
+  --image my-registry.io/pulsar-omb:v1.2.3
+
+# Dry run (show what would be executed)
+python scripts/orchestrator.py run \
+  --test-plan config/test-plans/poc.yaml \
+  --dry-run
+```
+
+**What Happens:**
+1. Creates experiment directory: `~/.pulsar-omb-lab/<experiment-id>/`
+2. Generates Kubernetes Job manifests for each test in the plan
+3. Creates ConfigMaps with workload configurations
+4. Submits Jobs to `pulsar-omb` namespace
+5. Monitors Jobs until completion (success or failure)
+6. Collects logs from all Job pods
+7. Saves logs to experiment directory
+8. Deletes Jobs and ConfigMaps
+9. Creates symlink: `~/.pulsar-omb-lab/latest` → experiment directory
+
+**Monitoring Progress:**
+```bash
+# Watch Job status
+kubectl get jobs -n pulsar-omb --watch
+
+# View Job pod logs in real-time
+kubectl logs -n pulsar-omb -l job-name=omb-workload-001 -f
+
+# Check for failed Jobs
+kubectl get jobs -n pulsar-omb --field-selector status.successful=0
+```
+
+#### Generate Report
+
+After tests complete, generate an HTML report:
+
+```bash
+# Generate report for latest experiment
+python scripts/orchestrator.py report
+
+# Generate report for specific experiment
+python scripts/orchestrator.py report --experiment-id my-test-2024-01-15
+
+# Specify output format
+python scripts/orchestrator.py report --format html
+python scripts/orchestrator.py report --format json
+```
+
+**Report Contents:**
+- **Summary Statistics**: Total throughput, average latency, error rates
+- **Per-Test Metrics**: Throughput (msgs/sec, MB/sec), latency percentiles (p50, p95, p99, p99.9, max)
+- **Charts**: Throughput over time, latency distributions, test comparisons
+- **Raw Data**: Complete logs and parsed metrics for further analysis
+- **Test Configurations**: Workload definitions and test plan parameters
+
+**Report Location:**
+- HTML report: `~/.pulsar-omb-lab/<experiment-id>/report.html`
+- Raw data: `~/.pulsar-omb-lab/<experiment-id>/results/`
+- Logs: `~/.pulsar-omb-lab/<experiment-id>/logs/`
+
+#### List Experiments
+
+View all experiments and their status:
+
+```bash
+# List all experiments
 python scripts/orchestrator.py list
 
-# Individual steps (assumes EKS cluster already exists)
-python scripts/orchestrator.py deploy                                     # Helm install Pulsar
-python scripts/orchestrator.py run --test-plan config/test-plans/poc.yaml --experiment-id latest
-python scripts/orchestrator.py report --experiment-id latest
-python scripts/orchestrator.py undeploy --experiment-id latest            # Helm uninstall Pulsar
+# Show detailed information
+python scripts/orchestrator.py list --verbose
+
+# Filter by date
+python scripts/orchestrator.py list --since 2024-01-01
 ```
 
-### Kubectl Operations
+### kubectl Operations for OMB Jobs
+
+Useful commands for debugging and monitoring:
 
 ```bash
-# View cluster resources
-kubectl get all -n pulsar
-kubectl get pods -n pulsar -w  # Watch pod status
+# List all OMB Jobs
+kubectl get jobs -n pulsar-omb
 
-# Check pod logs
-kubectl logs -n pulsar pulsar-broker-0 -f
-kubectl logs -n pulsar pulsar-bookkeeper-0 -f
-kubectl logs -n pulsar omb-producer-<pod-id> -f
+# Watch Job status in real-time
+kubectl get jobs -n pulsar-omb --watch
 
-# Exec into pods
-kubectl exec -it -n pulsar pulsar-broker-0 -- bash
+# View Job details
+kubectl describe job <job-name> -n pulsar-omb
 
-# Port forward for local access
-kubectl port-forward -n pulsar svc/pulsar-broker 8080:8080  # Admin API
-kubectl port-forward -n pulsar svc/pulsar-broker 6650:6650  # Binary protocol
-kubectl port-forward -n pulsar svc/pulsar-grafana 3000:3000 # Grafana UI
+# Check Job pod logs
+kubectl logs -n pulsar-omb -l job-name=<job-name>
 
-# Manage topics via pulsar-admin
-kubectl exec -n pulsar pulsar-broker-0 -- bin/pulsar-admin topics list public/default
-kubectl exec -n pulsar pulsar-broker-0 -- bin/pulsar-admin topics delete persistent://public/default/my-topic
+# Get logs from failed pods
+kubectl logs -n pulsar-omb <pod-name> --previous
+
+# View ConfigMaps created for tests
+kubectl get configmaps -n pulsar-omb
+
+# View ConfigMap contents
+kubectl describe configmap <configmap-name> -n pulsar-omb
+
+# Check Job events (helpful for debugging)
+kubectl get events -n pulsar-omb --sort-by='.lastTimestamp'
+
+# Delete stuck Jobs manually
+kubectl delete job <job-name> -n pulsar-omb
+
+# Clean up entire namespace
+kubectl delete namespace pulsar-omb
 ```
 
-### Configuration
+## Configuration
 
-- `config/infrastructure.yaml`: AWS region and experiment metadata
-- `config/pulsar-cluster.yaml`: Pulsar component settings (replicas, JVM, storage)
-- `config/test-plans/*.yaml`: Test scenario definitions and matrices
-- `workloads/*.yaml`: OpenMessaging Benchmark workload specifications
-- `helm/pulsar-eks-lab/values.yaml`: Helm chart default values (EKS-optimized)
+### Test Plans
 
-**Note**: EKS cluster is managed externally. Configuration files control Helm deployment and test execution.
+Test plans define which workloads to run and how to vary parameters.
 
-## Pulsar Components
+**Location**: `config/test-plans/*.yaml`
 
-Deployed as StatefulSets and Deployments in Kubernetes:
+**Structure**:
+```yaml
+name: "POC Test Plan"
+description: "Proof of concept load test"
 
-- **ZooKeeper**: Cluster coordination (default: 3 replicas)
-  - Service: `pulsar-zookeeper` (ClusterIP)
-  - Port: 2181 (client), 2888 (peer), 3888 (election)
-  - Persistent storage via PVCs
+# OMB Docker image to use for Jobs
+image: pulsar-omb:latest
 
-- **BookKeeper**: Message storage layer (default: 3 replicas)
-  - Service: `pulsar-bookkeeper` (ClusterIP)
-  - Port: 3181 (client)
-  - Persistent storage for journal and ledgers via PVCs
+# List of workloads to execute
+workloads:
+  - name: "simple-produce-consume"
+    file: "workloads/simple.yaml"
+    variations:
+      - name: "1kb-messages"
+        parameters:
+          messageSize: 1024
+      - name: "10kb-messages"
+        parameters:
+          messageSize: 10240
 
-- **Broker**: Message routing and serving (default: 3 replicas)
-  - Service: `pulsar-broker` (ClusterIP and LoadBalancer options)
-  - Port: 6650 (binary protocol), 8080 (HTTP admin)
-  - Stateless, connects to BookKeeper for storage
+  - name: "high-throughput"
+    file: "workloads/max-throughput.yaml"
+    variations:
+      - name: "baseline"
+        parameters: {}
 
-- **Proxy**: Load balancing and routing (default: 2 replicas)
-  - Service: `pulsar-proxy` (LoadBalancer)
-  - Port: 6650 (binary), 8080 (HTTP)
-  - Optional component for external access
+# Job resource requests/limits (optional)
+resources:
+  requests:
+    cpu: "1000m"
+    memory: "2Gi"
+  limits:
+    cpu: "2000m"
+    memory: "4Gi"
 
-- **OpenMessaging Benchmark**: Load testing (default: 1 producer, 1 consumer)
-  - Pods: `omb-producer`, `omb-consumer`
-  - Custom Docker image with OMB framework
-  - ConfigMap for workload definitions
+# Job timeout (optional, default: 3600s)
+timeout: 1800
+```
 
-### Kubernetes Resources
+### Workload Definitions
 
-- **Namespaces**: `pulsar` (default), configurable
-- **StatefulSets**: ZooKeeper, BookKeeper (require stable network identity)
-- **Deployments**: Broker, Proxy, OMB pods (stateless)
-- **Services**: ClusterIP for internal communication, LoadBalancer for external access
-- **ConfigMaps**: Pulsar configuration, OMB workloads, Grafana dashboards
-- **PersistentVolumeClaims**: EBS volumes for ZooKeeper and BookKeeper data
-- **ServiceMonitors**: Prometheus scraping configuration for metrics
+Workload files define the actual test scenarios in OpenMessaging Benchmark format.
 
-## Test Plans
+**Location**: `workloads/*.yaml`
 
-Test plans define variations to systematically explore:
-- Infrastructure: instance types, storage types, cluster size
-- Workload: topics, partitions, message size, producer/consumer counts, rates
-- Pulsar config: JVM settings, retention policies, replication factors
+**Structure** (standard OMB format):
+```yaml
+name: "Simple Producer-Consumer Test"
 
-Each test run generates:
-- Throughput metrics (msgs/sec, MB/sec)
-- Latency percentiles (p50, p95, p99, p99.9, max)
-- Cost analysis (total cost, cost per million messages)
-- Offline report package (HTML + raw data + configs)
+# Pulsar-specific driver configuration (DO NOT MODIFY serviceUrl)
+driverConfig:
+  name: "Pulsar"
+  serviceUrl: "pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650"
+  httpUrl: "http://pulsar-proxy.pulsar.svc.cluster.local:8080"
 
-## Cost Management
+# Topic and subscription configuration
+topics:
+  - name: "test-topic"
+    partitions: 10
 
-- All resources tagged with experiment-id for tracking
-- Cost estimates shown before deployment
-- Post-experiment cost report via AWS Cost Explorer API
-- Automatic cleanup on completion or failure
+subscriptions:
+  - name: "test-subscription"
+    subscriptionType: "Shared"
+
+# Producer configuration
+producers:
+  - name: "producer-1"
+    rate: 10000  # messages per second
+    messageSize: 1024  # bytes
+
+# Consumer configuration
+consumers:
+  - name: "consumer-1"
+    subscriptions:
+      - "test-subscription"
+
+# Test duration
+testDuration: 300  # seconds
+warmupDuration: 60  # seconds
+```
+
+**Key Parameters**:
+- `topics`: Topic names and partition counts
+- `subscriptions`: Subscription names and types (Shared, Exclusive, Failover)
+- `producers.rate`: Messages per second (0 = max throughput)
+- `producers.messageSize`: Message payload size in bytes
+- `testDuration`: How long to run the test
+- `warmupDuration`: Time to stabilize before collecting metrics
+
+**Parameter Overrides**: Test plan variations can override workload parameters dynamically.
+
+## Test Results
+
+### Result Directory Structure
+
+Each experiment creates a directory at `~/.pulsar-omb-lab/<experiment-id>/`:
+
+```
+~/.pulsar-omb-lab/<experiment-id>/
+├── orchestrator.log           # Orchestrator execution log
+├── report.html                # Generated HTML report
+├── report.json                # Machine-readable results
+├── test-plan.yaml             # Copy of test plan used
+├── logs/
+│   ├── omb-workload-001/
+│   │   └── pod.log            # Complete OMB output
+│   ├── omb-workload-002/
+│   │   └── pod.log
+│   └── ...
+├── results/
+│   ├── workload-001.json      # Parsed metrics
+│   ├── workload-002.json
+│   └── summary.json           # Aggregated statistics
+└── manifests/
+    ├── job-workload-001.yaml  # Generated Job manifests
+    ├── configmap-workload-001.yaml
+    └── ...
+```
+
+### Metrics Collected
+
+For each test, the following metrics are extracted:
+
+**Throughput**:
+- Messages per second (msgs/sec)
+- Megabytes per second (MB/sec)
+- Publish rate, Consume rate
+
+**Latency** (percentiles):
+- p50 (median)
+- p95
+- p99
+- p99.9
+- max
+
+**Errors**:
+- Publish errors
+- Consume errors
+- Connection failures
+- Timeout events
+
+**Resource Utilization** (if available):
+- CPU usage
+- Memory usage
+- Network throughput
 
 ## Troubleshooting
 
 ### Common Issues
 
-**EKS Cluster Connection Issues**
+#### Pulsar Connection Failures
+
+**Symptoms**: Jobs fail with "Connection refused" or "Failed to create Pulsar client"
+
+**Diagnosis**:
 ```bash
-# Ensure kubeconfig is updated
-aws eks update-kubeconfig --region us-east-1 --name pulsar-eks-<experiment-id>
+# Check Pulsar proxy service exists
+kubectl get svc -n pulsar pulsar-proxy
 
-# Verify cluster access
-kubectl get nodes
-kubectl cluster-info
+# Check service endpoints
+kubectl get endpoints -n pulsar pulsar-proxy
 
-# Check IAM permissions
-aws sts get-caller-identity
+# Test connectivity from test namespace
+kubectl run -n pulsar-omb curl-test --image=curlimages/curl -i --rm --restart=Never -- \
+  curl -v http://pulsar-proxy.pulsar.svc.cluster.local:8080/admin/v2/clusters
 ```
 
-**Helm Installation Failures**
+**Solutions**:
+- Verify Pulsar cluster is running: `kubectl get pods -n pulsar`
+- Verify proxy service exists and has endpoints
+- Check network policies allow traffic from `pulsar-omb` namespace
+- Verify service name matches hardcoded value in workload configs
+
+#### Job ImagePullBackOff
+
+**Symptoms**: Job pods stuck in `ImagePullBackOff` state
+
+**Diagnosis**:
 ```bash
-# Check Helm chart dependencies
-cd helm/pulsar-eks-lab
-helm dependency list
-helm dependency update
+# Check pod events
+kubectl describe pod -n pulsar-omb <pod-name>
 
-# Verify chart syntax
-helm lint ./helm/pulsar-eks-lab
-
-# Debug installation
-helm install pulsar ./helm/pulsar-eks-lab --dry-run --debug
-
-# Check failed pods
-kubectl get pods -n pulsar
-kubectl describe pod <pod-name> -n pulsar
-kubectl logs <pod-name> -n pulsar --previous  # For crashed pods
-```
-
-**Pod Not Starting or CrashLoopBackOff**
-```bash
-# Check pod status and events
-kubectl describe pod <pod-name> -n pulsar
-
-# Check logs
-kubectl logs <pod-name> -n pulsar -f
-
-# Check resource constraints
-kubectl top nodes
-kubectl top pods -n pulsar
-
-# Check PVC status (for StatefulSets)
-kubectl get pvc -n pulsar
-kubectl describe pvc <pvc-name> -n pulsar
-```
-
-**Docker Image Pull Failures**
-```bash
 # Verify image exists
 docker images | grep pulsar-omb
-
-# For ECR, verify authentication
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-east-1.amazonaws.com
-
-# Check imagePullSecrets in Helm values
-kubectl get secrets -n pulsar
 ```
 
-**Stuck Resources After Failed Deployment**
+**Solutions**:
+- Build and push OMB Docker image: `cd docker/omb && docker build -t pulsar-omb:latest .`
+- For local clusters, load image: `minikube image load pulsar-omb:latest`
+- Update test plan with correct image reference
+- Configure imagePullSecrets if using private registry:
+  ```bash
+  kubectl create secret docker-registry regcred \
+    --docker-server=<registry> \
+    --docker-username=<username> \
+    --docker-password=<password> \
+    -n pulsar-omb
+  ```
+
+#### Job Timeout or Hangs
+
+**Symptoms**: Jobs run indefinitely or timeout without completing
+
+**Diagnosis**:
 ```bash
-# Uninstall Helm release
-helm uninstall pulsar --namespace pulsar
+# Check Job pod status
+kubectl get pods -n pulsar-omb -l job-name=<job-name>
+
+# View live logs
+kubectl logs -n pulsar-omb -l job-name=<job-name> -f
+
+# Check for resource constraints
+kubectl top pods -n pulsar-omb
+kubectl describe pod -n pulsar-omb <pod-name>
+```
+
+**Solutions**:
+- Verify Pulsar cluster is healthy and not overloaded
+- Check Job resource requests/limits in test plan
+- Reduce test duration or workload intensity
+- Check for network issues between OMB and Pulsar
+- Verify test plan timeout is sufficient
+
+#### Jobs Fail with OMB Errors
+
+**Symptoms**: Jobs complete but logs show OMB errors or failures
+
+**Diagnosis**:
+```bash
+# View Job logs
+kubectl logs -n pulsar-omb <pod-name>
+
+# Common errors to look for:
+# - "Topic not found" → Topic creation failed
+# - "Partition error" → Invalid partition count
+# - "Authorization failed" → Missing permissions
+# - "Service not ready" → Pulsar cluster unhealthy
+```
+
+**Solutions**:
+- Check Pulsar broker logs for errors
+- Verify topic auto-creation is enabled or pre-create topics
+- Check authentication/authorization if enabled
+- Reduce workload intensity (lower rate, fewer partitions)
+- Verify workload configuration syntax
+
+#### No Results After Test Completion
+
+**Symptoms**: Tests complete but report generation fails
+
+**Diagnosis**:
+```bash
+# Check experiment directory
+ls -la ~/.pulsar-omb-lab/<experiment-id>/
+
+# Check for logs
+ls -la ~/.pulsar-omb-lab/<experiment-id>/logs/
+
+# Verify logs contain metrics
+cat ~/.pulsar-omb-lab/<experiment-id>/logs/*/pod.log | grep -i "throughput\|latency"
+```
+
+**Solutions**:
+- Check orchestrator logs: `~/.pulsar-omb-lab/<experiment-id>/orchestrator.log`
+- Verify OMB output format matches parser expectations
+- Re-run report generation: `python scripts/orchestrator.py report --experiment-id <id>`
+- Check for parsing errors in orchestrator output
+
+### Stuck Jobs Cleanup
+
+If Jobs get stuck or need manual cleanup:
+
+```bash
+# Delete all Jobs in namespace
+kubectl delete jobs -n pulsar-omb --all
+
+# Delete all ConfigMaps
+kubectl delete configmaps -n pulsar-omb --all
 
 # Force delete stuck pods
-kubectl delete pod <pod-name> -n pulsar --grace-period=0 --force
+kubectl delete pods -n pulsar-omb --all --grace-period=0 --force
 
-# Delete namespace (removes all resources)
-kubectl delete namespace pulsar
+# Nuclear option: delete entire namespace
+kubectl delete namespace pulsar-omb
 
-# Emergency cleanup by experiment ID (destroys EKS cluster)
-python scripts/cleanup_by_tag.py --experiment-id <exp-id> --execute
-
-# Or use orchestrator teardown
-python scripts/orchestrator.py teardown --experiment-id <exp-id>
+# Recreate namespace for next run
+kubectl create namespace pulsar-omb
 ```
 
-**Performance Issues or Slow Tests**
-```bash
-# Check node resources
-kubectl top nodes
-kubectl describe nodes
+### Debugging Job Execution
 
-# Check pod resource usage
-kubectl top pods -n pulsar
-
-# Scale up node group (managed externally)
-aws eks update-nodegroup-config \
-  --cluster-name <cluster-name> \
-  --nodegroup-name <nodegroup-name> \
-  --scaling-config desiredSize=5
-```
-
-### Important Files and Locations
-
-- **Orchestrator logs**: `~/.pulsar-aws-lab/<experiment-id>/orchestrator.log`
-- **Experiment results**: `~/.pulsar-aws-lab/<experiment-id>/`
-- **Latest experiment symlink**: `~/.pulsar-aws-lab/latest`
-- **Kubeconfig**: `~/.kube/config` (updated by `aws eks update-kubeconfig`)
-- **Helm values**: `helm/pulsar-eks-lab/values.yaml`
-- **Docker context**: `docker/omb/`
-
-### Useful Debugging Commands
+For detailed debugging of a specific Job:
 
 ```bash
-# Get all resources in namespace
-kubectl get all -n pulsar
+# Get Job status
+kubectl get job <job-name> -n pulsar-omb -o yaml
 
-# Check events (helpful for debugging)
-kubectl get events -n pulsar --sort-by='.lastTimestamp'
+# Check Job events
+kubectl describe job <job-name> -n pulsar-omb
 
-# Check logs for all pods with label
-kubectl logs -n pulsar -l app=pulsar-broker --tail=100
+# Get pod name for Job
+POD_NAME=$(kubectl get pods -n pulsar-omb -l job-name=<job-name> -o jsonpath='{.items[0].metadata.name}')
 
-# Port forward to access services locally
-kubectl port-forward -n pulsar svc/pulsar-broker 8080:8080
+# View pod logs
+kubectl logs -n pulsar-omb $POD_NAME
 
-# Copy files from pod (e.g., logs, configs)
-kubectl cp pulsar/pulsar-broker-0:/pulsar/logs ./local-logs
+# Exec into pod (if still running)
+kubectl exec -it -n pulsar-omb $POD_NAME -- bash
 
-# Execute commands in pod
-kubectl exec -it -n pulsar pulsar-broker-0 -- bash
+# Inside pod, check OMB installation
+ls -la /opt/benchmark/
+java -version
 ```
 
-### Key Architectural Changes
+## Important Files and Locations
 
-**Migrated from EC2 to EKS Architecture**
+### Project Structure
 
-This project has migrated from AMI-based EC2 instances to Kubernetes on EKS:
+```
+pulsar-aws-lab/
+├── docker/
+│   └── omb/                          # OMB Docker image
+│       ├── Dockerfile
+│       └── entrypoint.sh
+├── scripts/
+│   ├── orchestrator.py               # Main CLI
+│   └── requirements.txt              # Python dependencies
+├── config/
+│   └── test-plans/                   # Test plan definitions
+│       ├── poc.yaml
+│       └── performance.yaml
+├── workloads/                        # OMB workload specs
+│   ├── simple.yaml
+│   ├── max-throughput.yaml
+│   └── latency-sensitive.yaml
+└── CLAUDE.md                         # This file
+```
 
-- **OLD (v1)**: Terraform provisions EC2 instances → Packer AMIs with pre-installed Pulsar → systemd services
-- **NEW (v2)**: Terraform provisions EKS cluster → Helm deploys Pulsar chart → Kubernetes manages pods
+### Runtime Locations
 
-**What Changed:**
-- No more Packer/AMI building - replaced with Docker images for OMB
-- No more Ansible or systemd - replaced with Kubernetes native orchestration
-- No more SSM commands - replaced with kubectl/Helm operations
-- EC2 instances replaced with EKS managed node groups
-- Individual component VMs replaced with pods in a single cluster
+- **Experiment results**: `~/.pulsar-omb-lab/<experiment-id>/`
+- **Latest experiment symlink**: `~/.pulsar-omb-lab/latest`
+- **Orchestrator logs**: `~/.pulsar-omb-lab/<experiment-id>/orchestrator.log`
+- **Test logs**: `~/.pulsar-omb-lab/<experiment-id>/logs/`
+- **Generated reports**: `~/.pulsar-omb-lab/<experiment-id>/report.html`
+- **Job manifests**: `~/.pulsar-omb-lab/<experiment-id>/manifests/`
 
-**Migration Benefits:**
-- Better resource utilization (multiple components per node)
-- Easier scaling and updates (Kubernetes native)
-- Improved observability (Prometheus/Grafana integration)
-- Faster deployment cycles (no AMI rebuild required)
-- Cost optimization (shared node infrastructure)
+### Kubernetes Resources
 
-If you see references to Packer, AMIs, Ansible, or SSM in code or docs, they are outdated and should be removed. These components have been completely removed from the project.
+- **Namespace**: `pulsar-omb` (created automatically)
+- **Jobs**: `omb-<workload>-<variation>-<timestamp>`
+- **ConfigMaps**: `omb-workload-<hash>`
+- **Service Account**: `default` (no special permissions required)
+
+## Development Guidelines
+
+When working with this codebase:
+
+1. **OMB is ephemeral** - Always use Jobs, never Deployments/StatefulSets
+2. **Pulsar is external** - Never include Pulsar deployment code
+3. **Config is immutable** - Each test creates new ConfigMaps, doesn't modify existing
+4. **Results are local** - Store results in experiment directory, not in cluster
+5. **Cleanup is automatic** - Jobs self-cleanup, orchestrator handles ConfigMap cleanup
+6. **Hardcoded connection** - Pulsar URL is fixed in orchestrator constants
+
+## Adding New Features
+
+### Adding a New Workload
+1. Create YAML file in `workloads/` directory
+2. Define topics, partitions, message sizes, producer/consumer settings
+3. Reference in test plan YAML
+
+### Adding a New Test Type
+1. Update test plan schema if needed
+2. Add variation logic to `_generate_workload()` in orchestrator
+3. Document in test plan examples
+
+### Modifying OMB Image
+1. Update `docker/omb/Dockerfile`
+2. Rebuild and push to registry
+3. Update image reference in test plans

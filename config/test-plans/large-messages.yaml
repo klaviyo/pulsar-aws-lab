@@ -1,0 +1,33 @@
+# Large Messages Test Plan
+# Test with large payloads (64 KB messages)
+
+name: "large-messages"
+description: "Test with 64 KB messages at lower rate (5k msgs/sec)"
+
+base_workload:
+  name: "large-messages-test"
+  topics: 1
+  partitions_per_topic: 8
+  message_size: 65536  # 64 KB
+  subscriptions_per_topic: 1
+  producers_per_topic: 1
+  consumers_per_topic: 1
+  consumer_backlog_size_gb: 0
+  test_duration_minutes: 5
+  warmup_duration_minutes: 1
+
+test_runs:
+  - name: "large-msg-5k"
+    description: "5k msgs/sec with 64 KB messages"
+    type: "fixed_rate"
+    producer_rate: 5000
+
+reporting:
+  output_format:
+    - "html"
+    - "json"
+  include_raw_data: true
+  metrics_to_highlight:
+    - "throughput_mb"
+    - "p99_latency"
+    - "network_usage"
