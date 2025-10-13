@@ -46,13 +46,13 @@ class OrchestratorError(Exception):
 class Orchestrator:
     """Main orchestrator for OMB load testing against existing Pulsar clusters"""
 
-    def __init__(self, experiment_id: Optional[str] = None, namespace: str = "pulsar", omb_image: Optional[str] = None):
+    def __init__(self, experiment_id: Optional[str] = None, namespace: str = "omb", omb_image: Optional[str] = None):
         """
         Initialize orchestrator with experiment tracking.
 
         Args:
             experiment_id: Unique experiment identifier (auto-generated if not provided)
-            namespace: Kubernetes namespace where OMB jobs will run (default: pulsar)
+            namespace: Kubernetes namespace where OMB jobs will run (default: omb)
             omb_image: OMB Docker image to use (default: from DEFAULT_OMB_IMAGE)
         """
         self.experiment_id = experiment_id or f"exp-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -62,6 +62,9 @@ class Orchestrator:
         self.pulsar_service_url = PULSAR_SERVICE_URL
         self.pulsar_http_url = PULSAR_HTTP_URL
         self.omb_image = omb_image or DEFAULT_OMB_IMAGE
+
+        # Ensure OMB namespace exists
+        self._ensure_namespace_exists()
 
         # Create/update "latest" symlink
         latest_link = RESULTS_DIR / "latest"
@@ -80,9 +83,30 @@ class Orchestrator:
         logger.info(f"Initialized orchestrator for experiment: {self.experiment_id}")
         print(f"\n{'='*60}")
         print(f"Experiment ID: {self.experiment_id}")
-        print(f"Namespace: {self.namespace}")
+        print(f"OMB Namespace: {self.namespace}")
+        print(f"Pulsar Namespace: pulsar")
+        print(f"Pulsar URL: {self.pulsar_service_url}")
         print(f"Results will be saved to: {self.experiment_dir}")
         print(f"{'='*60}\n")
+
+    def _ensure_namespace_exists(self) -> None:
+        """Ensure the OMB namespace exists, create it if not."""
+        result = self.run_command(
+            ["kubectl", "get", "namespace", self.namespace],
+            f"Check if namespace {self.namespace} exists",
+            capture_output=True,
+            check=False
+        )
+
+        if result.returncode != 0:
+            logger.info(f"Creating namespace: {self.namespace}")
+            self.run_command(
+                ["kubectl", "create", "namespace", self.namespace],
+                f"Create namespace {self.namespace}"
+            )
+            logger.info(f"✓ Namespace '{self.namespace}' created")
+        else:
+            logger.debug(f"Namespace '{self.namespace}' already exists")
 
     def load_config(self, config_file: Path) -> Dict:
         """
@@ -395,9 +419,9 @@ class Orchestrator:
             else:
                 topic_url = f"persistent://public/default/{topic_name}"
 
-            # Delete topic via pulsar-admin
+            # Delete topic via pulsar-admin (broker is in pulsar namespace)
             result = self.run_command(
-                ["kubectl", "exec", "-n", self.namespace, "pulsar-broker-0", "--",
+                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
                  "bin/pulsar-admin", "topics", "delete", topic_url],
                 f"Delete topic {topic_name}",
                 check=False,
@@ -435,6 +459,18 @@ class Orchestrator:
         num_workers = test_config.get('num_workers', 3)  # Default to 3 workers
         logger.info(f"Running OMB test: {test_name} (with {num_workers} workers)")
 
+        # Print monitoring information
+        print(f"\n{'='*60}")
+        print(f"Test: {test_name}")
+        print(f"Workers: {num_workers}")
+        print(f"\nMonitoring Information:")
+        print(f"  Pulsar Namespace: pulsar")
+        print(f"  OMB Namespace: {self.namespace}")
+        print(f"\n  To access Grafana dashboards:")
+        print(f"  kubectl port-forward -n pulsar svc/pulsar-grafana 3000:3000")
+        print(f"  Then open: http://localhost:3000")
+        print(f"{'='*60}\n")
+
         # Generate workload ConfigMap
         workload_yaml = self._generate_omb_workload_yaml(test_name, workload_config)
         workload_file = self.experiment_dir / f"workload_{test_name}.yaml"
@@ -462,13 +498,45 @@ class Orchestrator:
 
         # Wait for workers to be ready
         logger.info(f"Waiting for {num_workers} worker pods to be ready...")
-        self.run_command(
-            ["kubectl", "wait", "--for=condition=ready",
-             f"pod", "-l", f"app=omb-worker,test={test_name}",
-             "-n", self.namespace, "--timeout=5m"],
-            f"Wait for worker pods to be ready"
-        )
-        logger.info(f"✓ All {num_workers} workers are ready")
+        timeout_seconds = 5 * 60  # 5 minutes
+        start_time = time.time()
+        poll_interval = 5
+
+        while time.time() - start_time < timeout_seconds:
+            result = self.run_command(
+                ["kubectl", "get", "pods", "-n", self.namespace,
+                 "-l", f"app=omb-worker,test={test_name}",
+                 "-o", "json"],
+                "Check worker pods status",
+                capture_output=True,
+                check=False
+            )
+
+            if result.returncode == 0:
+                pods = json.loads(result.stdout)
+                pod_items = pods.get('items', [])
+
+                if len(pod_items) == num_workers:
+                    # Check if all are ready
+                    ready_count = 0
+                    for pod in pod_items:
+                        conditions = pod.get('status', {}).get('conditions', [])
+                        for condition in conditions:
+                            if condition['type'] == 'Ready' and condition['status'] == 'True':
+                                ready_count += 1
+                                break
+
+                    if ready_count == num_workers:
+                        logger.info(f"✓ All {num_workers} workers are ready")
+                        break
+                    else:
+                        logger.info(f"Workers ready: {ready_count}/{num_workers}")
+                else:
+                    logger.info(f"Workers created: {len(pod_items)}/{num_workers}")
+
+            time.sleep(poll_interval)
+        else:
+            raise OrchestratorError(f"Timeout waiting for worker pods to be ready after {timeout_seconds}s")
 
         # Create OMB driver Job
         job_yaml = self._generate_omb_job_yaml(test_name, num_workers)
@@ -641,23 +709,27 @@ spec:
         command: ["/bin/bash", "-c"]
         args:
           - |
+            set -x
             echo "Starting OMB worker on $(hostname)"
-            /app/bin/benchmark-worker --port 8080
+            echo "Worker will listen on 0.0.0.0:8080"
+
+            # Start worker and keep it running
+            exec /app/bin/benchmark-worker --port 8080
         ports:
         - containerPort: 8080
           name: http
         readinessProbe:
-          httpGet:
-            path: /
+          tcpSocket:
             port: 8080
           initialDelaySeconds: 5
           periodSeconds: 5
+          failureThreshold: 3
         livenessProbe:
-          httpGet:
-            path: /
+          tcpSocket:
             port: 8080
           initialDelaySeconds: 10
           periodSeconds: 10
+          failureThreshold: 3
 """
 
     def _generate_omb_job_yaml(self, test_name: str, num_workers: int = 3) -> str:
