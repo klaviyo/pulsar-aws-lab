@@ -5,13 +5,13 @@ name: "high-throughput"
 description: "High throughput stress test with 4 producers and 4 consumers"
 
 base_workload:
-  name: "high-throughput-test"
+  name: "high-throughput-100-test"
   topics: 1
   partitions_per_topic: 16
   message_size: 1024  # 1 KB
   subscriptions_per_topic: 1
-  producers_per_topic: 4
-  consumers_per_topic: 4
+  producers_per_topic: 8
+  consumers_per_topic: 8
   consumer_backlog_size_gb: 0
   test_duration_minutes: 5
   warmup_duration_minutes: 1
@@ -20,7 +20,7 @@ test_runs:
   - name: "throughput-100k"
     description: "100k msgs/sec high load test"
     type: "fixed_rate"
-    producer_rate: 100000
+    producer_rate: 500000
 
 reporting:
   output_format:
