@@ -23,6 +23,9 @@ from rich import box
 
 from tui import OrchestratorUI
 from operations import cleanup_pulsar_namespaces, cleanup_pulsar_topics
+from kubernetes_manager import KubernetesManager
+from pulsar_manager import PulsarManager
+from results_collector import ResultsCollector
 
 # Import OMB worker manager
 from omb.workers import WorkerManager
@@ -89,23 +92,28 @@ class Orchestrator:
         self.test_start_time = None
         self.test_end_time = None
 
-    @property
-    def console(self):
-        """Delegate console access to UI."""
-        return self.ui.console
-
-    @property
-    def current_test(self):
-        """Delegate current_test access to UI."""
-        return self.ui.current_test
-
-    @current_test.setter
-    def current_test(self, value):
-        """Delegate current_test setter to UI."""
-        self.ui.set_current_test(value)
-
         # Store test results from immediate collection
         self.test_results = ""
+
+        # Initialize managers
+        self.k8s_manager = KubernetesManager(
+            namespace=self.namespace,
+            experiment_dir=self.experiment_dir
+        )
+
+        self.pulsar_manager = PulsarManager(
+            pulsar_namespace=self.pulsar_tenant_namespace,
+            run_command_func=self.run_command,
+            add_status_func=self._add_status,
+            create_layout_func=self._create_layout
+        )
+
+        self.results_collector = ResultsCollector(
+            namespace=self.namespace,
+            experiment_id=self.experiment_id,
+            experiment_dir=self.experiment_dir,
+            run_command_func=self.run_command
+        )
 
         # Initialize worker manager for persistent worker pools
         self.worker_manager = WorkerManager(
@@ -115,10 +123,10 @@ class Orchestrator:
         )
 
         # Ensure K8s namespace exists
-        self._ensure_namespace_exists()
+        self.k8s_manager.ensure_namespace_exists()
 
         # Ensure Pulsar namespace exists
-        self._ensure_pulsar_namespace_exists()
+        self.pulsar_manager.ensure_pulsar_namespace_exists()
 
         # Create/update "latest" symlink
         latest_link = RESULTS_DIR / "latest"
@@ -136,6 +144,21 @@ class Orchestrator:
 
         logger.info(f"Initialized orchestrator for experiment: {self.experiment_id}")
         self._display_initial_info()
+
+    @property
+    def console(self):
+        """Delegate console access to UI."""
+        return self.ui.console
+
+    @property
+    def current_test(self):
+        """Delegate current_test access to UI."""
+        return self.ui.current_test
+
+    @current_test.setter
+    def current_test(self, value):
+        """Delegate current_test setter to UI."""
+        self.ui.set_current_test(value)
 
     def _display_initial_info(self) -> None:
         """Display initial experiment information"""
@@ -163,242 +186,9 @@ class Orchestrator:
         self.ui.set_grafana_url(self._get_grafana_url())
         return self.ui.create_layout()
 
-    def _ensure_namespace_exists(self) -> None:
-        """Ensure the K8s OMB namespace exists, create it if not."""
-        result = self.run_command(
-            ["kubectl", "get", "namespace", self.namespace],
-            f"Check if K8s namespace {self.namespace} exists",
-            capture_output=True,
-            check=False
-        )
 
-        if result.returncode != 0:
-            logger.info(f"Creating K8s namespace: {self.namespace}")
-            self.run_command(
-                ["kubectl", "create", "namespace", self.namespace],
-                f"Create K8s namespace {self.namespace}"
-            )
-            logger.info(f"✓ K8s namespace '{self.namespace}' created")
-        else:
-            logger.debug(f"K8s namespace '{self.namespace}' already exists")
 
-    def _ensure_results_pvc_exists(self) -> None:
-        """Ensure shared PVC for OMB results exists, create it if not."""
-        pvc_name = "omb-results"
 
-        result = self.run_command(
-            ["kubectl", "get", "pvc", pvc_name, "-n", self.namespace],
-            f"Check if PVC {pvc_name} exists",
-            capture_output=True,
-            check=False
-        )
-
-        if result.returncode != 0:
-            logger.info(f"Creating PVC: {pvc_name}")
-
-            pvc_yaml = f"""apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: {pvc_name}
-  namespace: {self.namespace}
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi
-  storageClassName: gp2
-"""
-            pvc_file = self.experiment_dir / f"{pvc_name}.yaml"
-            with open(pvc_file, 'w') as f:
-                f.write(pvc_yaml)
-
-            self.run_command(
-                ["kubectl", "apply", "-f", str(pvc_file)],
-                f"Create PVC {pvc_name}"
-            )
-            logger.info(f"✓ PVC '{pvc_name}' created")
-        else:
-            logger.debug(f"PVC '{pvc_name}' already exists")
-
-    def _ensure_pulsar_namespace_exists(self) -> None:
-        """Ensure the Pulsar tenant/namespace for tests exists, create it if not."""
-        # Check if namespace exists
-        result = self.run_command(
-            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-             "bin/pulsar-admin", "namespaces", "list", "public"],
-            f"List Pulsar namespaces in public tenant",
-            capture_output=True,
-            check=False
-        )
-
-        if result.returncode == 0:
-            namespaces = [line.strip().strip('"') for line in result.stdout.strip().split('\n')
-                         if line.strip() and line.strip().startswith('public/')]
-
-            if self.pulsar_tenant_namespace in namespaces:
-                logger.debug(f"Pulsar namespace '{self.pulsar_tenant_namespace}' already exists")
-                return
-
-        # Create the namespace
-        logger.info(f"Creating Pulsar namespace: {self.pulsar_tenant_namespace}")
-        result = self.run_command(
-            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-             "bin/pulsar-admin", "namespaces", "create", self.pulsar_tenant_namespace],
-            f"Create Pulsar namespace {self.pulsar_tenant_namespace}",
-            check=False,
-            capture_output=True
-        )
-
-        if result.returncode == 0:
-            logger.info(f"✓ Pulsar namespace '{self.pulsar_tenant_namespace}' created")
-        else:
-            # If it already exists, that's fine
-            if "already exists" in result.stderr.lower():
-                logger.debug(f"Pulsar namespace '{self.pulsar_tenant_namespace}' already exists")
-            else:
-                logger.warning(f"Failed to create Pulsar namespace: {result.stderr}")
-
-    def _detect_namespace_from_job_logs(self, test_name: str) -> Optional[str]:
-        """
-        Detect Pulsar namespace by reading OMB driver Job logs.
-        OMB prints the namespace when creating topics, giving us definitive data.
-
-        Args:
-            test_name: Name of the test (used to find Job pod)
-
-        Returns:
-            Namespace string like 'public/omb-test-7Wv9Uqc' or None if not found
-        """
-        try:
-            # Get the pod name for the OMB driver Job
-            result = self.run_command(
-                ["kubectl", "get", "pods", "-n", "omb",
-                 "-l", f"job-name=omb-{test_name}",
-                 "-o", "jsonpath={.items[0].metadata.name}"],
-                f"Get OMB driver pod for {test_name}",
-                capture_output=True,
-                check=False
-            )
-
-            if result.returncode != 0 or not result.stdout.strip():
-                logger.warning("Could not find OMB driver pod")
-                return None
-
-            pod_name = result.stdout.strip()
-            logger.debug(f"Found OMB driver pod: {pod_name}")
-
-            # Read pod logs
-            result = self.run_command(
-                ["kubectl", "logs", pod_name, "-n", "omb"],
-                f"Read logs from {pod_name}",
-                capture_output=True,
-                check=False
-            )
-
-            if result.returncode != 0:
-                logger.warning("Could not read OMB driver pod logs")
-                return None
-
-            logs = result.stdout
-
-            # Parse logs to find namespace
-            # Look for patterns like:
-            # - "Creating topic: persistent://public/omb-test-7Wv9Uqc/test-topic-0"
-            # - "namespace: public/omb-test-7Wv9Uqc"
-            import re
-
-            # Try pattern 1: topic URL in logs
-            topic_pattern = r'persistent://([^/]+/[^/]+)/'
-            matches = re.findall(topic_pattern, logs)
-
-            if matches:
-                # Find first match that starts with our prefix
-                for match in matches:
-                    if match.startswith(PULSAR_TEST_NAMESPACE + '-') or match.startswith('public/omb-test-'):
-                        logger.info(f"Detected namespace from Job logs: {match}")
-                        return match
-
-            # Try pattern 2: direct namespace mention
-            ns_pattern = r'namespace[:\s]+([^/\s]+/[^\s,]+)'
-            matches = re.findall(ns_pattern, logs, re.IGNORECASE)
-
-            if matches:
-                for match in matches:
-                    if match.startswith(PULSAR_TEST_NAMESPACE + '-') or match.startswith('public/omb-test-'):
-                        logger.info(f"Detected namespace from Job logs: {match}")
-                        return match
-
-            logger.warning("Could not find namespace in OMB driver logs")
-            return None
-
-        except Exception as e:
-            logger.warning(f"Error detecting namespace from logs: {e}")
-            return None
-
-    def _detect_pulsar_namespace(self) -> Optional[str]:
-        """
-        Detect the actual Pulsar namespace being used for the current test.
-        OMB appends random suffixes like 'omb-test-yDPSfpI' to the namespace prefix.
-
-        Strategy: Find the last (most recently listed) namespace with topics.
-        This is called right after the Job starts, so the newest namespace should be the one
-        OMB just created for this test.
-
-        Returns:
-            The full namespace string (e.g., 'public/omb-test-yDPSfpI') or None if not detected
-        """
-        try:
-            result = self.run_command(
-                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                 "bin/pulsar-admin", "namespaces", "list", "public"],
-                "List Pulsar namespaces",
-                capture_output=True,
-                check=False
-            )
-
-            if result.returncode != 0:
-                logger.warning("Failed to query Pulsar namespaces")
-                return None
-
-            # Parse namespaces
-            lines = result.stdout.strip().split('\n')
-            namespaces = [line.strip().strip('"') for line in lines
-                         if line.strip() and line.strip().startswith('public/')
-                         and 'Defaulted container' not in line]
-
-            # Look for namespaces starting with our prefix
-            omb_namespaces = [ns for ns in namespaces if ns.startswith(PULSAR_TEST_NAMESPACE + '-')]
-
-            if not omb_namespaces:
-                return None
-
-            # Check namespaces in reverse order (newest first) and return the first one with topics
-            for ns in reversed(omb_namespaces):
-                topic_result = self.run_command(
-                    ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                     "bin/pulsar-admin", "topics", "list", ns],
-                    f"List topics in {ns}",
-                    capture_output=True,
-                    check=False
-                )
-
-                if topic_result.returncode == 0:
-                    topics = [l.strip() for l in topic_result.stdout.strip().split('\n')
-                             if l.strip() and l.strip().startswith('persistent://')]
-
-                    if topics:
-                        logger.info(f"Detected Pulsar namespace: {ns} (with {len(topics)} topics)")
-                        return ns
-
-            # If no namespace has topics yet, return the last one (newest)
-            last_ns = omb_namespaces[-1]
-            logger.info(f"Detected Pulsar namespace: {last_ns} (no topics yet, but newest)")
-            return last_ns
-
-        except Exception as e:
-            logger.warning(f"Error detecting Pulsar namespace: {e}")
-            return None
 
     def _get_grafana_url(self, from_time: str = 'now-15m', to_time: str = 'now', dashboard_path: Optional[str] = None) -> str:
         """
@@ -521,307 +311,7 @@ spec:
             logger.error(error_msg)
             raise OrchestratorError(error_msg) from e
 
-    def setup_kubectl_context(self, region: str, cluster_name: str) -> None:
-        """
-        Configure kubectl to connect to EKS cluster.
 
-        Args:
-            region: AWS region
-            cluster_name: EKS cluster name
-
-        Raises:
-            OrchestratorError: If kubectl setup fails
-        """
-        logger.info(f"Setting up kubectl context for cluster: {cluster_name}")
-
-        # Update kubeconfig
-        self.run_command(
-            ["aws", "eks", "update-kubeconfig",
-             "--region", region,
-             "--name", cluster_name],
-            "Configure kubectl context"
-        )
-
-        # Verify connectivity
-        result = self.run_command(
-            ["kubectl", "cluster-info"],
-            "Verify kubectl connectivity",
-            capture_output=True
-        )
-        logger.info(f"✓ kubectl configured successfully")
-        logger.debug(result.stdout)
-
-        # Get node count
-        result = self.run_command(
-            ["kubectl", "get", "nodes", "-o", "json"],
-            "Get cluster nodes",
-            capture_output=True
-        )
-        nodes = json.loads(result.stdout)
-        node_count = len(nodes.get('items', []))
-        logger.info(f"✓ Cluster has {node_count} nodes")
-
-    def wait_for_pods_ready(self, timeout_seconds: int = 600) -> None:
-        """
-        Wait for all Pulsar pods to be ready.
-
-        Args:
-            timeout_seconds: Maximum time to wait
-
-        Raises:
-            OrchestratorError: If pods don't become ready within timeout
-        """
-        logger.info("="*60)
-        logger.info("WAITING FOR PODS TO BE READY")
-        logger.info("="*60)
-
-        start_time = time.time()
-        backoff_seconds = 5
-        max_backoff = 30
-
-        critical_components = ['zookeeper', 'bookkeeper', 'broker']
-
-        while time.time() - start_time < timeout_seconds:
-            # Get all pods
-            result = self.run_command(
-                ["kubectl", "get", "pods", "-n", self.namespace, "-o", "json"],
-                "Get pod status",
-                capture_output=True
-            )
-
-            pods = json.loads(result.stdout)
-            pod_items = pods.get('items', [])
-
-            if not pod_items:
-                logger.warning("No pods found yet, retrying...")
-                time.sleep(backoff_seconds)
-                continue
-
-            # Check pod readiness
-            all_ready = True
-            component_status = {}
-
-            for pod in pod_items:
-                name = pod['metadata']['name']
-                component = self._get_pod_component(name)
-
-                # Get pod phase and conditions
-                phase = pod['status'].get('phase', 'Unknown')
-                conditions = pod['status'].get('conditions', [])
-
-                # Check if this is an initialization Job (these complete and don't need to be "Ready")
-                is_init_job = 'init' in name.lower() or phase == 'Succeeded'
-
-                ready = False
-                if is_init_job and phase == 'Succeeded':
-                    # Init jobs that succeeded are considered "ready"
-                    ready = True
-                else:
-                    # Regular pods need Ready condition
-                    for condition in conditions:
-                        if condition['type'] == 'Ready':
-                            ready = condition['status'] == 'True'
-                            break
-
-                status_str = f"{phase} ({'Ready' if ready or is_init_job else 'Not Ready'})"
-                component_status.setdefault(component, []).append((name, status_str, ready))
-
-                if not ready:
-                    all_ready = False
-
-            # Log status
-            logger.info(f"Pod status ({len(pod_items)} total):")
-            for component in sorted(component_status.keys()):
-                pods_status = component_status[component]
-                ready_count = sum(1 for _, _, ready in pods_status if ready)
-                logger.info(f"  {component}: {ready_count}/{len(pods_status)} ready")
-                for pod_name, status, _ in pods_status:
-                    symbol = "✓" if "Ready" in status else "✗"
-                    logger.info(f"    {symbol} {pod_name}: {status}")
-
-            if all_ready:
-                logger.info("\n✓ All pods are ready!")
-                break
-
-            elapsed = int(time.time() - start_time)
-            logger.info(f"Waiting for pods... ({elapsed}s elapsed)")
-            time.sleep(backoff_seconds)
-            backoff_seconds = min(backoff_seconds * 1.5, max_backoff)
-
-        if time.time() - start_time >= timeout_seconds:
-            raise OrchestratorError(
-                f"Timeout waiting for pods to be ready after {timeout_seconds}s"
-            )
-
-        total_time = int(time.time() - start_time)
-        logger.info("="*60)
-        logger.info(f"PODS READY! (Total time: {total_time}s)")
-        logger.info("="*60)
-
-    def _get_pod_component(self, pod_name: str) -> str:
-        """Extract component type from pod name"""
-        for component in ['zookeeper', 'bookkeeper', 'broker', 'proxy', 'prometheus', 'grafana']:
-            if component in pod_name.lower():
-                return component
-        return 'other'
-
-    def cleanup_namespace(self) -> None:
-        """
-        Clean up any leftover OMB test resources in the namespace.
-        This removes Jobs, StatefulSets, Services, and ConfigMaps created during testing.
-        """
-        logger.info(f"Cleaning up OMB resources in namespace '{self.namespace}'...")
-
-        # Delete all OMB Jobs
-        result = self.run_command(
-            ["kubectl", "get", "jobs", "-n", self.namespace, "-l", "app=omb-driver", "-o", "name"],
-            "List OMB Jobs",
-            capture_output=True,
-            check=False
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            jobs = result.stdout.strip().split('\n')
-            logger.info(f"Found {len(jobs)} OMB Jobs to clean up")
-            self.run_command(
-                ["kubectl", "delete", "jobs", "-n", self.namespace, "-l", "app=omb-driver"],
-                "Delete OMB Jobs",
-                check=False
-            )
-
-        # Note: OMB workers are persistent across test runs and NOT cleaned up here
-        # To clean up workers explicitly, use: python scripts/orchestrator.py cleanup-workers
-
-        # Delete all OMB workload ConfigMaps
-        result = self.run_command(
-            ["kubectl", "get", "configmaps", "-n", self.namespace, "-o", "name"],
-            "List ConfigMaps",
-            capture_output=True,
-            check=False
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            for configmap in result.stdout.strip().split('\n'):
-                if 'omb-workload-' in configmap:
-                    cm_name = configmap.split('/')[-1]
-                    self.run_command(
-                        ["kubectl", "delete", "configmap", cm_name, "-n", self.namespace],
-                        f"Delete ConfigMap {cm_name}",
-                        check=False
-                    )
-
-        logger.info(f"✓ Namespace '{self.namespace}' cleanup completed")
-
-    def _cleanup_test_topics(self, test_name: str = "", workload_config: Optional[Dict] = None, live: Optional[Live] = None) -> None:
-        """
-        Delete all Pulsar topics in the test namespace.
-        OMB creates topics in the fixed namespace 'public/omb-test'.
-
-        Args:
-            test_name: Name of the test (unused, kept for compatibility)
-            workload_config: Workload configuration (unused, kept for compatibility)
-            live: Rich Live display instance for UI updates
-        """
-        _ = test_name, workload_config  # Keep for backward compatibility, unused
-
-        if live:
-            self._add_status(f"Cleaning up topics in {self.pulsar_tenant_namespace}...", 'info')
-            live.update(self._create_layout())
-
-        logger.info(f"Cleaning up Pulsar topics in namespace '{self.pulsar_tenant_namespace}'...")
-
-        # List all topics in the detected namespace
-        result = self.run_command(
-            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-             "bin/pulsar-admin", "topics", "list", self.pulsar_tenant_namespace],
-            f"List topics in {self.pulsar_tenant_namespace}",
-            check=False,
-            capture_output=True
-        )
-
-        if result.returncode != 0:
-            logger.warning(f"Failed to list topics in {self.pulsar_tenant_namespace}: {result.stderr}")
-            if live:
-                self._add_status("⚠ Failed to list topics for cleanup", 'warning')
-                live.update(self._create_layout())
-            return
-
-        # Parse topic list (filter out kubectl stderr messages)
-        lines = result.stdout.strip().split('\n')
-        topics = []
-        for line in lines:
-            line = line.strip()
-            if line and line.startswith('persistent://') and 'Defaulted container' not in line:
-                topics.append(line)
-
-        if not topics:
-            logger.info(f"No topics to delete in namespace '{self.pulsar_tenant_namespace}'")
-            if live:
-                self._add_status("✓ No topics to clean up", 'success')
-                live.update(self._create_layout())
-            return
-
-        logger.info(f"Found {len(topics)} topic(s) to delete")
-
-        # Delete each topic
-        topics_deleted = 0
-        for topic_url in topics:
-            result = self.run_command(
-                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                 "bin/pulsar-admin", "topics", "delete", topic_url, "-f"],  # -f for force delete
-                f"Delete topic {topic_url.split('/')[-1]}",
-                check=False,
-                capture_output=True
-            )
-
-            if result.returncode == 0:
-                topics_deleted += 1
-                logger.debug(f"  ✓ Deleted: {topic_url.split('/')[-1]}")
-            else:
-                logger.warning(f"  ✗ Failed to delete {topic_url.split('/')[-1]}: {result.stderr}")
-
-        logger.info(f"✓ Deleted {topics_deleted}/{len(topics)} topic(s) from '{self.pulsar_tenant_namespace}'")
-        if live:
-            self._add_status(f"✓ Cleaned up {topics_deleted}/{len(topics)} topics", 'success')
-            live.update(self._create_layout())
-
-        # Now delete the Pulsar namespace itself
-        self._cleanup_pulsar_namespace(live)
-
-    def _cleanup_pulsar_namespace(self, live: Optional[Live] = None) -> None:
-        """
-        Delete the Pulsar tenant/namespace after topics are cleaned up.
-        This should be called after _cleanup_test_topics().
-
-        Args:
-            live: Rich Live display instance for UI updates
-        """
-        if not self.pulsar_tenant_namespace or self.pulsar_tenant_namespace == PULSAR_TEST_NAMESPACE:
-            logger.debug("No specific Pulsar namespace to clean up")
-            return
-
-        if live:
-            self._add_status(f"Deleting Pulsar namespace {self.pulsar_tenant_namespace}...", 'info')
-            live.update(self._create_layout())
-
-        logger.info(f"Deleting Pulsar namespace '{self.pulsar_tenant_namespace}'...")
-
-        result = self.run_command(
-            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-             "bin/pulsar-admin", "namespaces", "delete", self.pulsar_tenant_namespace],
-            f"Delete Pulsar namespace {self.pulsar_tenant_namespace}",
-            check=False,
-            capture_output=True
-        )
-
-        if result.returncode == 0:
-            logger.info(f"✓ Deleted Pulsar namespace '{self.pulsar_tenant_namespace}'")
-            if live:
-                self._add_status(f"✓ Deleted Pulsar namespace", 'success')
-                live.update(self._create_layout())
-        else:
-            logger.warning(f"Failed to delete Pulsar namespace '{self.pulsar_tenant_namespace}': {result.stderr}")
-            if live:
-                self._add_status(f"⚠ Failed to delete Pulsar namespace", 'warning')
-                live.update(self._create_layout())
 
     def run_omb_job(self, test_config: Dict, workload_config: Dict, live: Live) -> str:
         """
@@ -931,17 +421,19 @@ spec:
         self._add_status("Detecting Pulsar namespace from Job logs...", 'info')
         live.update(self._create_layout())
 
-        detected_ns = self._detect_namespace_from_job_logs(test_name)
+        detected_ns = self.pulsar_manager.detect_pulsar_namespace_from_logs(test_name, self.namespace)
         if detected_ns:
             self.pulsar_tenant_namespace = detected_ns
+            self.pulsar_manager.pulsar_namespace = detected_ns
             self._add_status(f"✓ Pulsar namespace: {detected_ns}", 'success')
             logger.info(f"Using Pulsar namespace: {detected_ns}")
         else:
             # Fallback to guessing from topic list
             logger.warning("Could not detect namespace from logs, falling back to topic search")
-            detected_ns = self._detect_pulsar_namespace()
+            detected_ns = self.pulsar_manager.detect_pulsar_namespace()
             if detected_ns:
                 self.pulsar_tenant_namespace = detected_ns
+                self.pulsar_manager.pulsar_namespace = detected_ns
                 self._add_status(f"✓ Pulsar namespace: {detected_ns} (detected from topics)", 'success')
             else:
                 self._add_status("⚠ Could not detect Pulsar namespace", 'warning')
@@ -1001,7 +493,7 @@ spec:
                         self._add_status("Collecting test results...", 'info')
                         live.update(self._create_layout())
                         logger.info(f"Collecting results for {test_name}...")
-                        results = self._collect_job_logs(test_name, success=True)
+                        results = self.results_collector.collect_job_logs(test_name, success=True)
 
                         if results:
                             self._add_status(f"✓ Results collected ({len(results)} bytes)", 'success')
@@ -1052,7 +544,7 @@ spec:
                             self._add_status("Collecting test results (during sleep window)...", 'info')
                             live.update(self._create_layout())
 
-                            results = self._collect_job_logs(test_name, success=True)
+                            results = self.results_collector.collect_job_logs(test_name, success=True)
 
                             if results:
                                 self._add_status(f"✓ Results collected ({len(results)} bytes)", 'success')
@@ -1079,11 +571,11 @@ spec:
 
         if not (job_succeeded or job_failed):
             logger.error(f"Timeout waiting for Job {test_name} after {timeout_seconds}s")
-            self._collect_job_logs(test_name, success=False)
+            self.results_collector.collect_job_logs(test_name, success=False)
             raise OrchestratorError(f"OMB test {test_name} timed out")
 
         if job_failed:
-            self._collect_job_logs(test_name, success=False)
+            self.results_collector.collect_job_logs(test_name, success=False)
             raise OrchestratorError(f"OMB test {test_name} failed")
 
         # Results were already collected immediately after Job succeeded
@@ -1091,7 +583,7 @@ spec:
         results = self.test_results
 
         # Cleanup Pulsar topics created during test
-        self._cleanup_test_topics(test_name, workload_config, live)
+        self.pulsar_manager.cleanup_test_topics(live)
 
         # Cleanup ephemeral test resources (workers are persistent and reused)
         logger.info(f"Cleaning up test resources for {test_name}...")
@@ -1254,159 +746,6 @@ spec:
         emptyDir: {{}}
 """
 
-    def _collect_job_logs(self, test_name: str, success: bool) -> str:
-        """
-        Collect logs and results from OMB Job pod.
-
-        Returns:
-            JSON results as string
-        """
-        # Get Job pod name - retry a few times if not found immediately
-        pod_name = ""
-        for attempt in range(5):
-            result = self.run_command(
-                ["kubectl", "get", "pods", "-n", self.namespace,
-                 "-l", f"job-name=omb-{test_name}",
-                 "-o", "jsonpath={.items[0].metadata.name}"],
-                f"Get Job pod for {test_name} (attempt {attempt + 1})",
-                capture_output=True,
-                check=False
-            )
-            pod_name = result.stdout.strip()
-            if pod_name:
-                break
-            time.sleep(1)
-
-        if not pod_name:
-            logger.warning(f"Could not find pod for Job {test_name}")
-            return ""
-
-        logger.info(f"Found pod: {pod_name}")
-
-        # Don't wait for terminal state - Job is already complete, and pod has 30s sleep window
-        # We want to collect results during that window while pod is still Running
-
-        # Always get and save pod logs for debugging
-        log_result = self.run_command(
-            ["kubectl", "logs", pod_name, "-n", self.namespace],
-            f"Get logs for {test_name}",
-            capture_output=True,
-            check=False
-        )
-        logs = log_result.stdout
-
-        log_file = self.experiment_dir / f"omb_{test_name}_{'success' if success else 'failed'}.log"
-        with open(log_file, 'w') as f:
-            f.write(logs)
-        logger.info(f"Logs saved to: {log_file}")
-
-        # Copy JSON results from pod if test succeeded
-        json_data = ""
-        if success:
-            results_dir = self.experiment_dir / "benchmark_results"
-            results_dir.mkdir(exist_ok=True)
-
-            result_file = results_dir / f"{test_name}.json"
-            source_path = f"/results/{self.experiment_id}/{test_name}.json"
-
-            # Try kubectl cp first (during the 30-second sleep window, pod is still Running)
-            logger.info(f"Attempting to copy results file:")
-            logger.info(f"  Pod: {pod_name}")
-            logger.info(f"  Source path: {source_path}")
-            logger.info(f"  Destination: {result_file}")
-
-            cp_result = self.run_command(
-                ["kubectl", "cp", f"{self.namespace}/{pod_name}:{source_path}", str(result_file)],
-                f"Copy results for {test_name}",
-                check=False,
-                capture_output=True
-            )
-
-            logger.info(f"kubectl cp result:")
-            logger.info(f"  Return code: {cp_result.returncode}")
-            if cp_result.stdout:
-                logger.info(f"  Stdout: {cp_result.stdout}")
-            if cp_result.stderr:
-                logger.info(f"  Stderr: {cp_result.stderr}")
-            logger.info(f"  File exists after copy: {result_file.exists()}")
-            if result_file.exists():
-                logger.info(f"  File size: {result_file.stat().st_size} bytes")
-
-            if cp_result.returncode == 0 and result_file.exists() and result_file.stat().st_size > 0:
-                logger.info(f"✓ Results copied successfully via kubectl cp")
-                with open(result_file, 'r') as f:
-                    json_data = f.read()
-            else:
-                # Fallback: extract from logs if kubectl cp failed
-                logger.warning(f"kubectl cp failed, falling back to log extraction...")
-
-                try:
-                    # Find JSON in logs - it starts with { and OMB prints it after the cat command
-                    # Look for "Results saved to" marker (path varies by experiment/test)
-                    json_start = logs.rfind('Results saved to ')
-                    if json_start != -1:
-                        remaining = logs[json_start:]
-                        brace_start = remaining.find('{')
-                        if brace_start != -1:
-                            json_portion = remaining[brace_start:]
-                            brace_end = json_portion.rfind('}')
-                            if brace_end != -1:
-                                json_data = json_portion[:brace_end + 1]
-
-                                # Validate JSON
-                                import json as json_module
-                                json_module.loads(json_data)
-
-                                # Save to file
-                                with open(result_file, 'w') as f:
-                                    f.write(json_data)
-                                logger.info(f"✓ Extracted {len(json_data)} bytes of JSON from logs to: {result_file}")
-                            else:
-                                logger.warning("Could not find closing brace in JSON output")
-                        else:
-                            logger.warning("Could not find JSON start in logs")
-                    else:
-                        logger.warning("Could not find 'Results saved' marker in logs")
-                except Exception as e:
-                    logger.warning(f"Error extracting JSON from logs: {e}")
-                    json_data = ""
-
-        return json_data
-
-    def collect_pod_logs(self) -> None:
-        """Collect logs from all Pulsar component pods for debugging"""
-        logger.info("Collecting pod logs for troubleshooting...")
-
-        result = self.run_command(
-            ["kubectl", "get", "pods", "-n", self.namespace, "-o", "json"],
-            "Get all pods",
-            capture_output=True
-        )
-
-        pods = json.loads(result.stdout)
-
-        logs_dir = self.experiment_dir / "pod_logs"
-        logs_dir.mkdir(exist_ok=True)
-
-        for pod in pods.get('items', []):
-            pod_name = pod['metadata']['name']
-            component = self._get_pod_component(pod_name)
-
-            logger.info(f"Collecting logs from {pod_name}...")
-
-            result = self.run_command(
-                ["kubectl", "logs", pod_name, "-n", self.namespace,
-                 "--tail=1000"],
-                f"Get logs from {pod_name}",
-                capture_output=True,
-                check=False
-            )
-
-            log_file = logs_dir / f"{component}_{pod_name}.log"
-            with open(log_file, 'w') as f:
-                f.write(result.stdout if result.stdout else "No logs available")
-
-        logger.info(f"✓ Pod logs collected in: {logs_dir}")
 
     def run_tests(self, test_plan_file: Path) -> None:
         """
@@ -1474,7 +813,7 @@ spec:
         self.console.print(f"[bold green]✓ Report generated:[/bold green] {report_file}\n")
 
         # Cleanup any leftover resources in namespace
-        self.cleanup_namespace()
+        self.k8s_manager.cleanup_namespace()
 
     def _generate_workload(self, base: Dict, overrides: Dict) -> Dict:
         """Generate OMB workload from test plan"""
@@ -1760,78 +1099,6 @@ spec:
         logger.info(f"HTML report generated: {report_file}")
         return report_file
 
-    def parse_omb_results(self, result_files: List[Path]) -> Dict:
-        """
-        Parse OpenMessaging Benchmark JSON results.
-
-        Args:
-            result_files: List of JSON result file paths
-
-        Returns:
-            Dictionary with parsed metrics in ReportGenerator format:
-            {
-                'throughput': {test_name: {'publish_rate': X, 'consume_rate': Y}},
-                'latency': {test_name: {'p50': X, 'p95': Y, 'p99': Z, 'p999': A, 'max': B}},
-                'errors': {test_name: {'publish_errors': X, 'consume_errors': Y}}
-            }
-        """
-        logger.info(f"Parsing {len(result_files)} result files...")
-
-        metrics = {
-            'throughput': {},
-            'latency': {},
-            'errors': {}
-        }
-
-        for result_file in result_files:
-            test_name = result_file.stem  # Filename without extension
-
-            try:
-                with open(result_file, 'r') as f:
-                    data = json.load(f)
-
-                # Extract throughput metrics
-                # OMB stores rates as arrays of periodic measurements, we use the average
-                publish_rates = data.get('publishRate', [])
-                consume_rates = data.get('consumeRate', [])
-
-                avg_publish_rate = sum(publish_rates) / len(publish_rates) if publish_rates else 0
-                avg_consume_rate = sum(consume_rates) / len(consume_rates) if consume_rates else 0
-
-                metrics['throughput'][test_name] = {
-                    'publish_rate': avg_publish_rate,
-                    'consume_rate': avg_consume_rate
-                }
-
-                # Extract latency metrics (in milliseconds)
-                metrics['latency'][test_name] = {
-                    'p50': data.get('publishLatency50pct', 0),
-                    'p95': data.get('publishLatency95pct', 0),
-                    'p99': data.get('publishLatency99pct', 0),
-                    'p999': data.get('publishLatency999pct', 0),
-                    'max': data.get('publishLatencyMax', 0)
-                }
-
-                # Extract error metrics
-                # OMB doesn't explicitly track errors in JSON, so we'll default to 0
-                # Errors would show up as job failures or in logs
-                metrics['errors'][test_name] = {
-                    'publish_errors': 0,
-                    'consume_errors': 0
-                }
-
-                logger.info(f"✓ Parsed results for '{test_name}': "
-                           f"{avg_publish_rate:.0f} msg/s, "
-                           f"p99={data.get('publishLatency99pct', 0):.2f}ms")
-
-            except Exception as e:
-                logger.error(f"Failed to parse {result_file}: {e}")
-                # Add placeholder data for failed parse
-                metrics['throughput'][test_name] = {'publish_rate': 0, 'consume_rate': 0}
-                metrics['latency'][test_name] = {'p50': 0, 'p95': 0, 'p99': 0, 'p999': 0, 'max': 0}
-                metrics['errors'][test_name] = {'publish_errors': 1, 'consume_errors': 0}
-
-        return metrics
 
     def generate_report(self) -> None:
         """Generate comprehensive experiment report with metrics and costs"""
@@ -1855,7 +1122,7 @@ spec:
         logger.info(f"Found {len(result_files)} result files")
 
         # Parse OMB results
-        metrics = self.parse_omb_results(result_files)
+        metrics = self.results_collector.parse_omb_results(result_files)
 
         # Load experiment configuration
         config_file = self.experiment_dir / "infrastructure.yaml"
