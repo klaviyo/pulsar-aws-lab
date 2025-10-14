@@ -1015,8 +1015,8 @@ spec:
             return
 
         print(f"\n{'='*60}")
-        confirm = input(f"Delete {len(namespaces)} namespace(s)? (yes/no): ")
-        if confirm.lower() != 'yes':
+        confirm = input(f"Delete {len(namespaces)} namespace(s)? (yes/no): ").strip().lower()
+        if confirm != 'yes':
             print("Cancelled.")
             return
 
