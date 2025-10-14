@@ -71,12 +71,13 @@ class ReportGenerator:
         }
 
         # Extract latency metrics (in milliseconds)
+        # Use aggregated values (single numbers) instead of time-series arrays
         metrics['latency'][test_name] = {
-            'p50': results.get('publishLatency50pct', 0),
-            'p95': results.get('publishLatency95pct', 0),
-            'p99': results.get('publishLatency99pct', 0),
-            'p999': results.get('publishLatency999pct', 0),
-            'max': results.get('publishLatencyMax', 0)
+            'p50': results.get('aggregatedPublishLatency50pct', 0),
+            'p95': results.get('aggregatedPublishLatency95pct', 0),
+            'p99': results.get('aggregatedPublishLatency99pct', 0),
+            'p999': results.get('aggregatedPublishLatency999pct', 0),
+            'max': results.get('aggregatedPublishLatencyMax', 0)
         }
 
         # Extract error metrics

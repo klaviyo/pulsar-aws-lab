@@ -40,6 +40,10 @@ class OrchestratorUI:
         """Set the Grafana dashboard URL."""
         self.grafana_url = url
 
+    def set_pulsar_namespace(self, namespace: str) -> None:
+        """Update the Pulsar tenant/namespace (after detection)."""
+        self.pulsar_tenant_namespace = namespace
+
     def create_layout(self) -> Layout:
         """Create the split-pane layout (horizontal split: metadata on top, status on bottom)."""
         layout = Layout()

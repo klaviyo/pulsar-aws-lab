@@ -441,6 +441,7 @@ class Orchestrator:
         if detected_ns:
             self.pulsar_tenant_namespace = detected_ns
             self.pulsar_manager.pulsar_namespace = detected_ns
+            self.ui.set_pulsar_namespace(detected_ns)  # Update TUI display
             self._add_status(f"✓ Pulsar namespace: {detected_ns}", 'success')
             logger.info(f"Using Pulsar namespace: {detected_ns}")
         else:
@@ -450,6 +451,7 @@ class Orchestrator:
             if detected_ns:
                 self.pulsar_tenant_namespace = detected_ns
                 self.pulsar_manager.pulsar_namespace = detected_ns
+                self.ui.set_pulsar_namespace(detected_ns)  # Update TUI display
                 self._add_status(f"✓ Pulsar namespace: {detected_ns} (detected from topics)", 'success')
             else:
                 self._add_status("⚠ Could not detect Pulsar namespace", 'warning')
@@ -829,15 +831,30 @@ spec:
         from report_generator import ReportGenerator
         report_gen = ReportGenerator(self.experiment_dir, self.experiment_id)
 
-        # Generate full report package
-        report_dir = report_gen.create_report_package(
-            results_files=list(results_dir.glob("*.json")),
-            cost_data=None,  # No cost data for test runs (only for full experiments)
-            config={'test_plan': test_plan},
-            include_raw_data=True
-        )
+        # Get all result files
+        result_files = list(results_dir.glob("*.json"))
 
-        self.console.print(f"[bold green]✓ Report generated:[/bold green] {report_dir}\n")
+        if result_files:
+            # Generate full report package with updated namespace info
+            report_config = {
+                'test_plan': test_plan,
+                'namespace': self.namespace,
+                'pulsar_namespace': self.pulsar_tenant_namespace,  # Use detected namespace
+                'pulsar_service_url': self.pulsar_service_url,
+                'experiment_id': self.experiment_id
+            }
+
+            report_dir = report_gen.create_report_package(
+                results_files=result_files,
+                cost_data=None,  # No cost data for test runs (only for full experiments)
+                config=report_config,
+                include_raw_data=False  # Don't duplicate - files already in benchmark_results/
+            )
+            self.console.print(f"[bold green]✓ Report generated:[/bold green] {report_dir}\n")
+            self.console.print(f"[dim]Raw results: {results_dir}[/dim]\n")
+        else:
+            logger.warning("No result files found to generate report")
+            self.console.print("[yellow]⚠ No results to generate report[/yellow]\n")
 
         # Cleanup any leftover resources in namespace
         self.k8s_manager.cleanup_namespace()
