@@ -190,6 +190,22 @@ class Orchestrator:
 
 
 
+    def _format_grafana_time(self, dt: Optional[datetime], offset_seconds: int = 0) -> str:
+        """
+        Format datetime for Grafana URL.
+
+        Args:
+            dt: Datetime to format
+            offset_seconds: Offset in seconds to add (can be negative)
+
+        Returns:
+            Timestamp string in milliseconds or 'now' fallback
+        """
+        if dt:
+            timestamp_ms = int((dt.timestamp() + offset_seconds) * 1000)
+            return str(timestamp_ms)
+        return 'now' if offset_seconds >= 0 else 'now-15m'
+
     def _get_grafana_url(self, from_time: str = 'now-15m', to_time: str = 'now', dashboard_path: Optional[str] = None) -> str:
         """
         Generate Grafana dashboard URL with the correct parameters for each dashboard type.
@@ -807,10 +823,21 @@ spec:
         # Track end time for Grafana links
         self.test_end_time = datetime.now()
 
-        # Generate HTML report
+        # Generate HTML report using existing report generator
         self.console.print("\n[bold cyan]Generating test report...[/bold cyan]")
-        report_file = self.generate_html_report(test_plan, results_dir)
-        self.console.print(f"[bold green]✓ Report generated:[/bold green] {report_file}\n")
+
+        from report_generator import ReportGenerator
+        report_gen = ReportGenerator(self.experiment_dir, self.experiment_id)
+
+        # Generate full report package
+        report_dir = report_gen.create_report_package(
+            results_files=list(results_dir.glob("*.json")),
+            cost_data=None,  # No cost data for test runs (only for full experiments)
+            config={'test_plan': test_plan},
+            include_raw_data=True
+        )
+
+        self.console.print(f"[bold green]✓ Report generated:[/bold green] {report_dir}\n")
 
         # Cleanup any leftover resources in namespace
         self.k8s_manager.cleanup_namespace()
@@ -835,269 +862,6 @@ spec:
             workload['producerRate'] = overrides['producer_rate']
 
         return workload
-
-    def generate_html_report(self, test_plan: Dict, results_dir: Path) -> Path:
-        """
-        Generate comprehensive HTML report with test results and Grafana links.
-
-        Args:
-            test_plan: Test plan configuration
-            results_dir: Directory containing test result files
-
-        Returns:
-            Path to generated HTML report
-        """
-        report_file = self.experiment_dir / "test_report.html"
-
-        # Collect all result files
-        log_files = list(results_dir.glob("*.log"))
-        json_files = list(results_dir.glob("*.json"))
-
-        # Build HTML
-        html_content = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OMB Test Report - {self.experiment_id}</title>
-    <style>
-        body {{
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 20px;
-            background: #f5f5f5;
-        }}
-        h1 {{
-            color: #2c3e50;
-            border-bottom: 3px solid #3498db;
-            padding-bottom: 10px;
-        }}
-        h2 {{
-            color: #34495e;
-            margin-top: 30px;
-            border-left: 4px solid #3498db;
-            padding-left: 15px;
-        }}
-        .metadata {{
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-        }}
-        .metadata table {{
-            width: 100%;
-            border-collapse: collapse;
-        }}
-        .metadata td {{
-            padding: 8px;
-            border-bottom: 1px solid #ecf0f1;
-        }}
-        .metadata td:first-child {{
-            font-weight: bold;
-            color: #7f8c8d;
-            width: 200px;
-        }}
-        .grafana-link {{
-            display: inline-block;
-            background: #e74c3c;
-            color: white;
-            padding: 12px 24px;
-            text-decoration: none;
-            border-radius: 5px;
-            font-weight: bold;
-            margin: 10px 10px 10px 0;
-        }}
-        .grafana-link:hover {{
-            background: #c0392b;
-        }}
-        .test-results {{
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-        }}
-        .test-card {{
-            background: #ecf0f1;
-            padding: 15px;
-            border-radius: 5px;
-            margin: 10px 0;
-            border-left: 4px solid #27ae60;
-        }}
-        .test-card.failed {{
-            border-left-color: #e74c3c;
-        }}
-        .log-viewer {{
-            background: #2c3e50;
-            color: #ecf0f1;
-            padding: 15px;
-            border-radius: 5px;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            max-height: 400px;
-            overflow-y: auto;
-            white-space: pre-wrap;
-            word-wrap: break-word;
-        }}
-        .status-badge {{
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: bold;
-        }}
-        .status-success {{
-            background: #27ae60;
-            color: white;
-        }}
-        .status-failed {{
-            background: #e74c3c;
-            color: white;
-        }}
-        code {{
-            background: #ecf0f1;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-family: 'Courier New', monospace;
-        }}
-    </style>
-</head>
-<body>
-    <h1>OpenMessaging Benchmark Test Report</h1>
-
-    <div class="metadata">
-        <h2>Experiment Information</h2>
-        <table>
-            <tr>
-                <td>Experiment ID</td>
-                <td><code>{self.experiment_id}</code></td>
-            </tr>
-            <tr>
-                <td>Test Plan</td>
-                <td>{test_plan.get('name', 'N/A')}</td>
-            </tr>
-            <tr>
-                <td>Description</td>
-                <td>{test_plan.get('description', 'N/A')}</td>
-            </tr>
-            <tr>
-                <td>K8s Namespace (OMB)</td>
-                <td><code>{self.namespace}</code></td>
-            </tr>
-            <tr>
-                <td>K8s Namespace (Pulsar)</td>
-                <td><code>pulsar</code></td>
-            </tr>
-            <tr>
-                <td>Pulsar Tenant/Namespace</td>
-                <td><code>{self.pulsar_tenant_namespace}</code></td>
-            </tr>
-            <tr>
-                <td>Pulsar Service URL</td>
-                <td><code>{self.pulsar_service_url}</code></td>
-            </tr>
-            <tr>
-                <td>Results Directory</td>
-                <td><code>{self.experiment_dir}</code></td>
-            </tr>
-            <tr>
-                <td>Generated</td>
-                <td>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</td>
-            </tr>
-        </table>
-    </div>
-
-    <div class="metadata">
-        <h2>Monitoring & Dashboards</h2>
-        <p>View test metrics in Grafana (VPN required):</p>
-"""
-
-        # Generate time range for dashboards (5 min before start to 5 min after end)
-        if self.test_start_time and self.test_end_time:
-            from_timestamp = int((self.test_start_time.timestamp() - 300) * 1000)  # -5 min in ms
-            to_timestamp = int((self.test_end_time.timestamp() + 300) * 1000)      # +5 min in ms
-            from_time = str(from_timestamp)
-            to_time = str(to_timestamp)
-        else:
-            from_time = 'now-15m'
-            to_time = 'now'
-
-        # Generate dashboard links with test time range
-        messaging_url = self._get_grafana_url(from_time, to_time, "/d/EetmjdhnA/pulsar-messaging")
-        jvm_url = self._get_grafana_url(from_time, to_time, "/d/ystagDCsB/pulsar-jvm")
-        proxy_url = self._get_grafana_url(from_time, to_time, "/d/vgnAupsuh/pulsar-proxy")
-
-        html_content += f"""
-        <a href="{messaging_url}" target="_blank" class="grafana-link">Pulsar Messaging</a>
-        <a href="{jvm_url}" target="_blank" class="grafana-link">JVM Metrics</a>
-        <a href="{proxy_url}" target="_blank" class="grafana-link">Proxy Metrics</a>
-        <p style="color: #7f8c8d; font-size: 14px; margin-top: 10px;">
-            Namespace: <strong>{self.pulsar_tenant_namespace.replace('public/', '')}</strong><br>
-            Time range: Test execution ± 5 minutes
-        </p>
-    </div>
-
-    <div class="test-results">
-        <h2>Test Results</h2>
-        <p>Total tests executed: {len(test_plan.get('test_runs', []))}</p>
-        <p>Log files found: {len(log_files)}</p>
-        <p>JSON results found: {len(json_files)}</p>
-"""
-
-        # Add test cards for each test
-        for test_run in test_plan.get('test_runs', []):
-            test_name = test_run['name']
-            log_file = results_dir / f"{test_name}.log"
-            json_file = results_dir / f"{test_name}.json"
-
-            has_log = log_file.exists()
-            has_json = json_file.exists()
-            status = "success" if (has_log or has_json) else "failed"
-
-            html_content += f"""
-        <div class="test-card {status}">
-            <h3>{test_name} <span class="status-badge status-{status}">{'COMPLETED' if status == 'success' else 'NO RESULTS'}</span></h3>
-            <p><strong>Type:</strong> {test_run.get('type', 'N/A')}</p>
-            <p><strong>Description:</strong> {test_run.get('description', 'N/A')}</p>
-"""
-
-            if has_log:
-                with open(log_file, 'r') as f:
-                    log_content = f.read()
-                    # Truncate if too long
-                    if len(log_content) > 5000:
-                        log_content = log_content[:5000] + f"\n\n... (truncated, full log: {log_file}) ..."
-
-                html_content += f"""
-            <h4>Test Logs</h4>
-            <div class="log-viewer">{log_content if log_content else 'No log content'}</div>
-"""
-
-            if has_json:
-                html_content += f"""
-            <p style="margin-top: 10px;">
-                <strong>JSON Results:</strong> <code>{json_file}</code>
-            </p>
-"""
-
-            html_content += """
-        </div>
-"""
-
-        html_content += """
-    </div>
-</body>
-</html>
-"""
-
-        # Write report
-        with open(report_file, 'w') as f:
-            f.write(html_content)
-
-        logger.info(f"HTML report generated: {report_file}")
-        return report_file
 
 
     def generate_report(self) -> None:

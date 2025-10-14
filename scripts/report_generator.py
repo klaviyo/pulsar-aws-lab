@@ -22,10 +22,16 @@ TEMPLATE_DIR = Path(__file__).parent.parent / "reporting" / "templates"
 class ReportGenerator:
     """Generate comprehensive experiment reports"""
 
-    def __init__(self, experiment_dir: Path):
+    def __init__(self, experiment_dir: Path, experiment_id: Optional[str] = None):
         """Initialize report generator"""
         self.experiment_dir = experiment_dir
-        self.env = Environment(loader=FileSystemLoader(str(TEMPLATE_DIR)))
+        self.experiment_id = experiment_id or experiment_dir.name
+        # Only load Jinja2 templates if template directory exists
+        if TEMPLATE_DIR.exists():
+            self.env = Environment(loader=FileSystemLoader(str(TEMPLATE_DIR)))
+        else:
+            self.env = None
+            logger.warning(f"Template directory not found: {TEMPLATE_DIR}")
 
     def load_benchmark_results(self, results_file: Path) -> Dict:
         """Load benchmark results from JSON file"""
@@ -121,7 +127,10 @@ class ReportGenerator:
         cost_data: Optional[Dict] = None,
         config: Optional[Dict] = None
     ) -> str:
-        """Generate HTML report"""
+        """Generate HTML report using Jinja2 templates"""
+        if not self.env:
+            raise RuntimeError("Jinja2 templates not available")
+
         logger.info("Generating HTML report")
 
         # Calculate summary stats
