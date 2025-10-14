@@ -1059,7 +1059,7 @@ spec:
                     self._add_status("Collecting test results...", 'info')
                     live.update(self._create_layout())
                     logger.info(f"Collecting results for {test_name}...")
-                    results = self._collect_job_results_immediately(test_name)
+                    results = self._collect_job_logs(test_name, success=True)
 
                     if results:
                         self._add_status(f"✓ Results collected ({len(results)} bytes)", 'success')
@@ -1268,55 +1268,6 @@ spec:
         emptyDir: {{}}
 """
 
-    def _collect_job_results_immediately(self, test_name: str) -> str:
-        """
-        Collect results from OMB Job pod immediately after Job succeeds.
-        Uses kubectl exec to cat the results file while pod is still accessible.
-
-        Returns:
-            JSON results as string
-        """
-        # Get Job pod name
-        result = self.run_command(
-            ["kubectl", "get", "pods", "-n", self.namespace,
-             "-l", f"job-name=omb-{test_name}",
-             "-o", "jsonpath={{.items[0].metadata.name}}"],
-            f"Get Job pod for {test_name}",
-            capture_output=True,
-            check=False
-        )
-
-        pod_name = result.stdout.strip()
-        if not pod_name:
-            logger.warning(f"Could not find pod for Job {test_name}")
-            return ""
-
-        logger.info(f"Found pod: {pod_name}, collecting results immediately")
-
-        results_dir = self.experiment_dir / "benchmark_results"
-        results_dir.mkdir(exist_ok=True)
-        result_file = results_dir / f"{test_name}.json"
-
-        # Use kubectl exec to cat the results file (works even when pod is completing)
-        result = self.run_command(
-            ["kubectl", "exec", pod_name, "-n", self.namespace, "--",
-             "cat", f"/results/{self.experiment_id}/{test_name}.json"],
-            f"Get results from {pod_name}",
-            capture_output=True,
-            check=False
-        )
-
-        if result.returncode == 0 and result.stdout.strip():
-            json_data = result.stdout.strip()
-            # Save to file
-            with open(result_file, 'w') as f:
-                f.write(json_data)
-            logger.info(f"Results saved to: {result_file} ({len(json_data)} bytes)")
-            return json_data
-        else:
-            logger.warning(f"Failed to get results from pod: {result.stderr}")
-            return ""
-
     def _collect_job_logs(self, test_name: str, success: bool) -> str:
         """
         Collect logs and results from OMB Job pod.
@@ -1346,70 +1297,67 @@ spec:
 
         logger.info(f"Found pod: {pod_name}")
 
-        # Wait for pod to be in a terminal state (Succeeded or Failed)
-        for attempt in range(10):
-            result = self.run_command(
-                ["kubectl", "get", "pod", pod_name, "-n", self.namespace,
-                 "-o", "jsonpath={.status.phase}"],
-                f"Check pod {pod_name} phase",
-                capture_output=True,
-                check=False
-            )
-            phase = result.stdout.strip()
-            logger.info(f"Pod phase: {phase}")
+        # Don't wait for terminal state - Job is already complete, and pod has 30s sleep window
+        # We want to collect results during that window while pod is still Running
 
-            if phase in ["Succeeded", "Failed"]:
-                break
-
-            logger.info(f"Waiting for pod to reach terminal state (currently {phase})...")
-            time.sleep(2)
-
-        # Get pod logs
-        result = self.run_command(
+        # Always get and save pod logs for debugging
+        log_result = self.run_command(
             ["kubectl", "logs", pod_name, "-n", self.namespace],
             f"Get logs for {test_name}",
             capture_output=True,
             check=False
         )
+        logs = log_result.stdout
 
-        logs = result.stdout
-
-        # Save logs to file
         log_file = self.experiment_dir / f"omb_{test_name}_{'success' if success else 'failed'}.log"
         with open(log_file, 'w') as f:
             f.write(logs)
-
         logger.info(f"Logs saved to: {log_file}")
 
-        # Copy JSON results from pod if test succeeded (pod should still exist since we collect before cleanup)
+        # Copy JSON results from pod if test succeeded
         json_data = ""
         if success:
             results_dir = self.experiment_dir / "benchmark_results"
             results_dir.mkdir(exist_ok=True)
 
             result_file = results_dir / f"{test_name}.json"
+            source_path = f"/results/{self.experiment_id}/{test_name}.json"
 
-            # Try kubectl cp first (fastest and most reliable)
-            logger.info(f"Attempting to copy results from pod {pod_name}...")
-            result = self.run_command(
-                ["kubectl", "cp",
-                 f"{self.namespace}/{pod_name}:/results/result.json",
-                 str(result_file)],
+            # Try kubectl cp first (during the 30-second sleep window, pod is still Running)
+            logger.info(f"Attempting to copy results file:")
+            logger.info(f"  Pod: {pod_name}")
+            logger.info(f"  Source path: {source_path}")
+            logger.info(f"  Destination: {result_file}")
+
+            cp_result = self.run_command(
+                ["kubectl", "cp", f"{self.namespace}/{pod_name}:{source_path}", str(result_file)],
                 f"Copy results for {test_name}",
                 check=False,
                 capture_output=True
             )
 
-            if result.returncode == 0 and result_file.exists() and result_file.stat().st_size > 0:
-                logger.info(f"Results copied successfully to: {result_file}")
+            logger.info(f"kubectl cp result:")
+            logger.info(f"  Return code: {cp_result.returncode}")
+            if cp_result.stdout:
+                logger.info(f"  Stdout: {cp_result.stdout}")
+            if cp_result.stderr:
+                logger.info(f"  Stderr: {cp_result.stderr}")
+            logger.info(f"  File exists after copy: {result_file.exists()}")
+            if result_file.exists():
+                logger.info(f"  File size: {result_file.stat().st_size} bytes")
+
+            if cp_result.returncode == 0 and result_file.exists() and result_file.stat().st_size > 0:
+                logger.info(f"✓ Results copied successfully via kubectl cp")
                 with open(result_file, 'r') as f:
                     json_data = f.read()
             else:
-                # Fallback: extract JSON from logs (OMB cats the file to stdout)
-                logger.warning(f"kubectl cp failed ({result.stderr}), extracting from logs instead...")
+                # Fallback: extract from logs if kubectl cp failed
+                logger.warning(f"kubectl cp failed, falling back to log extraction...")
+
                 try:
                     # Find JSON in logs - it starts with { and OMB prints it after the cat command
-                    json_start = logs.rfind('Results saved to /results/result.json')
+                    # Look for "Results saved to" marker (path varies by experiment/test)
+                    json_start = logs.rfind('Results saved to ')
                     if json_start != -1:
                         remaining = logs[json_start:]
                         brace_start = remaining.find('{')
@@ -1426,7 +1374,7 @@ spec:
                                 # Save to file
                                 with open(result_file, 'w') as f:
                                     f.write(json_data)
-                                logger.info(f"Extracted {len(json_data)} bytes of JSON from logs to: {result_file}")
+                                logger.info(f"✓ Extracted {len(json_data)} bytes of JSON from logs to: {result_file}")
                             else:
                                 logger.warning("Could not find closing brace in JSON output")
                         else:
@@ -1967,6 +1915,164 @@ spec:
         return experiment_id
 
     @staticmethod
+    def cleanup_pulsar_namespaces(pattern: str = "omb-test-*", dry_run: bool = False) -> None:
+        """
+        Clean up Pulsar namespaces matching a pattern.
+
+        Args:
+            pattern: Glob pattern for namespace names to delete (default: omb-test-*)
+            dry_run: If True, only list namespaces without deleting
+        """
+        print(f"\nLooking for Pulsar namespaces matching: public/{pattern}")
+        print("=" * 60)
+
+        # List all namespaces in public tenant
+        result = subprocess.run(
+            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+             "bin/pulsar-admin", "namespaces", "list", "public"],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+
+        if result.returncode != 0:
+            print(f"Error listing namespaces: {result.stderr}")
+            return
+
+        # Parse namespace list
+        lines = result.stdout.strip().split('\n')
+        namespaces = []
+        for line in lines:
+            line = line.strip()
+            if line and line.startswith('public/') and 'Defaulted container' not in line:
+                namespace_name = line.split('/')[-1]
+                # Match pattern (simple glob: omb-test-* matches omb-test-anything)
+                if pattern.endswith('*'):
+                    prefix = pattern[:-1]
+                    if namespace_name.startswith(prefix):
+                        namespaces.append(line)
+                elif namespace_name == pattern:
+                    namespaces.append(line)
+
+        if not namespaces:
+            print(f"No namespaces found matching pattern: {pattern}")
+            return
+
+        print(f"Found {len(namespaces)} namespace(s) to {'delete' if not dry_run else 'list'}:\n")
+        for ns in namespaces:
+            print(f"  - {ns}")
+
+        if dry_run:
+            print("\n[DRY RUN] No changes made. Run without --dry-run to delete.")
+            return
+
+        print(f"\n{'='*60}")
+        confirm = input(f"Delete {len(namespaces)} namespace(s)? (yes/no): ")
+        if confirm.lower() != 'yes':
+            print("Cancelled.")
+            return
+
+        print("\nDeleting namespaces...")
+        deleted = 0
+        failed = 0
+
+        for ns in namespaces:
+            print(f"\nProcessing {ns}...")
+
+            total_deleted = 0
+            total_failed = 0
+
+            # First, delete regular (non-partitioned) topics
+            topic_result = subprocess.run(
+                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+                 "bin/pulsar-admin", "topics", "list", ns],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+
+            if topic_result.returncode == 0:
+                # Filter out non-topic lines (like "Defaulted container...")
+                topics = [t.strip() for t in topic_result.stdout.strip().split('\n')
+                         if t.strip() and t.strip().startswith('persistent://')]
+
+                if topics:
+                    print(f"  Found {len(topics)} regular topic(s), deleting...")
+                    for topic in topics:
+                        delete_result = subprocess.run(
+                            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+                             "bin/pulsar-admin", "topics", "delete", topic, "-f"],
+                            capture_output=True,
+                            text=True,
+                            check=False
+                        )
+
+                        if delete_result.returncode == 0:
+                            total_deleted += 1
+                        else:
+                            total_failed += 1
+                            print(f"    ✗ Failed to delete topic {topic}: {delete_result.stderr.strip()}")
+
+            # Second, delete partitioned topics (they don't show up in regular topics list)
+            partitioned_result = subprocess.run(
+                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+                 "bin/pulsar-admin", "topics", "list-partitioned-topics", ns],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+
+            if partitioned_result.returncode == 0:
+                partitioned_topics = [t.strip() for t in partitioned_result.stdout.strip().split('\n')
+                                     if t.strip() and t.strip().startswith('persistent://')]
+
+                if partitioned_topics:
+                    print(f"  Found {len(partitioned_topics)} partitioned topic(s), deleting...")
+                    for topic in partitioned_topics:
+                        delete_result = subprocess.run(
+                            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+                             "bin/pulsar-admin", "topics", "delete-partitioned-topic", topic, "-f"],
+                            capture_output=True,
+                            text=True,
+                            check=False
+                        )
+
+                        if delete_result.returncode == 0:
+                            total_deleted += 1
+                        else:
+                            total_failed += 1
+                            print(f"    ✗ Failed to delete partitioned topic {topic}: {delete_result.stderr.strip()}")
+
+            if total_deleted > 0 or total_failed > 0:
+                print(f"  Total topics: {total_deleted} deleted, {total_failed} failed")
+            else:
+                print(f"  No topics found in {ns}")
+
+            # Now delete the namespace
+            result = subprocess.run(
+                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+                 "bin/pulsar-admin", "namespaces", "delete", ns],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+
+            if result.returncode == 0:
+                print(f"  ✓ Namespace deleted: {ns}")
+                deleted += 1
+            else:
+                error_msg = result.stderr.strip()
+                # Filter out "Defaulted container" warnings
+                error_lines = [line for line in error_msg.split('\n')
+                              if 'Defaulted container' not in line]
+                clean_error = '\n'.join(error_lines).strip()
+                print(f"  ✗ Failed to delete namespace {ns}: {clean_error}")
+                failed += 1
+
+        print(f"\n{'='*60}")
+        print(f"Summary: {deleted} deleted, {failed} failed")
+
+    @staticmethod
     def list_experiments() -> None:
         """List all experiments with timestamps"""
         if not RESULTS_DIR.exists():
@@ -2024,6 +2130,11 @@ def main():
     cleanup_workers_parser = subparsers.add_parser("cleanup-workers", help="Delete persistent worker pods")
     cleanup_workers_parser.add_argument("--namespace", default="omb", help="Kubernetes namespace (default: omb)")
 
+    # Cleanup Pulsar namespaces command
+    cleanup_pulsar_parser = subparsers.add_parser("cleanup-pulsar", help="Delete Pulsar namespaces matching a pattern")
+    cleanup_pulsar_parser.add_argument("--pattern", default="omb-test-*", help="Namespace pattern to match (default: omb-test-*)")
+    cleanup_pulsar_parser.add_argument("--dry-run", action="store_true", help="List namespaces without deleting")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -2043,6 +2154,11 @@ def main():
             worker_manager = WorkerManager(namespace=namespace, omb_image="", results_dir=Path("/tmp"))
             worker_manager.cleanup_workers()
             print(f"✓ Workers cleaned up in namespace '{namespace}'")
+            return
+
+        # Handle cleanup-pulsar command (doesn't need experiment ID)
+        if args.command == "cleanup-pulsar":
+            Orchestrator.cleanup_pulsar_namespaces(pattern=args.pattern, dry_run=args.dry_run)
             return
 
         # Resolve experiment ID
