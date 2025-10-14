@@ -947,15 +947,25 @@ spec:
         # Wait for Job completion or failure
         self._add_status(f"Running benchmark test (this may take several minutes)...", 'info')
         live.update(self._create_layout())
-        logger.info(f"Waiting for test {test_name} to complete...")
+        # Calculate expected test duration from workload config
+        warmup_minutes = workload_config.get('warmupDurationMinutes', 1)
+        test_minutes = workload_config.get('testDurationMinutes', 5)
+        expected_duration_seconds = (warmup_minutes + test_minutes) * 60
+        # When to start checking for the sleep message (test should be done)
+        check_sleep_after = expected_duration_seconds - 10  # Start checking 10s before expected completion
+
+        logger.info(f"Expected test duration: ~{warmup_minutes + test_minutes} minutes (warmup: {warmup_minutes}m, test: {test_minutes}m)")
+        logger.info(f"Will start polling for sleep message after {check_sleep_after}s")
 
         # Poll Job status until complete or failed
-        timeout_seconds = 30 * 60  # 30 minutes
+        timeout_seconds = expected_duration_seconds + (10 * 60)  # Expected duration + 10min buffer
         start_time = time.time()
-        poll_interval = 10  # seconds
+        poll_interval = 10  # Check Job status every 10 seconds
+        log_poll_interval = 5  # Check logs more frequently when near completion
 
         job_succeeded = False
         job_failed = False
+        results_collected = False
 
         while time.time() - start_time < timeout_seconds:
             result = self.run_command(
@@ -980,23 +990,24 @@ spec:
                     live.update(self._create_layout())
                     logger.info(f"✓ Job {test_name} completed successfully (succeeded: {succeeded_count})")
 
-                    # Collect results immediately while pod is still accessible
-                    # (don't wait for pod to fully terminate)
-                    self._add_status("Collecting test results...", 'info')
-                    live.update(self._create_layout())
-                    logger.info(f"Collecting results for {test_name}...")
-                    results = self._collect_job_logs(test_name, success=True)
-
-                    if results:
-                        self._add_status(f"✓ Results collected ({len(results)} bytes)", 'success')
-                        self.test_results = results  # Store for later use
+                    # Results already collected during sleep window
+                    if results_collected:
+                        logger.info(f"Results already collected during sleep window")
                     else:
-                        self._add_status("⚠ No results data collected", 'warning')
-                        self.test_results = ""
-                    live.update(self._create_layout())
+                        # Fallback: collect now if we somehow missed the sleep window
+                        self._add_status("Collecting test results...", 'info')
+                        live.update(self._create_layout())
+                        logger.info(f"Collecting results for {test_name}...")
+                        results = self._collect_job_logs(test_name, success=True)
 
-                    # Now can safely wait for pod to terminate
-                    time.sleep(2)
+                        if results:
+                            self._add_status(f"✓ Results collected ({len(results)} bytes)", 'success')
+                            self.test_results = results
+                        else:
+                            self._add_status("⚠ No results data collected", 'warning')
+                            self.test_results = ""
+                        live.update(self._create_layout())
+
                     break
                 elif failed_count > 0:
                     job_failed = True
@@ -1007,15 +1018,61 @@ spec:
                     time.sleep(2)
                     break
 
-                # Still running - log progress
+                # Still running - check if we should start polling for sleep message
                 elapsed = int(time.time() - start_time)
+
+                # If we're near expected completion and haven't collected results yet, poll logs for sleep message
+                if elapsed >= check_sleep_after and not results_collected and active_count > 0:
+                    # Check pod logs for the sleep message
+                    pod_name_result = self.run_command(
+                        ["kubectl", "get", "pods", "-n", self.namespace,
+                         "-l", f"job-name=omb-{test_name}",
+                         "-o", "jsonpath={.items[0].metadata.name}"],
+                        f"Get pod name for {test_name}",
+                        capture_output=True,
+                        check=False
+                    )
+
+                    if pod_name_result.returncode == 0 and pod_name_result.stdout.strip():
+                        pod_name = pod_name_result.stdout.strip()
+                        # Get last 20 lines of logs to check for sleep message
+                        log_result = self.run_command(
+                            ["kubectl", "logs", pod_name, "-n", self.namespace, "--tail=20"],
+                            f"Check logs for sleep message",
+                            capture_output=True,
+                            check=False
+                        )
+
+                        if log_result.returncode == 0 and "Sleeping 30 seconds to allow results collection" in log_result.stdout:
+                            # Sleep message detected! Pod is in the collection window
+                            logger.info(f"✓ Detected sleep message in logs - collecting results during 30s window")
+                            self._add_status("Collecting test results (during sleep window)...", 'info')
+                            live.update(self._create_layout())
+
+                            results = self._collect_job_logs(test_name, success=True)
+
+                            if results:
+                                self._add_status(f"✓ Results collected ({len(results)} bytes)", 'success')
+                                self.test_results = results
+                                results_collected = True
+                                logger.info(f"✓ Results collected successfully during sleep window")
+                            else:
+                                logger.warning(f"Failed to collect results during sleep window")
+
+                            live.update(self._create_layout())
+
+                # Log progress
                 minutes = elapsed // 60
                 seconds = elapsed % 60
                 self._add_status(f"Test running... ({minutes}m {seconds}s elapsed)", 'info')
                 live.update(self._create_layout())
                 logger.info(f"Job {test_name} still running... ({elapsed}s elapsed, active: {active_count}, succeeded: {succeeded_count}, failed: {failed_count})")
 
-            time.sleep(poll_interval)
+            # Use shorter poll interval when checking for sleep message
+            if elapsed >= check_sleep_after and not results_collected:
+                time.sleep(log_poll_interval)
+            else:
+                time.sleep(poll_interval)
 
         if not (job_succeeded or job_failed):
             logger.error(f"Timeout waiting for Job {test_name} after {timeout_seconds}s")
