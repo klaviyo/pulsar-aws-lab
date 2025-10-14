@@ -428,13 +428,15 @@ class Orchestrator:
             self._add_status("⚠ Job pod not running yet, may not detect namespace", 'warning')
             live.update(self._create_layout())
         else:
-            # Wait additional time for OMB to initialize and create topics
-            self._add_status("Job running, waiting for namespace creation...", 'info')
+            # Wait additional time for OMB workers to initialize and create namespace
+            self._add_status("Job running, waiting for worker initialization and namespace creation...", 'info')
             live.update(self._create_layout())
-            time.sleep(15)  # OMB needs time to initialize and create namespace
+            # OMB workers need time to initialize PulsarBenchmarkDriver and create namespace
+            # The driver logs "Created Pulsar namespace" during initialization on worker pods
+            time.sleep(30)  # Increased from 15s to allow workers to fully initialize
 
-        # Try to get namespace from Job logs (OMB prints namespace when creating topics)
-        self._add_status("Detecting Pulsar namespace from Job logs...", 'info')
+        # Try to get namespace from worker pod logs (OMB logs namespace during driver initialization)
+        self._add_status("Detecting Pulsar namespace from worker pod logs...", 'info')
         live.update(self._create_layout())
 
         detected_ns = self.pulsar_manager.detect_pulsar_namespace_from_logs(test_name, self.namespace)
