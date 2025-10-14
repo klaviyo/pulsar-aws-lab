@@ -16,13 +16,10 @@ from typing import Dict, List, Optional
 
 import boto3
 import yaml
-from rich.console import Console
-from rich.layout import Layout
 from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
-from rich import box
+
+from tui import OrchestratorUI
+from operations import cleanup_pulsar_namespaces, cleanup_pulsar_topics
 
 # Import OMB worker manager
 from omb.workers import WorkerManager
@@ -76,16 +73,33 @@ class Orchestrator:
         self.pulsar_service_url = PULSAR_SERVICE_URL
         self.pulsar_http_url = PULSAR_HTTP_URL
         self.omb_image = omb_image or DEFAULT_OMB_IMAGE
-
-        # Rich console for UI
-        self.console = Console()
-        self.status_messages = []  # Track status updates
-        self.current_test = None
         self.pulsar_tenant_namespace = PULSAR_TEST_NAMESPACE  # Will be updated with actual namespace after detection
+
+        # Initialize TUI
+        self.ui = OrchestratorUI(
+            experiment_id=self.experiment_id,
+            namespace=self.namespace,
+            pulsar_tenant_namespace=self.pulsar_tenant_namespace
+        )
 
         # Track test run times for Grafana links
         self.test_start_time = None
         self.test_end_time = None
+
+    @property
+    def console(self):
+        """Delegate console access to UI."""
+        return self.ui.console
+
+    @property
+    def current_test(self):
+        """Delegate current_test access to UI."""
+        return self.ui.current_test
+
+    @current_test.setter
+    def current_test(self, value):
+        """Delegate current_test setter to UI."""
+        self.ui.set_current_test(value)
 
         # Store test results from immediate collection
         self.test_results = ""
@@ -136,102 +150,15 @@ class Orchestrator:
         self.console.print(Panel(table, title="[bold cyan]Experiment Configuration[/bold cyan]", border_style="cyan"))
         self.console.print()
 
-    def _create_metadata_panel(self) -> Panel:
-        """Create static metadata panel for left side"""
-        # Experiment info
-        exp_table = Table(show_header=False, box=None, padding=(0, 1))
-        exp_table.add_column("Key", style="bold cyan", width=18)
-        exp_table.add_column("Value", style="white")
-
-        exp_table.add_row("Experiment ID", self.experiment_id)
-        exp_table.add_row("K8s Namespace", self.namespace)
-        exp_table.add_row("Pulsar K8s NS", "pulsar")
-        exp_table.add_row("Pulsar Tenant/NS", self.pulsar_tenant_namespace)
-
-        # Test info
-        if self.current_test:
-            test_table = Table(show_header=False, box=None, padding=(0, 1), title="[bold yellow]Current Test[/bold yellow]", title_justify="left")
-            test_table.add_column("Key", style="bold yellow", width=18)
-            test_table.add_column("Value", style="white")
-
-            test_table.add_row("Test Name", self.current_test.get('name', 'N/A'))
-            test_table.add_row("Workers", str(self.current_test.get('workers', 'N/A')))
-            test_table.add_row("Type", self.current_test.get('type', 'N/A'))
-
-            content = Table.grid()
-            content.add_row(exp_table)
-            content.add_row("")
-            content.add_row(test_table)
-        else:
-            content = exp_table
-
-        # Monitoring info with Grafana link
-        monitor_text = Text()
-        monitor_text.append("\n\nMonitoring:\n", style="bold green")
-        grafana_url = self._get_grafana_url()
-        monitor_text.append(f"{grafana_url}\n", style="blue underline")
-
-        final_content = Table.grid()
-        final_content.add_row(content)
-        final_content.add_row(monitor_text)
-
-        return Panel(
-            final_content,
-            title="[bold cyan]Experiment Info[/bold cyan]",
-            border_style="cyan",
-            padding=(1, 2)
-        )
-
-    def _create_status_panel(self) -> Panel:
-        """Create live status panel for right side"""
-        if not self.status_messages:
-            content = Text("Waiting for test to start...", style="dim italic")
-        else:
-            # Show last 20 status messages
-            content = Text()
-            for msg in self.status_messages[-20:]:
-                timestamp = msg.get('time', '')
-                message = msg.get('message', '')
-                level = msg.get('level', 'info')
-
-                style_map = {
-                    'info': 'white',
-                    'success': 'green',
-                    'warning': 'yellow',
-                    'error': 'red'
-                }
-                style = style_map.get(level, 'white')
-
-                content.append(f"[dim]{timestamp}[/dim] ", style="dim")
-                content.append(f"{message}\n", style=style)
-
-        return Panel(
-            content,
-            title="[bold green]Status Log[/bold green]",
-            border_style="green",
-            padding=(1, 2)
-        )
-
     def _add_status(self, message: str, level: str = 'info') -> None:
-        """Add a status message to the log"""
-        self.status_messages.append({
-            'time': datetime.now().strftime('%H:%M:%S'),
-            'message': message,
-            'level': level
-        })
+        """Add a status message (delegates to UI)."""
+        self.ui.add_status(message, level)
 
-    def _create_layout(self) -> Layout:
-        """Create the split-pane layout (horizontal split: metadata on top, status on bottom)"""
-        layout = Layout()
-        layout.split_column(
-            Layout(name="top", ratio=1),
-            Layout(name="bottom", ratio=2)
-        )
-
-        layout["top"].update(self._create_metadata_panel())
-        layout["bottom"].update(self._create_status_panel())
-
-        return layout
+    def _create_layout(self):
+        """Create the UI layout (delegates to UI)."""
+        # Update UI with latest test info and Grafana URL
+        self.ui.set_grafana_url(self._get_grafana_url())
+        return self.ui.create_layout()
 
     def _ensure_namespace_exists(self) -> None:
         """Ensure the K8s OMB namespace exists, create it if not."""
@@ -1913,8 +1840,9 @@ spec:
             return latest_link.resolve().name
         return experiment_id
 
+    # Cleanup method removed - now in operations.py
     @staticmethod
-    def cleanup_pulsar_namespaces(pattern: str = "omb-test-*", dry_run: bool = False) -> None:
+    def cleanup_pulsar_namespaces_deprecated(pattern: str = "omb-test-*", dry_run: bool = False) -> None:
         """
         Clean up Pulsar namespaces matching a pattern.
 
@@ -2128,7 +2056,7 @@ def main():
 
         # Handle cleanup-pulsar command (doesn't need experiment ID)
         if args.command == "cleanup-pulsar":
-            Orchestrator.cleanup_pulsar_namespaces(pattern=args.pattern, dry_run=args.dry_run)
+            cleanup_pulsar_namespaces(pattern=args.pattern, dry_run=args.dry_run)
             return
 
         # Resolve experiment ID
