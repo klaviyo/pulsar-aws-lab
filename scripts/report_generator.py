@@ -13,6 +13,14 @@ from typing import Dict, List, Optional
 import pandas as pd
 from jinja2 import Environment, FileSystemLoader
 
+# Import chart generation module
+try:
+    from omb_charts import generate_all_charts
+    CHARTS_AVAILABLE = True
+except ImportError:
+    CHARTS_AVAILABLE = False
+    logging.warning("omb_charts module not available - chart generation disabled")
+
 logger = logging.getLogger(__name__)
 
 # Template directory
@@ -126,7 +134,9 @@ class ReportGenerator:
         self,
         metrics: Dict,
         cost_data: Optional[Dict] = None,
-        config: Optional[Dict] = None
+        config: Optional[Dict] = None,
+        charts: Optional[List[Path]] = None,
+        grafana_dashboards: Optional[Dict[str, str]] = None
     ) -> str:
         """Generate HTML report using Jinja2 templates"""
         if not self.env:
@@ -145,6 +155,8 @@ class ReportGenerator:
             'metrics': metrics,
             'cost_data': cost_data or {},
             'config': config or {},
+            'charts': charts or [],
+            'grafana_dashboards': grafana_dashboards or {},
         }
 
         # Render template
@@ -191,7 +203,8 @@ class ReportGenerator:
         results_files: List[Path],
         cost_data: Optional[Dict] = None,
         config: Optional[Dict] = None,
-        include_raw_data: bool = True
+        include_raw_data: bool = True,
+        grafana_dashboards: Optional[Dict[str, str]] = None
     ) -> Path:
         """
         Create complete offline report package
@@ -201,6 +214,7 @@ class ReportGenerator:
             cost_data: Cost tracking data
             config: Experiment configuration
             include_raw_data: Include raw benchmark data in package
+            grafana_dashboards: Dict of dashboard names to URLs
 
         Returns:
             Path to report package directory
@@ -234,8 +248,29 @@ class ReportGenerator:
                 import shutil
                 shutil.copy(results_file, raw_dir / results_file.name)
 
+        # Generate charts from results
+        charts = []
+        if CHARTS_AVAILABLE and results_files:
+            try:
+                charts_dir = report_dir / "charts"
+                logger.info(f"Generating charts from {len(results_files)} result file(s)...")
+                generated_charts = generate_all_charts(results_files, charts_dir)
+
+                # Convert absolute paths to relative paths for HTML embedding
+                charts = [chart.relative_to(report_dir) for chart in generated_charts]
+                logger.info(f"Generated {len(charts)} chart(s)")
+            except Exception as e:
+                logger.error(f"Chart generation failed: {e}")
+                charts = []
+
         # Generate HTML report
-        html_content = self.generate_html_report(all_metrics, cost_data, config)
+        html_content = self.generate_html_report(
+            all_metrics,
+            cost_data,
+            config,
+            charts=charts,
+            grafana_dashboards=grafana_dashboards
+        )
         html_file = report_dir / "index.html"
         with open(html_file, 'w') as f:
             f.write(html_content)

@@ -222,9 +222,45 @@ class PulsarManager:
             else:
                 logger.warning(f"  ✗ Failed to delete {topic_url.split('/')[-1]}: {result.stderr}")
 
-        logger.info(f"✓ Deleted {topics_deleted}/{len(topics)} topic(s)")
+        logger.info(f"✓ Deleted {topics_deleted}/{len(topics)} regular topic(s)")
+
+        # List and delete partitioned topics (they don't show up in regular topics list)
+        partitioned_result = self.run_command(
+            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+             "bin/pulsar-admin", "topics", "list-partitioned-topics", self.pulsar_tenant_namespace],
+            f"List partitioned topics in {self.pulsar_tenant_namespace}",
+            check=False,
+            capture_output=True
+        )
+
+        partitioned_deleted = 0
+        if partitioned_result.returncode == 0:
+            partitioned_topics = [line.strip() for line in partitioned_result.stdout.strip().split('\n')
+                                 if line.strip() and line.strip().startswith('persistent://')
+                                 and 'Defaulted container' not in line]
+
+            if partitioned_topics:
+                logger.info(f"Found {len(partitioned_topics)} partitioned topic(s) to delete")
+                for topic_url in partitioned_topics:
+                    result = self.run_command(
+                        ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+                         "bin/pulsar-admin", "topics", "delete-partitioned-topic", topic_url, "-f"],
+                        f"Delete partitioned topic {topic_url.split('/')[-1]}",
+                        check=False,
+                        capture_output=True
+                    )
+
+                    if result.returncode == 0:
+                        partitioned_deleted += 1
+                        logger.debug(f"  ✓ Deleted partitioned: {topic_url.split('/')[-1]}")
+                    else:
+                        logger.warning(f"  ✗ Failed to delete partitioned {topic_url.split('/')[-1]}: {result.stderr}")
+
+                logger.info(f"✓ Deleted {partitioned_deleted}/{len(partitioned_topics)} partitioned topic(s)")
+
+        total_deleted = topics_deleted + partitioned_deleted
         if live and self._add_status and self._create_layout:
-            self._add_status(f"✓ Cleaned up {topics_deleted}/{len(topics)} topics", 'success')
+            self._add_status(f"✓ Cleaned up {total_deleted} topic(s) ({topics_deleted} regular, {partitioned_deleted} partitioned)", 'success')
             live.update(self._create_layout())
 
         # Cleanup namespace

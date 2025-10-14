@@ -844,11 +844,22 @@ spec:
                 'experiment_id': self.experiment_id
             }
 
+            # Generate Grafana dashboard URLs with test execution time range
+            from_time = self._format_grafana_time(self.test_start_time, offset_seconds=-300)  # Start 5 minutes before
+            to_time = self._format_grafana_time(self.test_end_time, offset_seconds=300)  # End 5 minutes after
+
+            grafana_dashboards = {
+                'Pulsar Messaging': self._get_grafana_url(from_time, to_time, "/d/EetmjdhnA/pulsar-messaging"),
+                'JVM Metrics': self._get_grafana_url(from_time, to_time, "/d/ystagDCsB/pulsar-jvm"),
+                'Proxy Metrics': self._get_grafana_url(from_time, to_time, "/d/vgnAupsuh/pulsar-proxy")
+            }
+
             report_dir = report_gen.create_report_package(
                 results_files=result_files,
                 cost_data=None,  # No cost data for test runs (only for full experiments)
                 config=report_config,
-                include_raw_data=False  # Don't duplicate - files already in benchmark_results/
+                include_raw_data=False,  # Don't duplicate - files already in benchmark_results/
+                grafana_dashboards=grafana_dashboards
             )
             self.console.print(f"[bold green]✓ Report generated:[/bold green] {report_dir}\n")
             self.console.print(f"[dim]Raw results: {results_dir}[/dim]\n")
