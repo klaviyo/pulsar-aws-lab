@@ -17,6 +17,9 @@ from typing import Dict, List, Optional
 import boto3
 import yaml
 from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
 
 from tui import OrchestratorUI
 from operations import cleanup_pulsar_namespaces, cleanup_pulsar_topics
