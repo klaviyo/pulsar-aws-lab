@@ -83,6 +83,15 @@ class ResultsCollector:
             f.write(logs)
         logger.info(f"Logs saved to: {log_file}")
 
+        # Extract and save workload configuration
+        workload_config = self.extract_workload_config(logs)
+        if workload_config:
+            workload_file = self.experiment_dir / "benchmark_results" / f"{test_name}_workload.json"
+            workload_file.parent.mkdir(exist_ok=True)
+            with open(workload_file, 'w') as f:
+                json.dump(workload_config, f, indent=2)
+            logger.info(f"Workload config saved to: {workload_file}")
+
         # Copy JSON results if test succeeded
         json_data = ""
         if success:
@@ -167,6 +176,66 @@ class ResultsCollector:
             logger.warning(f"Error extracting JSON from logs: {e}")
 
         return ""
+
+    def extract_workload_config(self, logs: str) -> dict:
+        """
+        Extract workload configuration from pod logs.
+
+        Args:
+            logs: Pod log content
+
+        Returns:
+            Dictionary containing workload configuration or empty dict
+        """
+        try:
+            # Find "INFO Benchmark - Workloads:" marker
+            workload_marker = "INFO Benchmark - Workloads:"
+            marker_idx = logs.find(workload_marker)
+
+            if marker_idx == -1:
+                logger.warning("Could not find 'INFO Benchmark - Workloads:' marker in logs")
+                return {}
+
+            # Extract JSON portion starting after the marker
+            remaining = logs[marker_idx + len(workload_marker):]
+
+            # Find the opening brace
+            brace_start = remaining.find('{')
+            if brace_start == -1:
+                logger.warning("Could not find opening brace in workload config")
+                return {}
+
+            # Find the matching closing brace
+            # We need to count braces to handle nested JSON
+            brace_count = 0
+            json_end = -1
+
+            for i in range(brace_start, len(remaining)):
+                if remaining[i] == '{':
+                    brace_count += 1
+                elif remaining[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        json_end = i + 1
+                        break
+
+            if json_end == -1:
+                logger.warning("Could not find closing brace in workload config")
+                return {}
+
+            # Extract and parse JSON
+            json_str = remaining[brace_start:json_end]
+            workload_data = json.loads(json_str)
+
+            logger.info(f"✓ Extracted workload configuration")
+            return workload_data
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"Error parsing workload config JSON: {e}")
+            return {}
+        except Exception as e:
+            logger.warning(f"Error extracting workload config from logs: {e}")
+            return {}
 
     def collect_pod_logs(self) -> None:
         """Collect logs from all pods for debugging."""

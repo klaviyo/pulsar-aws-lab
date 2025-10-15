@@ -833,8 +833,8 @@ spec:
         from report_generator import ReportGenerator
         report_gen = ReportGenerator(self.experiment_dir, self.experiment_id)
 
-        # Get all result files
-        result_files = list(results_dir.glob("*.json"))
+        # Get all result files (filter out workload config files)
+        result_files = [f for f in results_dir.glob("*.json") if not f.name.endswith("_workload.json")]
 
         if result_files:
             # Generate full report package with updated namespace info
@@ -907,7 +907,8 @@ spec:
             logger.error("Run tests first using: orchestrator.py run --test-plan <file>")
             return
 
-        result_files = list(results_dir.glob("*.json"))
+        # Filter out workload config files from result files
+        result_files = [f for f in results_dir.glob("*.json") if not f.name.endswith("_workload.json")]
         if not result_files:
             logger.error(f"No result files found in {results_dir}")
             logger.error("Expected JSON files from OMB tests")

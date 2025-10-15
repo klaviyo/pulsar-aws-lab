@@ -198,6 +198,34 @@ class ReportGenerator:
 
         logger.info(f"JSON export complete: {output_file}")
 
+    def load_workload_configs(self, results_files: List[Path]) -> Dict[str, Dict]:
+        """
+        Load workload configurations for each test.
+
+        Args:
+            results_files: List of benchmark result files
+
+        Returns:
+            Dictionary mapping test names to workload configurations
+        """
+        workload_configs = {}
+
+        for results_file in results_files:
+            test_name = results_file.stem
+            # Look for workload config file
+            workload_file = results_file.parent / f"{test_name}_workload.json"
+
+            if workload_file.exists():
+                try:
+                    with open(workload_file, 'r') as f:
+                        config = json.load(f)
+                        workload_configs[test_name] = config
+                        logger.info(f"Loaded workload config for {test_name}")
+                except Exception as e:
+                    logger.warning(f"Failed to load workload config for {test_name}: {e}")
+
+        return workload_configs
+
     def create_report_package(
         self,
         results_files: List[Path],
@@ -225,11 +253,15 @@ class ReportGenerator:
         report_dir = self.experiment_dir / "report"
         report_dir.mkdir(exist_ok=True)
 
+        # Load workload configurations
+        workload_configs = self.load_workload_configs(results_files)
+
         # Aggregate metrics from all results
         all_metrics = {
             'throughput': {},
             'latency': {},
-            'errors': {}
+            'errors': {},
+            'workload_configs': workload_configs
         }
 
         for results_file in results_files:
