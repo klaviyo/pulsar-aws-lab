@@ -1,0 +1,46 @@
+# Ramp-Up Throughput Test Plan
+# Automatically discover maximum sustainable throughput
+
+name: "ramp-to-max-throughput"
+description: "Auto-discover maximum sustainable throughput by gradually ramping up producer rate"
+
+base_workload:
+  name: "ramp-throughput-test"
+  topics: 1
+  partitions_per_topic: 16
+  message_size: 1024  # 1 KB
+  subscriptions_per_topic: 1
+  producers_per_topic: 4
+  consumers_per_topic: 4
+  consumer_backlog_size_gb: 0
+  test_duration_minutes: 10  # Longer duration to allow ramping
+  warmup_duration_minutes: 2
+
+test_runs:
+  # - name: "auto-discover-max"
+  #   description: "Auto-discover max throughput starting from 10k msgs/sec"
+  #   type: "ramp_up"
+  #   producer_rate: 0  # 0 = auto-ramp starting at 10k msgs/sec
+
+  - name: "ramp-from-50k"
+    description: "Ramp up starting from 50k msgs/sec baseline"
+    type: "ramp_up"
+    producer_rate: 0
+    initial_rate: 50000  # Start ramping from 50k instead of default 10k
+
+  # - name: "ramp-from-100k"
+  #   description: "Ramp up starting from 100k msgs/sec baseline"
+  #   type: "ramp_up"
+  #   producer_rate: 0
+  #   initial_rate: 100000  # Start ramping from 100k
+
+reporting:
+  output_format:
+    - "html"
+    - "json"
+  include_raw_data: true
+  metrics_to_highlight:
+    - "throughput"
+    - "p99_latency"
+    - "max_throughput_achieved"
+    - "cpu_usage"

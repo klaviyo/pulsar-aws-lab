@@ -192,6 +192,166 @@
         .good { color: #27ae60; }
         .warning { color: #f39c12; }
         .error { color: #e74c3c; }
+
+        /* Chart Grid Layout */
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin: 20px 0;
+        }
+
+        .chart-item {
+            position: relative;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .chart-item:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+
+        .chart-item img {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        .chart-item .chart-overlay {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: linear-gradient(to top, rgba(0,0,0,0.7), transparent);
+            color: white;
+            padding: 8px 12px;
+            font-size: 0.85em;
+            font-weight: 500;
+        }
+
+        /* Modal Styles */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.95);
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        .modal-content {
+            position: relative;
+            max-width: 90vw;
+            max-height: 90vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-content img {
+            display: block;
+            max-width: 90vw;
+            max-height: 90vh;
+            width: 800px;  /* Force SVG to display at its native size */
+            height: 600px;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+            background: white;
+            padding: 20px;
+            object-fit: contain;
+        }
+
+        .modal-close {
+            position: absolute;
+            top: -40px;
+            right: 0;
+            color: white;
+            font-size: 40px;
+            font-weight: bold;
+            cursor: pointer;
+            background: none;
+            border: none;
+            padding: 0;
+            line-height: 1;
+            z-index: 1001;
+        }
+
+        .modal-close:hover {
+            color: #ddd;
+        }
+
+        /* Compact workload configs */
+        .workload-compact {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 6px;
+            border-left: 4px solid #3498db;
+            margin-bottom: 15px;
+        }
+
+        .workload-compact h3 {
+            margin: 0 0 10px 0;
+            font-size: 1em;
+            color: #2c3e50;
+        }
+
+        .workload-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+            font-size: 0.9em;
+        }
+
+        .workload-grid > div {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .workload-param {
+            display: flex;
+            justify-content: space-between;
+            padding: 2px 0;
+        }
+
+        .workload-param strong {
+            color: #7f8c8d;
+            font-size: 0.85em;
+        }
+
+        .workload-param span {
+            color: #2c3e50;
+            font-weight: 500;
+        }
+
+        /* Responsive adjustments */
+        @media (max-width: 1200px) {
+            .charts-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 768px) {
+            .charts-grid {
+                grid-template-columns: 1fr;
+            }
+            .workload-grid {
+                grid-template-columns: 1fr;
+            }
+        }
     </style>
 </head>
 <body>
@@ -276,14 +436,23 @@
 
         {% if charts %}
         <h2>Performance Charts</h2>
-        <div style="margin: 20px 0;">
+        <div class="charts-grid">
             {% for chart in charts %}
-            <div style="margin-bottom: 30px; text-align: center;">
-                <img src="{{ chart }}" alt="Performance Chart" style="max-width: 100%; height: auto; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <div class="chart-item" onclick="openModal('{{ chart }}')">
+                <img src="{{ chart }}" alt="{{ chart.stem }}">
+                <div class="chart-overlay">{{ chart.stem }}</div>
             </div>
             {% endfor %}
         </div>
         {% endif %}
+
+        <!-- Modal for full-size chart viewing -->
+        <div id="chartModal" class="modal" onclick="closeModal()">
+            <div class="modal-content" onclick="event.stopPropagation()">
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+                <img id="modalImage" alt="Full size chart">
+            </div>
+        </div>
 
         <h2>Detailed Test Results</h2>
 
@@ -319,36 +488,28 @@
         {% if metrics.workload_configs %}
         <h2>Workload Configurations</h2>
         {% for test_name, workload_config in metrics.workload_configs.items() %}
-        <div style="margin-bottom: 30px; background: #f8f9fa; padding: 20px; border-radius: 6px; border-left: 4px solid #3498db;">
-            <h3 style="margin-top: 0; color: #2c3e50;">{{ test_name }}</h3>
+        <div class="workload-compact">
+            <h3>{{ test_name }}</h3>
             {% if workload_config.workload %}
-            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; margin-top: 15px;">
+            <div class="workload-grid">
                 <div>
-                    <strong>Workload Name:</strong> {{ workload_config.workload.name }}<br>
-                    <strong>Topics:</strong> {{ workload_config.workload.topics }}<br>
-                    <strong>Partitions per Topic:</strong> {{ workload_config.workload.partitionsPerTopic }}<br>
-                    <strong>Message Size:</strong> {{ workload_config.workload.messageSize }} bytes<br>
-                    <strong>Key Distributor:</strong> {{ workload_config.workload.keyDistributor }}
+                    <div class="workload-param"><strong>Topics:</strong> <span>{{ workload_config.workload.topics }}</span></div>
+                    <div class="workload-param"><strong>Partitions:</strong> <span>{{ workload_config.workload.partitionsPerTopic }}</span></div>
+                    <div class="workload-param"><strong>Message Size:</strong> <span>{{ workload_config.workload.messageSize }}B</span></div>
                 </div>
                 <div>
-                    <strong>Producers per Topic:</strong> {{ workload_config.workload.producersPerTopic }}<br>
-                    <strong>Consumers per Subscription:</strong> {{ workload_config.workload.consumerPerSubscription }}<br>
-                    <strong>Subscriptions per Topic:</strong> {{ workload_config.workload.subscriptionsPerTopic }}<br>
-                    <strong>Producer Rate:</strong> {{ workload_config.workload.producerRate }} msgs/sec<br>
-                    <strong>Consumer Backlog:</strong> {{ workload_config.workload.consumerBacklogSizeGB }} GB
+                    <div class="workload-param"><strong>Producers:</strong> <span>{{ workload_config.workload.producersPerTopic }}</span></div>
+                    <div class="workload-param"><strong>Consumers:</strong> <span>{{ workload_config.workload.consumerPerSubscription }}</span></div>
+                    <div class="workload-param"><strong>Subscriptions:</strong> <span>{{ workload_config.workload.subscriptionsPerTopic }}</span></div>
                 </div>
                 <div>
-                    <strong>Test Duration:</strong> {{ workload_config.workload.testDurationMinutes }} minutes<br>
-                    <strong>Warmup Duration:</strong> {{ workload_config.workload.warmupDurationMinutes }} minutes<br>
-                    <strong>Backlog Drain Ratio:</strong> {{ workload_config.workload.backlogDrainRatio }}<br>
-                    <strong>Randomized Payloads:</strong> {{ "Yes" if workload_config.workload.useRandomizedPayloads else "No" }}<br>
-                    {% if workload_config.workload.payloadFile %}
-                    <strong>Payload File:</strong> {{ workload_config.workload.payloadFile }}
-                    {% endif %}
+                    <div class="workload-param"><strong>Producer Rate:</strong> <span>{{ workload_config.workload.producerRate }} msg/s</span></div>
+                    <div class="workload-param"><strong>Test Duration:</strong> <span>{{ workload_config.workload.testDurationMinutes }}m</span></div>
+                    <div class="workload-param"><strong>Warmup:</strong> <span>{{ workload_config.workload.warmupDurationMinutes }}m</span></div>
                 </div>
             </div>
             {% else %}
-            <pre style="background: #fff; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 0.9em;">{{ workload_config | tojson(indent=2) }}</pre>
+            <pre style="background: #fff; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 0.85em;">{{ workload_config | tojson(indent=2) }}</pre>
             {% endif %}
         </div>
         {% endfor %}
@@ -358,5 +519,53 @@
             <p>Generated by Pulsar AWS Lab | <a href="https://github.com/pulsar">Apache Pulsar</a></p>
         </div>
     </div>
+
+    <script>
+        // Modal functionality for chart viewing
+        function openModal(imageSrc) {
+            console.log('Opening modal with image:', imageSrc);
+            const modal = document.getElementById('chartModal');
+            const modalImg = document.getElementById('modalImage');
+
+            if (!modal || !modalImg) {
+                console.error('Modal elements not found');
+                return;
+            }
+
+            modalImg.src = imageSrc;
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden'; // Prevent background scrolling
+
+            console.log('Modal opened, image src set to:', modalImg.src);
+        }
+
+        function closeModal() {
+            const modal = document.getElementById('chartModal');
+            if (modal) {
+                modal.classList.remove('active');
+                document.body.style.overflow = ''; // Restore scrolling
+            }
+        }
+
+        // Close modal on Escape key
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') {
+                closeModal();
+            }
+        });
+
+        // Log any image loading errors (but skip empty src)
+        document.getElementById('modalImage').addEventListener('error', function() {
+            if (this.src) {
+                console.error('Failed to load image:', this.src);
+            }
+        });
+
+        document.getElementById('modalImage').addEventListener('load', function() {
+            if (this.src) {
+                console.log('Image loaded successfully:', this.src);
+            }
+        });
+    </script>
 </body>
 </html>
