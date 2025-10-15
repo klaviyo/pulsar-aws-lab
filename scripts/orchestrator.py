@@ -447,16 +447,30 @@ class Orchestrator:
             self._add_status(f"✓ Pulsar namespace: {detected_ns}", 'success')
             logger.info(f"Using Pulsar namespace: {detected_ns}")
         else:
-            # Fallback to guessing from topic list
+            # Fallback to topic-based detection with retry (wait for topics to be created)
             logger.warning("Could not detect namespace from logs, falling back to topic search")
-            detected_ns = self.pulsar_manager.detect_pulsar_namespace()
-            if detected_ns:
-                self.pulsar_tenant_namespace = detected_ns
-                self.pulsar_manager.pulsar_namespace = detected_ns
-                self.ui.set_pulsar_namespace(detected_ns)  # Update TUI display
-                self._add_status(f"✓ Pulsar namespace: {detected_ns} (detected from topics)", 'success')
+            self._add_status("Waiting for topics to be created for namespace detection...", 'info')
+            live.update(self._create_layout())
+
+            # Retry topic detection for up to 60 seconds (topics should appear within warmup)
+            max_retries = 12  # 12 * 5s = 60s
+            for attempt in range(max_retries):
+                detected_ns = self.pulsar_manager.detect_pulsar_namespace()
+                if detected_ns:
+                    self.pulsar_tenant_namespace = detected_ns
+                    self.pulsar_manager.pulsar_namespace = detected_ns
+                    self.ui.set_pulsar_namespace(detected_ns)  # Update TUI display
+                    self._add_status(f"✓ Pulsar namespace: {detected_ns} (detected from topics)", 'success')
+                    logger.info(f"Detected namespace with topics after {attempt + 1} attempts: {detected_ns}")
+                    break
+
+                if attempt < max_retries - 1:
+                    logger.debug(f"No namespace with topics yet, retrying in 5s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(5)
             else:
-                self._add_status("⚠ Could not detect Pulsar namespace", 'warning')
+                # After all retries, still couldn't detect
+                self._add_status("⚠ Could not detect Pulsar namespace with topics", 'warning')
+                logger.warning(f"Failed to detect namespace with topics after {max_retries} attempts")
         live.update(self._create_layout())
 
         # Wait for Job completion or failure

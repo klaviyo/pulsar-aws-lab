@@ -1,26 +1,26 @@
 # High Throughput Test Plan
-# Stress test with high load - 100k msgs/sec
+# Stress test with high load - 200k msgs/sec
 
 name: "high-throughput"
 description: "High throughput stress test with 4 producers and 4 consumers"
 
 base_workload:
-  name: "high-throughput-100-test"
-  topics: 10
+  name: "high-throughput-200-test"
+  topics: 1
   partitions_per_topic: 16
   message_size: 1024  # 1 KB
-  subscriptions_per_topic: 2
-  producers_per_topic: 5
-  consumers_per_topic: 5
+  subscriptions_per_topic: 1
+  producers_per_topic: 4
+  consumers_per_topic: 4
   consumer_backlog_size_gb: 0
   test_duration_minutes: 5
   warmup_duration_minutes: 1
 
 test_runs:
-  - name: "throughput-100k"
-    description: "100k msgs/sec high load test"
+  - name: "throughput-200k"
+    description: "200k msgs/sec high load test"
     type: "fixed_rate"
-    producer_rate: 500000
+    producer_rate: 200000
 
 reporting:
   output_format:

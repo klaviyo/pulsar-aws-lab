@@ -164,6 +164,9 @@ class PulsarManager:
             return None
 
         # Check each namespace for topics (the one with topics is the active test)
+        # Sort namespaces by name in reverse order to check newest first (assuming timestamp-based suffixes)
+        omb_namespaces.sort(reverse=True)
+
         for ns in omb_namespaces:
             logger.debug(f"Checking {ns} for topics...")
 
@@ -177,16 +180,17 @@ class PulsarManager:
 
             if result.returncode == 0:
                 topics = [line.strip() for line in result.stdout.strip().split('\n')
-                         if line.strip() and line.strip().startswith('persistent://')]
+                         if line.strip() and line.strip().startswith('persistent://')
+                         and 'Defaulted container' not in line]
 
                 if topics:
-                    logger.info(f"✓ Found Pulsar namespace with {len(topics)} topic(s): {ns}")
+                    logger.info(f"✓ Found active Pulsar namespace with {len(topics)} topic(s): {ns}")
                     return ns
 
-        # If no namespace has topics yet, return the first omb-test namespace as fallback
-        detected_ns = omb_namespaces[0]
-        logger.info(f"✓ Found Pulsar namespace (no topics yet): {detected_ns}")
-        return detected_ns
+        # If no namespace has topics yet, we cannot reliably detect the active one
+        # Return None to force the orchestrator to retry later
+        logger.warning(f"Found {len(omb_namespaces)} omb-test namespace(s) but none have topics yet")
+        return None
 
     def detect_pulsar_namespace(self) -> Optional[str]:
         """

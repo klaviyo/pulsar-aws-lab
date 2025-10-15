@@ -1,8 +1,8 @@
-# Ramp-Up Throughput Test Plan
-# Automatically discover maximum sustainable throughput
+# Manual Ramp-Up Throughput Test Plan
+# Discover maximum sustainable throughput by testing at increasing fixed rates
 
-name: "ramp-to-max-throughput"
-description: "Auto-discover maximum sustainable throughput by gradually ramping up producer rate"
+name: "manual-ramp-throughput"
+description: "Manual ramp-up to discover max throughput using progressive fixed-rate tests"
 
 base_workload:
   name: "ramp-throughput-test"
@@ -13,26 +13,35 @@ base_workload:
   producers_per_topic: 4
   consumers_per_topic: 4
   consumer_backlog_size_gb: 0
-  test_duration_minutes: 10  # Longer duration to allow ramping
-  warmup_duration_minutes: 2
+  test_duration_minutes: 5  # Shorter duration for each test
+  warmup_duration_minutes: 1
 
 test_runs:
-  # - name: "auto-discover-max"
-  #   description: "Auto-discover max throughput starting from 10k msgs/sec"
-  #   type: "ramp_up"
-  #   producer_rate: 0  # 0 = auto-ramp starting at 10k msgs/sec
+  # Manual ramping - test at increasing fixed rates to find max capacity
+  - name: "test-50k"
+    description: "Baseline test at 50k msgs/sec"
+    type: "fixed_rate"
+    producer_rate: 50000
 
-  - name: "ramp-from-50k"
-    description: "Ramp up starting from 50k msgs/sec baseline"
-    type: "ramp_up"
-    producer_rate: 0
-    initial_rate: 50000  # Start ramping from 50k instead of default 10k
+  - name: "test-75k"
+    description: "Increase to 75k msgs/sec"
+    type: "fixed_rate"
+    producer_rate: 75000
 
-  # - name: "ramp-from-100k"
-  #   description: "Ramp up starting from 100k msgs/sec baseline"
-  #   type: "ramp_up"
-  #   producer_rate: 0
-  #   initial_rate: 100000  # Start ramping from 100k
+  - name: "test-100k"
+    description: "Test at 100k msgs/sec"
+    type: "fixed_rate"
+    producer_rate: 100000
+
+  - name: "test-125k"
+    description: "Push to 125k msgs/sec"
+    type: "fixed_rate"
+    producer_rate: 125000
+
+  - name: "test-150k"
+    description: "Test upper limit at 150k msgs/sec"
+    type: "fixed_rate"
+    producer_rate: 150000
 
 reporting:
   output_format:
