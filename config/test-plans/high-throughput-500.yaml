@@ -17,10 +17,11 @@ base_workload:
   warmup_duration_minutes: 1
 
 test_runs:
-  - name: "throughput-100k"
-    description: "100k msgs/sec high load test"
+  - name: "throughput-500k"
+    description: "500k msgs/sec high load test"
     type: "fixed_rate"
     producer_rate: 500000
+    num_workers: 10  # 
 
 reporting:
   output_format:
