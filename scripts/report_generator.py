@@ -72,10 +72,14 @@ class ReportGenerator:
 
         avg_publish_rate = sum(publish_rates) / len(publish_rates) if publish_rates else 0
         avg_consume_rate = sum(consume_rates) / len(consume_rates) if consume_rates else 0
+        max_publish_rate = max(publish_rates) if publish_rates else 0
+        max_consume_rate = max(consume_rates) if consume_rates else 0
 
         metrics['throughput'][test_name] = {
             'publish_rate': avg_publish_rate,
-            'consume_rate': avg_consume_rate
+            'consume_rate': avg_consume_rate,
+            'max_publish_rate': max_publish_rate,
+            'max_consume_rate': max_consume_rate
         }
 
         # Extract latency metrics (in milliseconds)
@@ -98,22 +102,33 @@ class ReportGenerator:
         return metrics
 
     def calculate_summary_stats(self, metrics: Dict) -> Dict:
-        """Calculate summary statistics across all tests"""
+        """
+        Calculate summary statistics across all tests.
+
+        Returns:
+            Dictionary with:
+            - avg_throughput: Overall mean throughput across all test measurements
+            - peak_throughput: Highest instantaneous rate achieved in any test
+            - avg_p99_latency: Mean p99 latency across all tests
+        """
         summary = {
             'total_tests': len(metrics.get('throughput', {})),
             'avg_throughput': 0.0,
-            'max_throughput': 0.0,
+            'peak_throughput': 0.0,
             'avg_p99_latency': 0.0,
             'total_errors': 0
         }
 
-        # Calculate averages and totals
-        throughputs = []
+        # Collect per-test averages and peaks
+        avg_throughputs = []
+        peak_throughputs = []
         latencies = []
 
         for test_name in metrics.get('throughput', {}).keys():
-            throughput = metrics['throughput'][test_name].get('publish_rate', 0)
-            throughputs.append(throughput)
+            avg_throughput = metrics['throughput'][test_name].get('publish_rate', 0)
+            peak_throughput = metrics['throughput'][test_name].get('max_publish_rate', 0)
+            avg_throughputs.append(avg_throughput)
+            peak_throughputs.append(peak_throughput)
 
             latency = metrics['latency'][test_name].get('p99', 0)
             latencies.append(latency)
@@ -121,9 +136,13 @@ class ReportGenerator:
             summary['total_errors'] += metrics['errors'][test_name].get('publish_errors', 0)
             summary['total_errors'] += metrics['errors'][test_name].get('consume_errors', 0)
 
-        if throughputs:
-            summary['avg_throughput'] = sum(throughputs) / len(throughputs)
-            summary['max_throughput'] = max(throughputs)
+        # Overall average throughput: mean of all per-test averages
+        if avg_throughputs:
+            summary['avg_throughput'] = sum(avg_throughputs) / len(avg_throughputs)
+
+        # Peak throughput: highest instantaneous rate across all tests
+        if peak_throughputs:
+            summary['peak_throughput'] = max(peak_throughputs)
 
         if latencies:
             summary['avg_p99_latency'] = sum(latencies) / len(latencies)
@@ -172,8 +191,10 @@ class ReportGenerator:
         for test_name in metrics.get('throughput', {}).keys():
             row = {
                 'test_name': test_name,
-                'publish_rate_msgs_sec': metrics['throughput'][test_name].get('publish_rate', 0),
-                'consume_rate_msgs_sec': metrics['throughput'][test_name].get('consume_rate', 0),
+                'avg_publish_rate_msgs_sec': metrics['throughput'][test_name].get('publish_rate', 0),
+                'max_publish_rate_msgs_sec': metrics['throughput'][test_name].get('max_publish_rate', 0),
+                'avg_consume_rate_msgs_sec': metrics['throughput'][test_name].get('consume_rate', 0),
+                'max_consume_rate_msgs_sec': metrics['throughput'][test_name].get('max_consume_rate', 0),
                 'latency_p50_ms': metrics['latency'][test_name].get('p50', 0),
                 'latency_p95_ms': metrics['latency'][test_name].get('p95', 0),
                 'latency_p99_ms': metrics['latency'][test_name].get('p99', 0),

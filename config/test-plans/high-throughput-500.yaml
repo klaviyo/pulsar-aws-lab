@@ -6,12 +6,12 @@ description: "High throughput stress test with 4 producers and 4 consumers"
 
 base_workload:
   name: "high-throughput-100-test"
-  topics: 10
+  topics: 20
   partitions_per_topic: 16
   message_size: 1024  # 1 KB
-  subscriptions_per_topic: 2
-  producers_per_topic: 5
-  consumers_per_topic: 5
+  subscriptions_per_topic: 1
+  producers_per_topic: 1
+  consumers_per_topic: 1
   consumer_backlog_size_gb: 0
   test_duration_minutes: 5
   warmup_duration_minutes: 1

@@ -229,7 +229,7 @@ spec:
         imagePullPolicy: Always
         env:
         - name: HEAP_OPTS
-          value: "-Xms6G -Xmx6G -XX:MaxDirectMemorySize=1G"
+          value: "-Xms12G -Xmx12G -XX:MaxDirectMemorySize=4G"
         command: ["/bin/bash", "-c"]
         args:
           - |
@@ -257,9 +257,9 @@ spec:
           failureThreshold: 3
         resources:
           requests:
-            memory: "2Gi"
-            cpu: "500m"
-          limits:
             memory: "8Gi"
-            cpu: "2000m"
+            cpu: "1000m"
+          limits:
+            memory: "24Gi"
+            cpu: "4000m"
 """

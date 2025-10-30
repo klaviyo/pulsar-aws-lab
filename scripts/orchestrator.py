@@ -365,6 +365,20 @@ class Orchestrator:
             self.worker_manager.ensure_workers(num_workers)
             self._add_status(f"✓ Workers ready (persistent pool)", 'success')
             live.update(self._create_layout())
+
+            # Give workers time to fully start up JVM and bind HTTP server
+            self._add_status(f"Waiting 30s for workers to fully initialize...", 'info')
+            live.update(self._create_layout())
+
+            # Progress countdown for 30 second wait
+            for i in range(30):
+                progress = (i + 1) / 30 * 100
+                self._add_status(f"Waiting for worker startup: {i+1}/30s ({progress:.0f}%)", 'info')
+                live.update(self._create_layout())
+                time.sleep(1)
+
+            self._add_status(f"✓ Worker startup grace period complete", 'success')
+            live.update(self._create_layout())
         except Exception as e:
             raise OrchestratorError(f"Failed to ensure workers: {e}")
 
@@ -883,8 +897,9 @@ spec:
             logger.warning("No result files found to generate report")
             self.console.print("[yellow]⚠ No results to generate report[/yellow]\n")
 
-        # Cleanup any leftover resources in namespace
-        self.k8s_manager.cleanup_namespace()
+        # Note: Workers are persistent across test runs - namespace is NOT cleaned up
+        # Use 'python scripts/orchestrator.py cleanup-workers' to manually clean up workers
+        # self.k8s_manager.cleanup_namespace()
 
     def _generate_workload(self, base: Dict, overrides: Dict) -> Dict:
         """Generate OMB workload from test plan"""

@@ -373,13 +373,13 @@
             <div class="metric-card">
                 <h3>Average Throughput</h3>
                 <div class="metric-value">{{ "%.0f" | format(summary.avg_throughput) }}</div>
-                <div class="metric-unit">msgs/sec</div>
+                <div class="metric-unit">msgs/sec (mean across all tests)</div>
             </div>
 
             <div class="metric-card">
-                <h3>Max Throughput</h3>
-                <div class="metric-value">{{ "%.0f" | format(summary.max_throughput) }}</div>
-                <div class="metric-unit">msgs/sec</div>
+                <h3>Peak Throughput</h3>
+                <div class="metric-value">{{ "%.0f" | format(summary.peak_throughput) }}</div>
+                <div class="metric-unit">msgs/sec (highest instantaneous rate)</div>
             </div>
 
             <div class="metric-card">
@@ -460,7 +460,8 @@
             <thead>
                 <tr>
                     <th>Test Name</th>
-                    <th>Throughput<br>(msgs/sec)</th>
+                    <th>Avg Throughput<br>(msgs/sec)</th>
+                    <th>Peak Throughput<br>(msgs/sec)</th>
                     <th>P50 Latency<br>(ms)</th>
                     <th>P95 Latency<br>(ms)</th>
                     <th>P99 Latency<br>(ms)</th>
@@ -473,6 +474,7 @@
                 <tr>
                     <td class="test-name">{{ test_name }}</td>
                     <td>{{ "%.0f" | format(metrics.throughput[test_name].publish_rate) }}</td>
+                    <td>{{ "%.0f" | format(metrics.throughput[test_name].max_publish_rate) }}</td>
                     <td>{{ "%.2f" | format(metrics.latency[test_name].p50) }}</td>
                     <td>{{ "%.2f" | format(metrics.latency[test_name].p95) }}</td>
                     <td>{{ "%.2f" | format(metrics.latency[test_name].p99) }}</td>

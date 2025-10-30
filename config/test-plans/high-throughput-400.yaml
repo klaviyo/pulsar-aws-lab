@@ -9,9 +9,9 @@ base_workload:
   topics: 5
   partitions_per_topic: 16
   message_size: 1024  # 1 KB
-  subscriptions_per_topic: 2
-  producers_per_topic: 6
-  consumers_per_topic: 6
+  subscriptions_per_topic: 1
+  producers_per_topic: 4
+  consumers_per_topic: 4
   consumer_backlog_size_gb: 0
   test_duration_minutes: 5
   warmup_duration_minutes: 1
