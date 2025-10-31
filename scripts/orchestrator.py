@@ -26,6 +26,7 @@ from operations import cleanup_pulsar_namespaces, cleanup_pulsar_topics
 from kubernetes_manager import KubernetesManager
 from pulsar_manager import PulsarManager
 from results_collector import ResultsCollector
+from metrics_collector import MetricsCollector
 
 # Import OMB worker manager
 from omb.workers import WorkerManager
@@ -120,6 +121,13 @@ class Orchestrator:
             namespace=self.namespace,
             omb_image=self.omb_image,
             results_dir=self.experiment_dir
+        )
+
+        # Initialize metrics collector for infrastructure health tracking
+        self.metrics_collector = MetricsCollector(
+            namespace="pulsar",  # Pulsar components are in "pulsar" namespace
+            experiment_dir=self.experiment_dir,
+            run_command_func=self.run_command
         )
 
         # Ensure K8s namespace exists
@@ -404,6 +412,17 @@ class Orchestrator:
         with open(job_file, 'w') as f:
             f.write(job_yaml)
 
+        # Collect baseline infrastructure metrics before test
+        self._add_status("Collecting baseline infrastructure metrics...", 'info')
+        live.update(self._create_layout())
+        try:
+            self.metrics_collector.collect_baseline_metrics()
+            self._add_status("✓ Baseline metrics collected", 'success')
+        except Exception as e:
+            logger.warning(f"Failed to collect baseline metrics: {e}")
+            self._add_status("⚠ Failed to collect baseline metrics", 'warning')
+        live.update(self._create_layout())
+
         # Apply Job
         self._add_status("Starting driver Job", 'info')
         live.update(self._create_layout())
@@ -411,6 +430,17 @@ class Orchestrator:
             ["kubectl", "apply", "-f", str(job_file)],
             f"Create OMB driver Job for {test_name}"
         )
+
+        # Start background metrics collection
+        self._add_status("Starting background metrics collection...", 'info')
+        live.update(self._create_layout())
+        try:
+            self.metrics_collector.start_background_collection(interval_seconds=30)
+            self._add_status("✓ Background metrics collection started", 'success')
+        except Exception as e:
+            logger.warning(f"Failed to start background metrics collection: {e}")
+            self._add_status("⚠ Background metrics collection disabled", 'warning')
+        live.update(self._create_layout())
 
         # Wait for Job pod to start and read logs to detect namespace
         self._add_status("Waiting for Job pod to start...", 'info')
@@ -629,6 +659,19 @@ class Orchestrator:
         # Results were already collected immediately after Job succeeded
         # Use the stored results
         results = self.test_results
+
+        # Stop background metrics collection and save timeseries
+        self._add_status("Stopping metrics collection...", 'info')
+        live.update(self._create_layout())
+        try:
+            self.metrics_collector.stop_background_collection()
+            self.metrics_collector.collect_final_metrics()
+            self.metrics_collector.export_metrics_for_plotting()
+            self._add_status("✓ Infrastructure metrics saved", 'success')
+        except Exception as e:
+            logger.warning(f"Failed to finalize metrics collection: {e}")
+            self._add_status("⚠ Metrics collection incomplete", 'warning')
+        live.update(self._create_layout())
 
         # Cleanup Pulsar topics created during test
         self.pulsar_manager.cleanup_test_topics(live)

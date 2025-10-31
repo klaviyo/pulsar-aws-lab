@@ -13,13 +13,20 @@ from typing import Dict, List, Optional
 import pandas as pd
 from jinja2 import Environment, FileSystemLoader
 
-# Import chart generation module
+# Import chart generation modules
 try:
     from omb_charts import generate_all_charts
     CHARTS_AVAILABLE = True
 except ImportError:
     CHARTS_AVAILABLE = False
     logging.warning("omb_charts module not available - chart generation disabled")
+
+try:
+    from interactive_charts import generate_all_interactive_charts
+    INTERACTIVE_CHARTS_AVAILABLE = True
+except ImportError:
+    INTERACTIVE_CHARTS_AVAILABLE = False
+    logging.warning("interactive_charts module not available - interactive chart generation disabled")
 
 logger = logging.getLogger(__name__)
 
@@ -301,27 +308,59 @@ class ReportGenerator:
                 import shutil
                 shutil.copy(results_file, raw_dir / results_file.name)
 
-        # Generate charts from results
-        charts = []
+        # Generate interactive charts with health metrics
+        interactive_charts = []
+        if INTERACTIVE_CHARTS_AVAILABLE and results_files:
+            try:
+                charts_dir = report_dir / "charts"
+                logger.info(f"Generating interactive charts from {len(results_files)} result file(s)...")
+
+                # Load health metrics if available
+                metrics_dir = self.experiment_dir / "metrics"
+                plot_data_file = metrics_dir / "plot_data.json" if metrics_dir.exists() else None
+
+                for results_file in results_files:
+                    test_name = results_file.stem
+                    generated = generate_all_interactive_charts(
+                        results_file,
+                        plot_data_file,
+                        charts_dir,
+                        test_name
+                    )
+                    interactive_charts.extend(generated)
+
+                # Convert absolute paths to relative paths for HTML embedding
+                interactive_charts = [chart.relative_to(report_dir) for chart in interactive_charts]
+                logger.info(f"Generated {len(interactive_charts)} interactive chart(s)")
+            except Exception as e:
+                logger.error(f"Interactive chart generation failed: {e}")
+                logger.exception(e)
+                interactive_charts = []
+
+        # Generate static charts (pygal) as fallback
+        static_charts = []
         if CHARTS_AVAILABLE and results_files:
             try:
                 charts_dir = report_dir / "charts"
-                logger.info(f"Generating charts from {len(results_files)} result file(s)...")
+                logger.info(f"Generating static charts from {len(results_files)} result file(s)...")
                 generated_charts = generate_all_charts(results_files, charts_dir)
 
                 # Convert absolute paths to relative paths for HTML embedding
-                charts = [chart.relative_to(report_dir) for chart in generated_charts]
-                logger.info(f"Generated {len(charts)} chart(s)")
+                static_charts = [chart.relative_to(report_dir) for chart in generated_charts]
+                logger.info(f"Generated {len(static_charts)} static chart(s)")
             except Exception as e:
-                logger.error(f"Chart generation failed: {e}")
-                charts = []
+                logger.error(f"Static chart generation failed: {e}")
+                static_charts = []
+
+        # Combine all charts (prefer interactive, include static as supplement)
+        all_charts = interactive_charts + static_charts
 
         # Generate HTML report
         html_content = self.generate_html_report(
             all_metrics,
             cost_data,
             config,
-            charts=charts,
+            charts=all_charts,
             grafana_dashboards=grafana_dashboards
         )
         html_file = report_dir / "index.html"

@@ -436,11 +436,19 @@
 
         {% if charts %}
         <h2>Performance Charts</h2>
+        <p style="color: #7f8c8d; margin-bottom: 20px;">
+            📊 Click on any chart to view full-size. Interactive charts support zoom, pan, and hover for details.
+        </p>
         <div class="charts-grid">
             {% for chart in charts %}
             <div class="chart-item" onclick="openModal('{{ chart }}')">
+                {% if chart.suffix == '.html' %}
+                <iframe src="{{ chart }}" style="width: 100%; height: 300px; border: none; pointer-events: none;"></iframe>
+                <div class="chart-overlay">{{ chart.stem }} (Interactive)</div>
+                {% else %}
                 <img src="{{ chart }}" alt="{{ chart.stem }}">
                 <div class="chart-overlay">{{ chart.stem }}</div>
+                {% endif %}
             </div>
             {% endfor %}
         </div>
@@ -450,7 +458,8 @@
         <div id="chartModal" class="modal" onclick="closeModal()">
             <div class="modal-content" onclick="event.stopPropagation()">
                 <button class="modal-close" onclick="closeModal()">&times;</button>
-                <img id="modalImage" alt="Full size chart">
+                <img id="modalImage" alt="Full size chart" style="display:none;">
+                <iframe id="modalIframe" style="display:none; width: 90vw; height: 90vh; border: none; background: white;"></iframe>
             </div>
         </div>
 
@@ -524,28 +533,50 @@
 
     <script>
         // Modal functionality for chart viewing
-        function openModal(imageSrc) {
-            console.log('Opening modal with image:', imageSrc);
+        function openModal(chartSrc) {
+            console.log('Opening modal with chart:', chartSrc);
             const modal = document.getElementById('chartModal');
             const modalImg = document.getElementById('modalImage');
+            const modalIframe = document.getElementById('modalIframe');
 
-            if (!modal || !modalImg) {
+            if (!modal || !modalImg || !modalIframe) {
                 console.error('Modal elements not found');
                 return;
             }
 
-            modalImg.src = imageSrc;
+            // Determine if this is an HTML chart or image
+            const isHtml = chartSrc.endsWith('.html');
+
+            if (isHtml) {
+                // Show iframe for interactive HTML charts
+                modalImg.style.display = 'none';
+                modalIframe.style.display = 'block';
+                modalIframe.src = chartSrc;
+            } else {
+                // Show image for static charts
+                modalIframe.style.display = 'none';
+                modalImg.style.display = 'block';
+                modalImg.src = chartSrc;
+            }
+
             modal.classList.add('active');
             document.body.style.overflow = 'hidden'; // Prevent background scrolling
 
-            console.log('Modal opened, image src set to:', modalImg.src);
+            console.log('Modal opened, chart loaded:', chartSrc);
         }
 
         function closeModal() {
             const modal = document.getElementById('chartModal');
+            const modalImg = document.getElementById('modalImage');
+            const modalIframe = document.getElementById('modalIframe');
+
             if (modal) {
                 modal.classList.remove('active');
                 document.body.style.overflow = ''; // Restore scrolling
+
+                // Clear sources to stop iframe loading
+                modalImg.src = '';
+                modalIframe.src = '';
             }
         }
 
