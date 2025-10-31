@@ -6,7 +6,7 @@ description: "High throughput stress test with 4 producers and 4 consumers"
 
 base_workload:
   name: "high-throughput-1000-test"
-  topics: 1
+  topics: 80
   partitions_per_topic: 16
   message_size: 1024  # 1 KB
   subscriptions_per_topic: 1
@@ -21,6 +21,7 @@ test_runs:
     description: "1M msgs/sec high load test"
     type: "fixed_rate"
     producer_rate: 1000000
+    num_workers: 10  # 
 
 reporting:
   output_format:
