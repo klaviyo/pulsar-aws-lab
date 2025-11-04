@@ -309,15 +309,33 @@ class ReportGenerator:
                 shutil.copy(results_file, raw_dir / results_file.name)
 
         # Generate interactive charts with health metrics
-        interactive_charts = []
+        all_charts = []
+        charts_dir = report_dir / "charts"
+
+        # Use standard Plotly axis matching for synchronized zoom
+        # Note: Plotly's matches parameter only accepts "x", "x2", "y", "y2", etc.
+        x_match_group = "x"
+
+        # Load health metrics if available
+        metrics_dir = self.experiment_dir / "metrics"
+        plot_data_file = metrics_dir / "plot_data.json" if metrics_dir.exists() else None
+
+        # First: Generate OMB charts (from omb_charts.py) - these use pygal or plotly
+        if CHARTS_AVAILABLE and results_files:
+            try:
+                logger.info(f"Generating OMB charts from {len(results_files)} result file(s)...")
+                generated_charts = generate_all_charts(results_files, charts_dir)
+
+                # Convert absolute paths to relative paths for HTML embedding
+                all_charts.extend([chart.relative_to(report_dir) for chart in generated_charts])
+                logger.info(f"Generated {len(generated_charts)} OMB chart(s)")
+            except Exception as e:
+                logger.error(f"OMB chart generation failed: {e}")
+
+        # Second: Generate health + correlation charts (from interactive_charts.py)
         if INTERACTIVE_CHARTS_AVAILABLE and results_files:
             try:
-                charts_dir = report_dir / "charts"
-                logger.info(f"Generating interactive charts from {len(results_files)} result file(s)...")
-
-                # Load health metrics if available
-                metrics_dir = self.experiment_dir / "metrics"
-                plot_data_file = metrics_dir / "plot_data.json" if metrics_dir.exists() else None
+                logger.info(f"Generating health correlation charts from {len(results_files)} result file(s)...")
 
                 for results_file in results_files:
                     test_name = results_file.stem
@@ -325,35 +343,15 @@ class ReportGenerator:
                         results_file,
                         plot_data_file,
                         charts_dir,
-                        test_name
+                        test_name,
+                        x_match_group=x_match_group  # Pass match group for sync
                     )
-                    interactive_charts.extend(generated)
+                    all_charts.extend([chart.relative_to(report_dir) for chart in generated])
 
-                # Convert absolute paths to relative paths for HTML embedding
-                interactive_charts = [chart.relative_to(report_dir) for chart in interactive_charts]
-                logger.info(f"Generated {len(interactive_charts)} interactive chart(s)")
+                logger.info(f"Generated health correlation charts with synchronized zoom")
             except Exception as e:
-                logger.error(f"Interactive chart generation failed: {e}")
+                logger.error(f"Health chart generation failed: {e}")
                 logger.exception(e)
-                interactive_charts = []
-
-        # Generate static charts (pygal) as fallback
-        static_charts = []
-        if CHARTS_AVAILABLE and results_files:
-            try:
-                charts_dir = report_dir / "charts"
-                logger.info(f"Generating static charts from {len(results_files)} result file(s)...")
-                generated_charts = generate_all_charts(results_files, charts_dir)
-
-                # Convert absolute paths to relative paths for HTML embedding
-                static_charts = [chart.relative_to(report_dir) for chart in generated_charts]
-                logger.info(f"Generated {len(static_charts)} static chart(s)")
-            except Exception as e:
-                logger.error(f"Static chart generation failed: {e}")
-                static_charts = []
-
-        # Combine all charts (prefer interactive, include static as supplement)
-        all_charts = interactive_charts + static_charts
 
         # Generate HTML report
         html_content = self.generate_html_report(

@@ -525,7 +525,8 @@ class Orchestrator:
         test_minutes = workload_config.get('testDurationMinutes', 5)
         expected_duration_seconds = (warmup_minutes + test_minutes) * 60
         # When to start checking for the sleep message (test should be done)
-        check_sleep_after = expected_duration_seconds - 10  # Start checking 10s before expected completion
+        # Start checking 2 minutes before expected completion to avoid missing the 30s collection window
+        check_sleep_after = max(60, expected_duration_seconds - 120)  # At least 60s into test, or 2min before end
 
         logger.info(f"Expected test duration: ~{warmup_minutes + test_minutes} minutes (warmup: {warmup_minutes}m, test: {test_minutes}m)")
         logger.info(f"Will start polling for sleep message after {check_sleep_after}s")
@@ -616,9 +617,9 @@ class Orchestrator:
                             check=False
                         )
 
-                        if log_result.returncode == 0 and "Sleeping 30 seconds to allow results collection" in log_result.stdout:
+                        if log_result.returncode == 0 and "Sleeping 60 seconds to allow results collection" in log_result.stdout:
                             # Sleep message detected! Pod is in the collection window
-                            logger.info(f"✓ Detected sleep message in logs - collecting results during 30s window")
+                            logger.info(f"✓ Detected sleep message in logs - collecting results during 60s window")
                             self._add_status("Collecting test results (during sleep window)...", 'info')
                             live.update(self._create_layout())
 
@@ -818,8 +819,8 @@ spec:
               cat /results/{self.experiment_id}/{test_name}.json
 
               # Sleep to keep pod alive for results collection
-              echo "Sleeping 30 seconds to allow results collection..."
-              sleep 30
+              echo "Sleeping 60 seconds to allow results collection..."
+              sleep 60
             else
               echo "Benchmark failed with exit code $EXIT_CODE"
             fi
@@ -872,17 +873,20 @@ spec:
 
                 # Run OMB job
                 try:
-                    results = self.run_omb_job(test_run, workload, live)
+                    # Run test (results are saved by results_collector.collect_job_logs())
+                    self.run_omb_job(test_run, workload, live)
 
-                    # Save results
-                    result_file = results_dir / f"{test_name}.log"
-                    with open(result_file, 'w') as f:
-                        f.write(results)
+                    # Results are already saved by results_collector.collect_job_logs()
+                    # to benchmark_results/{test_name}.json
+                    result_file = results_dir / f"{test_name}.json"
 
                     self._add_status(f"✓ Test '{test_name}' completed", 'success')
                     live.update(self._create_layout())
                     logger.info(f"✓ Test '{test_name}' completed")
-                    logger.info(f"Results: {result_file}")
+                    if result_file.exists():
+                        logger.info(f"Results: {result_file}")
+                    else:
+                        logger.warning(f"Results file not found: {result_file}")
 
                 except OrchestratorError as e:
                     self._add_status(f"✗ Test '{test_name}' failed: {e}", 'error')

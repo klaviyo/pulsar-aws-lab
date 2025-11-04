@@ -69,14 +69,30 @@ class ResultsCollector:
 
         logger.info(f"Found pod: {pod_name}")
 
-        # Get and save pod logs
+        # Get and save pod logs - try current container first, then previous if that fails
         log_result = self.run_command(
             ["kubectl", "logs", pod_name, "-n", self.namespace],
             f"Get logs for {test_name}",
             capture_output=True,
             check=False
         )
+
         logs = log_result.stdout
+
+        # If getting current logs failed (pod terminated), try getting previous container logs
+        if not logs or log_result.returncode != 0:
+            logger.info(f"Current container logs not available, trying --previous flag...")
+            prev_log_result = self.run_command(
+                ["kubectl", "logs", pod_name, "-n", self.namespace, "--previous"],
+                f"Get previous logs for {test_name}",
+                capture_output=True,
+                check=False
+            )
+            if prev_log_result.returncode == 0:
+                logs = prev_log_result.stdout
+                logger.info(f"✓ Retrieved logs from previous container")
+            else:
+                logger.warning(f"Failed to get logs from both current and previous containers")
 
         log_file = self.experiment_dir / f"omb_{test_name}_{'success' if success else 'failed'}.log"
         with open(log_file, 'w') as f:

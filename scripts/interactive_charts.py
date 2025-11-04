@@ -37,6 +37,7 @@ class InteractiveChartGenerator:
 
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.x_match_group = None  # Will be set for synchronized zoom
 
     def generate_throughput_health_chart(
         self,
@@ -148,6 +149,11 @@ class InteractiveChartGenerator:
         fig.update_yaxes(title_text="JVM Heap (MB)", row=1, col=1, secondary_y=True)
         fig.update_yaxes(title_text="GC Time (seconds)", row=2, col=1)
 
+        # Add synchronized zoom if match group is set
+        if self.x_match_group:
+            fig.update_xaxes(matches=self.x_match_group, row=1, col=1)
+            fig.update_xaxes(matches=self.x_match_group, row=2, col=1)
+
         fig.update_layout(
             title_text=f"Throughput and Infrastructure Health - {test_name}",
             height=800,
@@ -216,6 +222,10 @@ class InteractiveChartGenerator:
                     line=dict(color=colors.get(percentile, '#000000'), width=2),
                     hovertemplate=f'<b>{percentile}</b><br>Time: %{{x}}s<br>Latency: %{{y:.2f}} ms<extra></extra>'
                 ))
+
+        # Add synchronized zoom if match group is set
+        if self.x_match_group:
+            fig.update_xaxes(matches=self.x_match_group)
 
         fig.update_layout(
             title=f"Publish Latency Percentiles - {test_name}",
@@ -377,6 +387,11 @@ class InteractiveChartGenerator:
         fig.update_yaxes(title_text="CPU (millicores)", row=1, col=1)
         fig.update_yaxes(title_text="Memory (MiB)", row=2, col=1)
 
+        # Add synchronized zoom if match group is set
+        if self.x_match_group:
+            fig.update_xaxes(matches=self.x_match_group, row=1, col=1)
+            fig.update_xaxes(matches=self.x_match_group, row=2, col=1)
+
         fig.update_layout(
             title_text=f"{component.title()} Resource Utilization - {test_name}",
             height=700,
@@ -497,16 +512,18 @@ def generate_all_interactive_charts(
     results_file: Path,
     health_metrics_file: Optional[Path],
     output_dir: Path,
-    test_name: str = "test"
+    test_name: str = "test",
+    x_match_group: Optional[str] = None
 ) -> List[Path]:
     """
-    Generate all interactive charts for a test run.
+    Generate all interactive charts for a test run with synchronized zoom.
 
     Args:
         results_file: Path to OMB results JSON
         health_metrics_file: Path to health metrics JSON (optional)
         output_dir: Directory to save charts
         test_name: Name of the test
+        x_match_group: Group ID for synchronized zoom/pan across charts
 
     Returns:
         List of generated chart file paths
@@ -515,7 +532,13 @@ def generate_all_interactive_charts(
         logger.warning("plotly not available - skipping interactive chart generation")
         return []
 
+    # Use standard Plotly axis matching if not provided
+    # Note: Plotly's matches parameter only accepts "x", "x2", "y", "y2", etc.
+    if not x_match_group:
+        x_match_group = "x"
+
     generator = InteractiveChartGenerator(output_dir)
+    generator.x_match_group = x_match_group  # Set match group for all charts
     generated_charts = []
 
     # Load OMB results
@@ -546,7 +569,7 @@ def generate_all_interactive_charts(
         generated_charts.append(chart)
 
         if health_metrics:
-            # Broker health heatmap
+            # Broker health heatmap (no time sync - different visualization)
             chart = generator.generate_broker_health_heatmap(health_metrics, test_name)
             if chart:
                 generated_charts.append(chart)
@@ -564,7 +587,7 @@ def generate_all_interactive_charts(
     except Exception as e:
         logger.error(f"Error generating interactive charts: {e}")
 
-    logger.info(f"Generated {len(generated_charts)} interactive charts")
+    logger.info(f"Generated {len(generated_charts)} interactive charts with synchronized zoom")
     return generated_charts
 
 
