@@ -308,6 +308,136 @@ class MetricsCollector:
 
         return net_metrics
 
+    def _get_bookie_pod_names(self) -> List[str]:
+        """
+        Get list of all bookie pod names.
+
+        Returns:
+            List of bookie pod names
+        """
+        result = self.run_command(
+            ["kubectl", "get", "pods", "-n", "pulsar",
+             "-l", "app=pulsar,component=bookie",
+             "-o", "jsonpath={.items[*].metadata.name}"],
+            "Get bookie pod names",
+            capture_output=True,
+            check=False
+        )
+
+        if result.returncode == 0:
+            return result.stdout.strip().split()
+        return []
+
+    def _get_pod_iostat(self, pod_name: str) -> Optional[Dict]:
+        """
+        Collect iostat metrics from a single pod.
+
+        Args:
+            pod_name: Pod name to collect from
+
+        Returns:
+            Dictionary with iostat metrics per device, or None if failed
+        """
+        # Run iostat with 2 samples (skip first which is since boot)
+        result = self.run_command(
+            ["kubectl", "exec", "-n", "pulsar", pod_name, "--",
+             "sh", "-c", "iostat -xm 1 2 2>/dev/null | tail -n +4 || echo 'IOSTAT_NOT_AVAILABLE'"],
+            f"Get iostat for {pod_name}",
+            capture_output=True,
+            check=False,
+            timeout=5
+        )
+
+        if result.returncode != 0 or 'IOSTAT_NOT_AVAILABLE' in result.stdout:
+            logger.debug(f"iostat not available in {pod_name}")
+            return None
+
+        return self._parse_iostat_output(result.stdout)
+
+    def _parse_iostat_output(self, output: str) -> Dict[str, Dict]:
+        """
+        Parse iostat -xm output into structured data.
+
+        Args:
+            output: Raw iostat output
+
+        Returns:
+            Dictionary mapping device names to metrics
+        """
+        devices = {}
+        lines = output.strip().split('\n')
+
+        for line in lines:
+            if not line.strip() or line.startswith('Device') or line.startswith('Linux'):
+                continue
+
+            parts = line.split()
+            if len(parts) >= 8:
+                device = parts[0]
+                try:
+                    devices[device] = {
+                        'reads_per_sec': float(parts[1]),
+                        'writes_per_sec': float(parts[2]),
+                        'read_mb_per_sec': float(parts[3]),
+                        'write_mb_per_sec': float(parts[4]),
+                        'await_ms': float(parts[5]),
+                        'svctm_ms': float(parts[6]),
+                        'util_percent': float(parts[7])
+                    }
+                except (ValueError, IndexError) as e:
+                    logger.debug(f"Error parsing iostat line '{line}': {e}")
+
+        return devices
+
+    def _collect_bookie_iostat_metrics(self, max_workers: int = 10) -> Dict:
+        """
+        Collect iostat metrics from all bookie pods in parallel.
+
+        Args:
+            max_workers: Maximum concurrent kubectl exec operations
+
+        Returns:
+            Dictionary with iostat metrics per bookie
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        bookie_pods = self._get_bookie_pod_names()
+
+        if not bookie_pods:
+            logger.warning("No bookie pods found")
+            return {'available': False}
+
+        logger.debug(f"Collecting iostat from {len(bookie_pods)} bookies in parallel (max_workers={max_workers})")
+
+        iostat_results = {}
+        start_time = time.time()
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_pod = {
+                executor.submit(self._get_pod_iostat, pod_name): pod_name
+                for pod_name in bookie_pods
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_to_pod):
+                pod_name = future_to_pod[future]
+                try:
+                    iostat_data = future.result()
+                    if iostat_data:
+                        iostat_results[pod_name] = iostat_data
+                except Exception as e:
+                    logger.debug(f"Failed to collect iostat from {pod_name}: {e}")
+
+        elapsed = time.time() - start_time
+        logger.debug(f"Collected iostat from {len(iostat_results)}/{len(bookie_pods)} bookies in {elapsed:.2f}s")
+
+        return {
+            'available': len(iostat_results) > 0,
+            'bookies': iostat_results,
+            'collection_time_seconds': round(elapsed, 2)
+        }
+
     def collect_baseline_metrics(self) -> Dict:
         """
         Collect baseline metrics before test starts.
@@ -323,6 +453,7 @@ class MetricsCollector:
             'bookies': self._collect_bookie_metrics(),
             'bookkeeper': self._collect_bookkeeper_metrics(),
             'disk_io': self._collect_disk_metrics(),
+            'bookie_iostat': self._collect_bookie_iostat_metrics(),
             'network': self._collect_network_metrics(),
             'cluster_summary': self._collect_cluster_summary()
         }
@@ -350,6 +481,7 @@ class MetricsCollector:
             'bookies': self._collect_bookie_metrics(),
             'bookkeeper': self._collect_bookkeeper_metrics(),
             'disk_io': self._collect_disk_metrics(),
+            'bookie_iostat': self._collect_bookie_iostat_metrics(),
             'network': self._collect_network_metrics(),
             'cluster_summary': self._collect_cluster_summary()
         }
@@ -380,6 +512,25 @@ class MetricsCollector:
 
         def collection_loop():
             snapshot_count = 0
+
+            # Collect first snapshot immediately (don't wait for first interval)
+            try:
+                snapshot_count += 1
+                metrics = {
+                    'timestamp': datetime.now().isoformat(),
+                    'brokers': self._collect_broker_metrics(),
+                    'bookies': self._collect_bookie_metrics(),
+                    'bookkeeper': self._collect_bookkeeper_metrics(),
+                    'disk_io': self._collect_disk_metrics(),
+                    'bookie_iostat': self._collect_bookie_iostat_metrics(),
+                    'network': self._collect_network_metrics()
+                }
+                self.collected_metrics.append(metrics)
+                logger.info(f"Collected initial metrics snapshot #{snapshot_count}")
+            except Exception as e:
+                logger.error(f"Error collecting initial metrics: {e}")
+
+            # Continue collecting at intervals until stopped
             while not self.stop_event.wait(timeout=interval_seconds):
                 try:
                     snapshot_count += 1
@@ -389,6 +540,7 @@ class MetricsCollector:
                         'bookies': self._collect_bookie_metrics(),
                         'bookkeeper': self._collect_bookkeeper_metrics(),
                         'disk_io': self._collect_disk_metrics(),
+                        'bookie_iostat': self._collect_bookie_iostat_metrics(),
                         'network': self._collect_network_metrics()
                     }
                     self.collected_metrics.append(metrics)
@@ -562,21 +714,21 @@ class MetricsCollector:
         Returns:
             Dictionary with JVM heap, GC, and thread metrics
         """
-        # Query broker metrics endpoint (port 8080)
+        # Query broker metrics endpoint (port 8080, JSON format)
         result = self.run_command(
             ["kubectl", "exec", "-n", "pulsar", pod_name, "--",
-             "curl", "-s", "http://localhost:8080/metrics"],
+             "curl", "-s", "-m", "3", "http://localhost:8080/admin/v2/broker-stats/metrics"],
             f"Get JVM metrics for {pod_name}",
             capture_output=True,
             check=False,
             timeout=5
         )
 
-        if result.returncode != 0:
+        if result.returncode != 0 or not result.stdout.strip():
             return self._empty_jvm_metrics()
 
-        # Parse Prometheus-format metrics
-        return self._parse_jvm_metrics(result.stdout)
+        # Parse JSON-format metrics
+        return self._parse_broker_json_metrics(result.stdout)
 
     def _get_bookie_jvm_metrics(self, pod_name: str) -> Dict:
         """
@@ -603,6 +755,54 @@ class MetricsCollector:
 
         # Parse Prometheus-format metrics
         return self._parse_jvm_metrics(result.stdout)
+
+    def _parse_broker_json_metrics(self, json_output: str) -> Dict:
+        """
+        Parse JVM metrics from Pulsar broker JSON metrics format.
+
+        Args:
+            json_output: Raw JSON output from /admin/v2/broker-stats/metrics endpoint
+
+        Returns:
+            Dictionary with parsed JVM metrics
+        """
+        jvm_metrics = self._empty_jvm_metrics()
+
+        try:
+            metrics_list = json.loads(json_output)
+
+            # Find the JVM metrics object (has "metric":"jvm_metrics" dimension)
+            for metric_obj in metrics_list:
+                dimensions = metric_obj.get('dimensions', {})
+                if dimensions.get('metric') == 'jvm_metrics':
+                    metrics = metric_obj.get('metrics', {})
+
+                    # Extract heap metrics
+                    if 'jvm_heap_used' in metrics:
+                        heap_used = metrics['jvm_heap_used']
+                        jvm_metrics['heap_used_bytes'] = heap_used
+                        jvm_metrics['heap_used_mb'] = heap_used / (1024 * 1024)
+
+                    if 'jvm_max_memory' in metrics:
+                        heap_max = metrics['jvm_max_memory']
+                        jvm_metrics['heap_max_bytes'] = heap_max
+                        jvm_metrics['heap_max_mb'] = heap_max / (1024 * 1024)
+
+                    # Extract GC metrics (convert from pause count to seconds)
+                    if 'jvm_full_gc_pause' in metrics:
+                        # Pause is in units, convert to approximate seconds
+                        jvm_metrics['gc_time_seconds'] = metrics['jvm_full_gc_pause']
+
+                    # Extract thread count
+                    if 'jvm_thread_cnt' in metrics:
+                        jvm_metrics['thread_count'] = int(metrics['jvm_thread_cnt'])
+
+                    break
+
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+            logger.debug(f"Error parsing broker JSON metrics: {e}")
+
+        return jvm_metrics
 
     def _parse_jvm_metrics(self, metrics_output: str) -> Dict:
         """
@@ -716,7 +916,17 @@ class MetricsCollector:
         plot_data = {
             'timestamps': [],
             'brokers': {},
-            'bookies': {}
+            'bookies': {},
+            'bookkeeper': {
+                'bookie_write_latency_p50': [],
+                'bookie_write_latency_p99': [],
+                'bookie_write_latency_p999': [],
+                'broker_addentry_latency': [],
+                'journal_sync_latency': []
+            },
+            'bookie_iostat': {},
+            'disk_io_nodes': {},
+            'network_pods': {}
         }
 
         # Extract timeseries data
@@ -754,6 +964,87 @@ class MetricsCollector:
                 plot_data['bookies'][pod_name]['memory'].append(bookie['resources'].get('memory'))
                 plot_data['bookies'][pod_name]['heap_used_mb'].append(bookie['jvm'].get('heap_used_mb'))
                 plot_data['bookies'][pod_name]['gc_time_seconds'].append(bookie['jvm'].get('gc_time_seconds'))
+
+            # BookKeeper metrics
+            bk = snapshot.get('bookkeeper', {})
+            if bk.get('available'):
+                bk_write = bk.get('bookie_write_latency_ms', {})
+                plot_data['bookkeeper']['bookie_write_latency_p50'].append(bk_write.get('p50'))
+                plot_data['bookkeeper']['bookie_write_latency_p99'].append(bk_write.get('p99'))
+                plot_data['bookkeeper']['bookie_write_latency_p999'].append(bk_write.get('p999'))
+
+                broker_latency = bk.get('broker_addentry_latency_ms', {})
+                plot_data['bookkeeper']['broker_addentry_latency'].append(broker_latency.get('avg'))
+
+                journal = bk.get('journal_sync_latency_ms', {})
+                plot_data['bookkeeper']['journal_sync_latency'].append(journal.get('avg'))
+            else:
+                plot_data['bookkeeper']['bookie_write_latency_p50'].append(None)
+                plot_data['bookkeeper']['bookie_write_latency_p99'].append(None)
+                plot_data['bookkeeper']['bookie_write_latency_p999'].append(None)
+                plot_data['bookkeeper']['broker_addentry_latency'].append(None)
+                plot_data['bookkeeper']['journal_sync_latency'].append(None)
+
+            # Bookie iostat metrics
+            iostat = snapshot.get('bookie_iostat', {})
+            if iostat.get('available'):
+                for bookie_name, devices in iostat.get('bookies', {}).items():
+                    if bookie_name not in plot_data['bookie_iostat']:
+                        plot_data['bookie_iostat'][bookie_name] = {}
+
+                    for device_name, device_metrics in devices.items():
+                        if device_name not in plot_data['bookie_iostat'][bookie_name]:
+                            plot_data['bookie_iostat'][bookie_name][device_name] = {
+                                'reads_per_sec': [],
+                                'writes_per_sec': [],
+                                'read_mb_per_sec': [],
+                                'write_mb_per_sec': [],
+                                'await_ms': [],
+                                'svctm_ms': [],
+                                'util_percent': []
+                            }
+
+                        plot_data['bookie_iostat'][bookie_name][device_name]['reads_per_sec'].append(device_metrics.get('reads_per_sec'))
+                        plot_data['bookie_iostat'][bookie_name][device_name]['writes_per_sec'].append(device_metrics.get('writes_per_sec'))
+                        plot_data['bookie_iostat'][bookie_name][device_name]['read_mb_per_sec'].append(device_metrics.get('read_mb_per_sec'))
+                        plot_data['bookie_iostat'][bookie_name][device_name]['write_mb_per_sec'].append(device_metrics.get('write_mb_per_sec'))
+                        plot_data['bookie_iostat'][bookie_name][device_name]['await_ms'].append(device_metrics.get('await_ms'))
+                        plot_data['bookie_iostat'][bookie_name][device_name]['svctm_ms'].append(device_metrics.get('svctm_ms'))
+                        plot_data['bookie_iostat'][bookie_name][device_name]['util_percent'].append(device_metrics.get('util_percent'))
+
+            # Disk I/O metrics (from node-exporter)
+            disk_io = snapshot.get('disk_io', {})
+            if disk_io.get('available'):
+                for node_name, devices in disk_io.get('nodes', {}).items():
+                    if node_name not in plot_data['disk_io_nodes']:
+                        plot_data['disk_io_nodes'][node_name] = {}
+
+                    for device_name, device_metrics in devices.items():
+                        if device_name not in plot_data['disk_io_nodes'][node_name]:
+                            plot_data['disk_io_nodes'][node_name][device_name] = {
+                                'io_time_percent': [],
+                                'write_bytes_per_sec': [],
+                                'io_operations_now': []
+                            }
+
+                        plot_data['disk_io_nodes'][node_name][device_name]['io_time_percent'].append(device_metrics.get('io_time_percent'))
+                        plot_data['disk_io_nodes'][node_name][device_name]['write_bytes_per_sec'].append(device_metrics.get('write_bytes_per_sec'))
+                        plot_data['disk_io_nodes'][node_name][device_name]['io_operations_now'].append(device_metrics.get('io_operations_now'))
+
+            # Network metrics
+            network = snapshot.get('network', {})
+            if network.get('available'):
+                for pod_name, pod_metrics in network.get('pods', {}).items():
+                    if pod_name not in plot_data['network_pods']:
+                        plot_data['network_pods'][pod_name] = {
+                            'tx_bytes_per_sec': [],
+                            'rx_bytes_per_sec': [],
+                            'tx_errors_per_sec': []
+                        }
+
+                    plot_data['network_pods'][pod_name]['tx_bytes_per_sec'].append(pod_metrics.get('tx_bytes_per_sec'))
+                    plot_data['network_pods'][pod_name]['rx_bytes_per_sec'].append(pod_metrics.get('rx_bytes_per_sec'))
+                    plot_data['network_pods'][pod_name]['tx_errors_per_sec'].append(pod_metrics.get('tx_errors_per_sec'))
 
         # Save plot data
         plot_data_file = self.metrics_dir / "plot_data.json"
