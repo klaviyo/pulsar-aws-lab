@@ -13,6 +13,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Callable
 from threading import Thread, Event
 
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+    logger.warning("requests library not available - Prometheus integration disabled")
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,12 +40,20 @@ class MetricsCollector:
             namespace: Kubernetes namespace where Pulsar is deployed
             experiment_dir: Directory to store collected metrics
             run_command_func: Function to run kubectl commands
-            prometheus_url: Prometheus service URL (optional, defaults to kubectl port-forward)
+            prometheus_url: Prometheus service URL (optional, auto-detects if not provided)
         """
         self.namespace = namespace
         self.experiment_dir = experiment_dir
         self.run_command = run_command_func
-        self.prometheus_url = prometheus_url or "http://localhost:9090"
+
+        # Detect or use provided Prometheus URL
+        self.prometheus_url = prometheus_url or self._detect_prometheus_endpoint()
+        self.prometheus_available = self.prometheus_url is not None and REQUESTS_AVAILABLE
+
+        if self.prometheus_available:
+            logger.info(f"Prometheus integration enabled: {self.prometheus_url}")
+        else:
+            logger.warning("Prometheus integration disabled - limited metrics available")
 
         # Metrics storage directory
         self.metrics_dir = experiment_dir / "metrics"
@@ -48,6 +63,250 @@ class MetricsCollector:
         self.collection_thread: Optional[Thread] = None
         self.stop_event = Event()
         self.collected_metrics: List[Dict] = []
+
+    def _detect_prometheus_endpoint(self) -> Optional[str]:
+        """
+        Auto-detect Prometheus service endpoint.
+
+        Returns:
+            Prometheus URL if found, None otherwise
+        """
+        # Try common Prometheus service locations
+        potential_services = [
+            ("monitoring", "prometheus-server"),
+            ("pulsar", "prometheus"),
+            ("default", "prometheus"),
+        ]
+
+        for ns, svc_name in potential_services:
+            try:
+                result = self.run_command(
+                    ["kubectl", "get", "svc", "-n", ns, svc_name, "-o", "json"],
+                    f"Check for Prometheus in {ns}/{svc_name}",
+                    capture_output=True,
+                    check=False
+                )
+
+                if result.returncode == 0:
+                    logger.info(f"Found Prometheus service: {ns}/{svc_name}")
+                    # Use port 80 as default HTTP port
+                    return f"http://{svc_name}.{ns}.svc.cluster.local:80"
+            except Exception as e:
+                logger.debug(f"Error checking {ns}/{svc_name}: {e}")
+
+        # Try localhost (for port-forwarded Prometheus)
+        try:
+            if REQUESTS_AVAILABLE:
+                response = requests.get("http://localhost:9090/api/v1/status/config", timeout=1)
+                if response.status_code == 200:
+                    logger.info("Found Prometheus on localhost:9090")
+                    return "http://localhost:9090"
+        except Exception:
+            pass
+
+        logger.warning("Could not auto-detect Prometheus endpoint")
+        return None
+
+    def _query_prometheus(self, query: str, time_param: Optional[str] = None) -> List[Dict]:
+        """
+        Execute Prometheus query and return results.
+
+        Args:
+            query: PromQL query string
+            time_param: Optional timestamp for query (default: current time)
+
+        Returns:
+            List of result dictionaries from Prometheus
+        """
+        if not self.prometheus_available:
+            return []
+
+        try:
+            params = {'query': query}
+            if time_param:
+                params['time'] = time_param
+
+            response = requests.get(
+                f"{self.prometheus_url}/api/v1/query",
+                params=params,
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    return data.get('data', {}).get('result', [])
+                else:
+                    logger.warning(f"Prometheus query failed: {data.get('error')}")
+            else:
+                logger.warning(f"Prometheus HTTP error: {response.status_code}")
+        except Exception as e:
+            logger.debug(f"Error querying Prometheus: {e}")
+
+        return []
+
+    def _collect_bookkeeper_metrics(self) -> Dict:
+        """
+        Collect BookKeeper write latency metrics from Prometheus.
+
+        Returns:
+            Dictionary with BookKeeper performance metrics
+        """
+        bk_metrics = {'available': self.prometheus_available}
+
+        if not self.prometheus_available:
+            return bk_metrics
+
+        try:
+            # Bookie write latency (from bookie perspective)
+            bookie_write_p50 = self._query_prometheus(
+                'histogram_quantile(0.50, rate(bookie_SERVER_ADD_ENTRY_bucket[1m]))'
+            )
+            bookie_write_p99 = self._query_prometheus(
+                'histogram_quantile(0.99, rate(bookie_SERVER_ADD_ENTRY_bucket[1m]))'
+            )
+            bookie_write_p999 = self._query_prometheus(
+                'histogram_quantile(0.999, rate(bookie_SERVER_ADD_ENTRY_bucket[1m]))'
+            )
+
+            # Broker → BookKeeper latency (from broker perspective)
+            broker_addentry_latency = self._query_prometheus(
+                'pulsar_managedLedger_addEntryLatency'
+            )
+
+            # Journal sync latency
+            journal_sync = self._query_prometheus(
+                'bookie_journal_JOURNAL_SYNC_latency'
+            )
+
+            # Parse results
+            bk_metrics['bookie_write_latency_ms'] = {
+                'p50': float(bookie_write_p50[0]['value'][1]) * 1000 if bookie_write_p50 else None,
+                'p99': float(bookie_write_p99[0]['value'][1]) * 1000 if bookie_write_p99 else None,
+                'p999': float(bookie_write_p999[0]['value'][1]) * 1000 if bookie_write_p999 else None
+            }
+
+            bk_metrics['broker_addentry_latency_ms'] = {
+                'avg': float(broker_addentry_latency[0]['value'][1]) if broker_addentry_latency else None
+            }
+
+            bk_metrics['journal_sync_latency_ms'] = {
+                'avg': float(journal_sync[0]['value'][1]) * 1000 if journal_sync else None
+            }
+
+        except Exception as e:
+            logger.debug(f"Error collecting BookKeeper metrics: {e}")
+
+        return bk_metrics
+
+    def _collect_disk_metrics(self) -> Dict:
+        """
+        Collect disk I/O metrics from node-exporter (if available).
+
+        Returns:
+            Dictionary with disk I/O metrics per bookie node
+        """
+        disk_metrics = {'available': self.prometheus_available}
+
+        if not self.prometheus_available:
+            return disk_metrics
+
+        try:
+            # Disk I/O time percentage (how busy the disk is)
+            io_time_query = 'rate(node_disk_io_time_seconds_total{job="node-exporter"}[1m]) * 100'
+            io_time_results = self._query_prometheus(io_time_query)
+
+            # Disk write throughput
+            write_bytes_query = 'rate(node_disk_written_bytes_total{job="node-exporter"}[1m])'
+            write_bytes_results = self._query_prometheus(write_bytes_query)
+
+            # Current pending I/O operations
+            io_now_query = 'node_disk_io_now{job="node-exporter"}'
+            io_now_results = self._query_prometheus(io_now_query)
+
+            # Organize by node/device
+            nodes = {}
+            for result in io_time_results:
+                node = result['metric'].get('instance', 'unknown')
+                device = result['metric'].get('device', 'unknown')
+                if node not in nodes:
+                    nodes[node] = {}
+                if device not in nodes[node]:
+                    nodes[node][device] = {}
+                nodes[node][device]['io_time_percent'] = float(result['value'][1])
+
+            for result in write_bytes_results:
+                node = result['metric'].get('instance', 'unknown')
+                device = result['metric'].get('device', 'unknown')
+                if node in nodes and device in nodes[node]:
+                    nodes[node][device]['write_bytes_per_sec'] = float(result['value'][1])
+
+            for result in io_now_results:
+                node = result['metric'].get('instance', 'unknown')
+                device = result['metric'].get('device', 'unknown')
+                if node in nodes and device in nodes[node]:
+                    nodes[node][device]['io_operations_now'] = int(float(result['value'][1]))
+
+            disk_metrics['nodes'] = nodes
+            disk_metrics['available'] = len(nodes) > 0
+
+        except Exception as e:
+            logger.debug(f"Error collecting disk metrics: {e}")
+            disk_metrics['available'] = False
+
+        return disk_metrics
+
+    def _collect_network_metrics(self) -> Dict:
+        """
+        Collect network metrics from cAdvisor (if available).
+
+        Returns:
+            Dictionary with network metrics per pod
+        """
+        net_metrics = {'available': self.prometheus_available}
+
+        if not self.prometheus_available:
+            return net_metrics
+
+        try:
+            # Network transmit rate (bytes/sec)
+            tx_bytes_query = 'rate(container_network_transmit_bytes_total{namespace="pulsar"}[1m])'
+            tx_bytes_results = self._query_prometheus(tx_bytes_query)
+
+            # Network receive rate (bytes/sec)
+            rx_bytes_query = 'rate(container_network_receive_bytes_total{namespace="pulsar"}[1m])'
+            rx_bytes_results = self._query_prometheus(rx_bytes_query)
+
+            # Transmission errors
+            tx_errors_query = 'rate(container_network_transmit_errors_total{namespace="pulsar"}[1m])'
+            tx_errors_results = self._query_prometheus(tx_errors_query)
+
+            # Organize by pod
+            pods = {}
+            for result in tx_bytes_results:
+                pod = result['metric'].get('pod', 'unknown')
+                if pod not in pods:
+                    pods[pod] = {}
+                pods[pod]['tx_bytes_per_sec'] = float(result['value'][1])
+
+            for result in rx_bytes_results:
+                pod = result['metric'].get('pod', 'unknown')
+                if pod in pods:
+                    pods[pod]['rx_bytes_per_sec'] = float(result['value'][1])
+
+            for result in tx_errors_results:
+                pod = result['metric'].get('pod', 'unknown')
+                if pod in pods:
+                    pods[pod]['tx_errors_per_sec'] = float(result['value'][1])
+
+            net_metrics['pods'] = pods
+            net_metrics['available'] = len(pods) > 0
+
+        except Exception as e:
+            logger.debug(f"Error collecting network metrics: {e}")
+            net_metrics['available'] = False
+
+        return net_metrics
 
     def collect_baseline_metrics(self) -> Dict:
         """
@@ -62,6 +321,9 @@ class MetricsCollector:
             'timestamp': datetime.now().isoformat(),
             'brokers': self._collect_broker_metrics(),
             'bookies': self._collect_bookie_metrics(),
+            'bookkeeper': self._collect_bookkeeper_metrics(),
+            'disk_io': self._collect_disk_metrics(),
+            'network': self._collect_network_metrics(),
             'cluster_summary': self._collect_cluster_summary()
         }
 
@@ -86,6 +348,9 @@ class MetricsCollector:
             'timestamp': datetime.now().isoformat(),
             'brokers': self._collect_broker_metrics(),
             'bookies': self._collect_bookie_metrics(),
+            'bookkeeper': self._collect_bookkeeper_metrics(),
+            'disk_io': self._collect_disk_metrics(),
+            'network': self._collect_network_metrics(),
             'cluster_summary': self._collect_cluster_summary()
         }
 
@@ -114,19 +379,27 @@ class MetricsCollector:
         self.collected_metrics = []
 
         def collection_loop():
+            snapshot_count = 0
             while not self.stop_event.wait(timeout=interval_seconds):
                 try:
+                    snapshot_count += 1
                     metrics = {
                         'timestamp': datetime.now().isoformat(),
                         'brokers': self._collect_broker_metrics(),
-                        'bookies': self._collect_bookie_metrics()
+                        'bookies': self._collect_bookie_metrics(),
+                        'bookkeeper': self._collect_bookkeeper_metrics(),
+                        'disk_io': self._collect_disk_metrics(),
+                        'network': self._collect_network_metrics()
                     }
                     self.collected_metrics.append(metrics)
-                    logger.debug(f"Collected metrics snapshot ({len(self.collected_metrics)} total)")
+                    logger.debug(f"Collected metrics snapshot #{snapshot_count} ({len(self.collected_metrics)} total)")
                 except Exception as e:
                     logger.error(f"Error collecting background metrics: {e}")
 
-        self.collection_thread = Thread(target=collection_loop, daemon=True)
+            logger.info(f"Background collection loop ended. Total snapshots: {snapshot_count}")
+
+        # Use non-daemon thread to ensure collection completes
+        self.collection_thread = Thread(target=collection_loop, daemon=False)
         self.collection_thread.start()
 
     def stop_background_collection(self) -> List[Dict]:
