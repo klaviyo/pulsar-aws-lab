@@ -44,8 +44,9 @@ CONFIG_DIR = PROJECT_ROOT / "config"
 RESULTS_DIR = PROJECT_ROOT / "results"
 
 # Pulsar cluster connection details
-PULSAR_SERVICE_URL = "pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650"
-PULSAR_HTTP_URL = "http://pulsar-proxy.pulsar.svc.cluster.local:80"
+# Updated to connect directly to brokers (bypassing proxy for better performance)
+PULSAR_SERVICE_URL = "pulsar://pulsar-broker.pulsar.svc.cluster.local:6650"
+PULSAR_HTTP_URL = "http://pulsar-broker.pulsar.svc.cluster.local:8080"
 PULSAR_TEST_NAMESPACE = "public/omb-test"  # Namespace prefix for OMB test topics (OMB appends random suffix)
 
 # Grafana dashboard URL
@@ -714,9 +715,9 @@ data:
       namespacePrefix: {self.pulsar_tenant_namespace}
     producer:
       batchingEnabled: true
-      batchingMaxPublishDelayMs: 1
+      batchingMaxPublishDelayMs: 5
       blockIfQueueFull: true
-      pendingQueueSize: 1000
+      pendingQueueSize: 50000
     consumer:
       subscriptionType: Shared
 """
@@ -759,22 +760,22 @@ spec:
             echo ""
 
             echo "===== DNS Resolution ====="
-            nslookup pulsar-proxy.pulsar.svc.cluster.local || echo "DNS lookup failed"
+            nslookup pulsar-broker.pulsar.svc.cluster.local || echo "DNS lookup failed"
             echo ""
 
             echo "===== Network Connectivity ====="
             echo "Testing binary protocol port (6650)..."
-            timeout 5 nc -zv pulsar-proxy.pulsar.svc.cluster.local 6650 || echo "Port 6650 not reachable"
-            echo "Testing HTTP port (80)..."
-            timeout 5 nc -zv pulsar-proxy.pulsar.svc.cluster.local 80 || echo "Port 80 not reachable"
+            timeout 5 nc -zv pulsar-broker.pulsar.svc.cluster.local 6650 || echo "Port 6650 not reachable"
+            echo "Testing HTTP port (8080)..."
+            timeout 5 nc -zv pulsar-broker.pulsar.svc.cluster.local 8080 || echo "Port 8080 not reachable"
             echo ""
 
             echo "===== HTTP Endpoint Tests ====="
             echo "Testing /admin/v2/brokers/health..."
-            curl -v -m 10 http://pulsar-proxy.pulsar.svc.cluster.local:80/admin/v2/brokers/health || echo "Health check failed"
+            curl -v -m 10 http://pulsar-broker.pulsar.svc.cluster.local:8080/admin/v2/brokers/health || echo "Health check failed"
             echo ""
             echo "Testing /admin/v2/namespaces/public/default..."
-            curl -v -m 10 http://pulsar-proxy.pulsar.svc.cluster.local:80/admin/v2/namespaces/public/default || echo "Namespace check failed"
+            curl -v -m 10 http://pulsar-broker.pulsar.svc.cluster.local:8080/admin/v2/namespaces/public/default || echo "Namespace check failed"
             echo ""
 
             echo "===== Configuration Files ====="
@@ -964,8 +965,12 @@ spec:
             'warmupDurationMinutes': overrides.get('workload_overrides', {}).get('warmup_duration_minutes', base.get('warmup_duration_minutes', 1)),
         }
 
+        # Set producer rate based on test type
         if overrides['type'] == 'fixed_rate' and 'producer_rate' in overrides:
             workload['producerRate'] = overrides['producer_rate']
+        elif overrides['type'] == 'max_rate':
+            # producerRate: 0 means "produce at maximum possible rate" (saturation test)
+            workload['producerRate'] = 0
 
         return workload
 

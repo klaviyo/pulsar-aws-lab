@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Pulsar OMB Lab** is a specialized load testing framework for Apache Pulsar using the OpenMessaging Benchmark (OMB) framework. This tool runs performance tests against **existing Pulsar clusters** and generates comprehensive reports.
 
-**CRITICAL**: This repository does NOT deploy Pulsar. You must have a running Pulsar cluster accessible at `pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650` before using this framework.
+**CRITICAL**: This repository does NOT deploy Pulsar. You must have a running Pulsar cluster accessible at `pulsar://pulsar-broker.pulsar.svc.cluster.local:6650` before using this framework.
 
 ## What This Framework Does
 
@@ -83,8 +83,8 @@ When you run a test, the orchestrator:
 - **Service Account**: Uses default service account with minimal permissions
 
 **Hardcoded Pulsar Connection:**
-- Service URL: `pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650`
-- HTTP URL: `http://pulsar-proxy.pulsar.svc.cluster.local:8080`
+- Service URL: `pulsar://pulsar-broker.pulsar.svc.cluster.local:6650`
+- HTTP URL: `http://pulsar-broker.pulsar.svc.cluster.local:8080`
 - Assumes Pulsar proxy service exists in `pulsar` namespace
 - No authentication configured (modify for production use)
 
@@ -153,8 +153,8 @@ When you run a test, the orchestrator:
 
 1. **Running Pulsar Cluster**
    - Must be deployed in Kubernetes
-   - Proxy service must be accessible at: `pulsar-proxy.pulsar.svc.cluster.local:6650`
-   - HTTP admin API at: `pulsar-proxy.pulsar.svc.cluster.local:8080`
+   - Proxy service must be accessible at: `pulsar-broker.pulsar.svc.cluster.local:6650`
+   - HTTP admin API at: `pulsar-broker.pulsar.svc.cluster.local:8080`
    - Cluster must be healthy and ready to accept connections
 
 2. **Kubernetes Cluster Access**
@@ -225,15 +225,15 @@ Before running tests, verify your Pulsar cluster is accessible:
 
 ```bash
 # Check Pulsar proxy service exists
-kubectl get svc -n pulsar pulsar-proxy
+kubectl get svc -n pulsar pulsar-broker
 
 # Expected output should show:
 # NAME           TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)
-# pulsar-proxy   ClusterIP   10.96.xxx.xxx   <none>        6650/TCP,8080/TCP
+# pulsar-broker   ClusterIP   10.96.xxx.xxx   <none>        6650/TCP,8080/TCP
 
 # Test connectivity from a pod
 kubectl run curl-test --image=curlimages/curl -i --rm --restart=Never -- \
-  curl -v http://pulsar-proxy.pulsar.svc.cluster.local:8080/admin/v2/clusters
+  curl -v http://pulsar-broker.pulsar.svc.cluster.local:8080/admin/v2/clusters
 
 # Should return Pulsar cluster information (not connection refused)
 
@@ -433,8 +433,8 @@ name: "Simple Producer-Consumer Test"
 # Pulsar-specific driver configuration (DO NOT MODIFY serviceUrl)
 driverConfig:
   name: "Pulsar"
-  serviceUrl: "pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650"
-  httpUrl: "http://pulsar-proxy.pulsar.svc.cluster.local:8080"
+  serviceUrl: "pulsar://pulsar-broker.pulsar.svc.cluster.local:6650"
+  httpUrl: "http://pulsar-broker.pulsar.svc.cluster.local:8080"
 
 # Topic and subscription configuration
 topics:
@@ -528,14 +528,14 @@ For each test, the following metrics are extracted:
 **Diagnosis**:
 ```bash
 # Check Pulsar proxy service exists
-kubectl get svc -n pulsar pulsar-proxy
+kubectl get svc -n pulsar pulsar-broker
 
 # Check service endpoints
-kubectl get endpoints -n pulsar pulsar-proxy
+kubectl get endpoints -n pulsar pulsar-broker
 
 # Test connectivity from test namespace
 kubectl run -n pulsar-omb curl-test --image=curlimages/curl -i --rm --restart=Never -- \
-  curl -v http://pulsar-proxy.pulsar.svc.cluster.local:8080/admin/v2/clusters
+  curl -v http://pulsar-broker.pulsar.svc.cluster.local:8080/admin/v2/clusters
 ```
 
 **Solutions**:

@@ -1,47 +1,28 @@
-# Manual Ramp-Up Throughput Test Plan
-# Discover maximum sustainable throughput by testing at increasing fixed rates
+# Saturation Throughput Test Plan
+# Discover maximum sustainable throughput by producing at max rate (no rate limit)
 
-name: "manual-ramp-throughput"
-description: "Manual ramp-up to discover max throughput using progressive fixed-rate tests"
+name: "saturation-throughput"
+description: "Maximum throughput saturation test - produce at max possible rate to find cluster limits"
 
 base_workload:
-  name: "ramp-throughput-test"
-  topics: 1
-  partitions_per_topic: 16
+  name: "saturation-test"
+  topics: 200
+  partitions_per_topic: 8
   message_size: 1024  # 1 KB
   subscriptions_per_topic: 1
-  producers_per_topic: 4
-  consumers_per_topic: 4
+  producers_per_topic: 1
+  consumers_per_topic: 1
   consumer_backlog_size_gb: 0
-  test_duration_minutes: 5  # Shorter duration for each test
-  warmup_duration_minutes: 1
+  test_duration_minutes: 15
+  warmup_duration_minutes: 2
 
 test_runs:
-  # Manual ramping - test at increasing fixed rates to find max capacity
-  - name: "test-50k"
-    description: "Baseline test at 50k msgs/sec"
-    type: "fixed_rate"
-    producer_rate: 50000
-
-  - name: "test-75k"
-    description: "Increase to 75k msgs/sec"
-    type: "fixed_rate"
-    producer_rate: 75000
-
-  - name: "test-100k"
-    description: "Test at 100k msgs/sec"
-    type: "fixed_rate"
-    producer_rate: 100000
-
-  - name: "test-125k"
-    description: "Push to 125k msgs/sec"
-    type: "fixed_rate"
-    producer_rate: 125000
-
-  - name: "test-150k"
-    description: "Test upper limit at 150k msgs/sec"
-    type: "fixed_rate"
-    producer_rate: 150000
+  # Saturation test - producerRate: 0 means "produce at maximum possible rate"
+  # This will saturate the cluster and reveal true maximum throughput
+  - name: "max-throughput"
+    description: "Maximum throughput test - no rate limit (producerRate: 0)"
+    type: "max_rate"
+    num_workers: 40
 
 reporting:
   output_format:

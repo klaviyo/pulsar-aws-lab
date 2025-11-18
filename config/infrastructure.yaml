@@ -17,9 +17,10 @@ kubernetes:
   namespace: "pulsar"  # Namespace where OMB jobs will run
 
 # Pulsar cluster connection
+# Updated to connect directly to brokers (bypassing proxy for better performance)
 pulsar:
-  service_url: "pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650"
-  http_url: "http://pulsar-proxy.pulsar.svc.cluster.local:8080"
+  service_url: "pulsar://pulsar-broker.pulsar.svc.cluster.local:6650"
+  http_url: "http://pulsar-broker.pulsar.svc.cluster.local:8080"
 
 # OpenMessaging Benchmark configuration
 benchmark:
