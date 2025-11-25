@@ -23,7 +23,6 @@ from rich import box
 
 from tui import OrchestratorUI
 from operations import cleanup_pulsar_namespaces, cleanup_pulsar_topics
-from kubernetes_manager import KubernetesManager
 from pulsar_manager import PulsarManager
 from results_collector import ResultsCollector
 from metrics_collector import MetricsCollector
@@ -98,11 +97,6 @@ class Orchestrator:
         self.test_results = ""
 
         # Initialize managers
-        self.k8s_manager = KubernetesManager(
-            namespace=self.namespace,
-            experiment_dir=self.experiment_dir
-        )
-
         self.pulsar_manager = PulsarManager(
             pulsar_namespace=self.pulsar_tenant_namespace,
             run_command_func=self.run_command,
@@ -132,7 +126,7 @@ class Orchestrator:
         )
 
         # Ensure K8s namespace exists
-        self.k8s_manager.ensure_namespace_exists()
+        self._ensure_namespace_exists()
 
         # Ensure Pulsar namespace exists
         self.pulsar_manager.ensure_pulsar_namespace_exists()
@@ -184,6 +178,25 @@ class Orchestrator:
         self.console.print()
         self.console.print(Panel(table, title="[bold cyan]Experiment Configuration[/bold cyan]", border_style="cyan"))
         self.console.print()
+
+    def _ensure_namespace_exists(self) -> None:
+        """Ensure the K8s namespace exists, create if not."""
+        result = self.run_command(
+            ["kubectl", "get", "namespace", self.namespace],
+            f"Check if K8s namespace {self.namespace} exists",
+            capture_output=True,
+            check=False
+        )
+
+        if result.returncode != 0:
+            logger.info(f"Creating K8s namespace: {self.namespace}")
+            self.run_command(
+                ["kubectl", "create", "namespace", self.namespace],
+                f"Create K8s namespace {self.namespace}"
+            )
+            logger.info(f"K8s namespace '{self.namespace}' created")
+        else:
+            logger.debug(f"K8s namespace '{self.namespace}' already exists")
 
     def _add_status(self, message: str, level: str = 'info') -> None:
         """Add a status message (delegates to UI)."""
