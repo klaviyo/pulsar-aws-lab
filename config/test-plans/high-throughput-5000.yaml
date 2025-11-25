@@ -1,0 +1,35 @@
+# High Throughput Test Plan
+# Stress test with high load - 5M msgs/sec
+
+name: "high-throughput"
+description: "High throughput stress test - 5M msgs/sec"
+
+base_workload:
+  name: "high-throughput-5000-test"
+  topics: 500
+  partitions_per_topic: 12
+  message_size: 1024  # 1 KB
+  subscriptions_per_topic: 1
+  producers_per_topic: 1
+  consumers_per_topic: 1
+  consumer_backlog_size_gb: 0
+  test_duration_minutes: 15
+  warmup_duration_minutes: 1
+
+test_runs:
+  - name: "throughput-5000k"
+    description: "5M msgs/sec high load test"
+    type: "fixed_rate"
+    producer_rate: 5000000
+    num_workers: 60
+
+reporting:
+  output_format:
+    - "html"
+    - "json"
+  include_raw_data: true
+  metrics_to_highlight:
+    - "throughput"
+    - "p99_latency"
+    - "cpu_usage"
+
