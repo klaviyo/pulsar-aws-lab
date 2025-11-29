@@ -223,6 +223,13 @@ spec:
       labels:
         app: omb-worker
     spec:
+      nodeSelector:
+        klaviyo.com/pool-name: loadgen
+      tolerations:
+      - key: "loadgen"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
       containers:
       - name: worker
         image: {self.omb_image}

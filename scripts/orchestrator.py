@@ -758,6 +758,13 @@ spec:
         test: {test_name}
     spec:
       restartPolicy: Never
+      nodeSelector:
+        klaviyo.com/pool-name: loadgen
+      tolerations:
+      - key: "loadgen"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
       containers:
       - name: omb-driver
         image: {self.omb_image}

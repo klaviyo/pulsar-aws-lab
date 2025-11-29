@@ -1,8 +1,9 @@
 # High Throughput Test Plan
 # Stress test with high load - 1M msgs/sec
+# Updated to properly saturate Pulsar cluster with sufficient parallelism
 
 name: "high-throughput"
-description: "High throughput stress test with 4 producers and 4 consumers"
+description: "High throughput stress test optimized for 1M+ msg/s"
 
 base_workload:
   name: "high-throughput-1000-test"
@@ -10,18 +11,44 @@ base_workload:
   partitions_per_topic: 16
   message_size: 1024  # 1 KB
   subscriptions_per_topic: 1
-  producers_per_topic: 1
-  consumers_per_topic: 1
+  producers_per_topic: 16  # Increased from 4 for better parallelism (1600 total producers)
+  consumers_per_topic: 8   # Increased from 4 to keep up with higher produce rate
   consumer_backlog_size_gb: 0
   test_duration_minutes: 15
   warmup_duration_minutes: 1
+
+# Pulsar client tuning for high throughput
+client_config:
+  pending_queue_size: 500000      # Increased from 50,000 to handle backpressure
+  max_pending_messages: 10000     # Per-producer pending messages
+  batching_enabled: true
+  batching_max_publish_delay_ms: 1  # Reduced from 5ms for higher throughput
+  batching_max_messages: 1000
+  send_timeout_ms: 120000         # 2 minutes timeout
 
 test_runs:
   - name: "throughput-1000k"
     description: "1M msgs/sec high load test"
     type: "fixed_rate"
     producer_rate: 1000000
-    num_workers: 15  # 
+    num_workers: 50  # Increased from 15 to generate sufficient load
+
+# Worker pod scheduling - target dedicated loadgen nodes
+worker_config:
+  node_selector:
+    node.kubernetes.io/instance-type: c7gn.4xlarge
+  tolerations:
+    - key: "loadgen"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
+  resources:
+    requests:
+      cpu: "4"
+      memory: "8Gi"
+    limits:
+      cpu: "14"
+      memory: "28Gi"
 
 reporting:
   output_format:
