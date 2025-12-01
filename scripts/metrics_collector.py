@@ -338,7 +338,7 @@ class MetricsCollector:
         Returns:
             Dictionary with iostat metrics per device, or None if failed
         """
-        # Run iostat with 2 samples (skip first which is since boot)
+        # First try iostat with 2 samples (skip first which is since boot)
         result = self.run_command(
             ["kubectl", "exec", "-n", "pulsar", pod_name, "--",
              "sh", "-c", "iostat -xm 1 2 2>/dev/null | tail -n +4 || echo 'IOSTAT_NOT_AVAILABLE'"],
@@ -348,11 +348,168 @@ class MetricsCollector:
             timeout=5
         )
 
-        if result.returncode != 0 or 'IOSTAT_NOT_AVAILABLE' in result.stdout:
-            logger.debug(f"iostat not available in {pod_name}")
+        if result.returncode == 0 and 'IOSTAT_NOT_AVAILABLE' not in result.stdout:
+            return self._parse_iostat_output(result.stdout)
+
+        # Fallback: parse /proc/diskstats directly (works without sysstat package)
+        logger.debug(f"iostat not available in {pod_name}, falling back to /proc/diskstats")
+        return self._get_pod_diskstats(pod_name)
+
+    def _get_pod_diskstats(self, pod_name: str) -> Optional[Dict]:
+        """
+        Collect disk stats from /proc/diskstats with two samples to calculate rates.
+
+        Args:
+            pod_name: Pod name to collect from
+
+        Returns:
+            Dictionary with disk metrics per device, or None if failed
+        """
+        # Collect two samples 1 second apart to calculate rates
+        script = '''
+        cat /proc/diskstats > /tmp/diskstats1
+        sleep 1
+        cat /proc/diskstats > /tmp/diskstats2
+        echo "=== SAMPLE1 ==="
+        cat /tmp/diskstats1
+        echo "=== SAMPLE2 ==="
+        cat /tmp/diskstats2
+        '''
+
+        result = self.run_command(
+            ["kubectl", "exec", "-n", "pulsar", pod_name, "--",
+             "sh", "-c", script],
+            f"Get /proc/diskstats for {pod_name}",
+            capture_output=True,
+            check=False,
+            timeout=10
+        )
+
+        if result.returncode != 0:
+            logger.debug(f"Failed to get /proc/diskstats from {pod_name}")
             return None
 
-        return self._parse_iostat_output(result.stdout)
+        return self._parse_diskstats_samples(result.stdout)
+
+    def _parse_diskstats_samples(self, output: str) -> Dict[str, Dict]:
+        """
+        Parse two /proc/diskstats samples and calculate rates.
+
+        /proc/diskstats format (kernel 4.18+):
+        major minor name reads_completed reads_merged sectors_read ms_reading
+        writes_completed writes_merged sectors_written ms_writing ios_in_progress
+        ms_io weighted_ms_io discards_completed discards_merged sectors_discarded
+        ms_discarding flush_requests ms_flushing
+
+        Args:
+            output: Raw output containing two samples separated by markers
+
+        Returns:
+            Dictionary mapping device names to calculated metrics
+        """
+        devices = {}
+
+        try:
+            parts = output.split("=== SAMPLE2 ===")
+            if len(parts) != 2:
+                return devices
+
+            sample1_text = parts[0].replace("=== SAMPLE1 ===", "").strip()
+            sample2_text = parts[1].strip()
+
+            sample1 = self._parse_single_diskstats(sample1_text)
+            sample2 = self._parse_single_diskstats(sample2_text)
+
+            # Calculate rates (per second, since we waited 1 second)
+            # Filter to only include real block devices (nvme*, sd*, vd*, xvd*)
+            for device in sample2:
+                if device not in sample1:
+                    continue
+
+                # Only include real disk devices, not partitions or loop devices
+                if not any(device.startswith(prefix) for prefix in ['nvme', 'sd', 'vd', 'xvd', 'dm-']):
+                    continue
+
+                # Skip partition numbers (e.g., nvme0n1p1) - we want whole devices
+                if 'p' in device and device.split('p')[-1].isdigit():
+                    continue
+
+                s1 = sample1[device]
+                s2 = sample2[device]
+
+                # Calculate deltas
+                reads_completed = s2['reads_completed'] - s1['reads_completed']
+                writes_completed = s2['writes_completed'] - s1['writes_completed']
+                sectors_read = s2['sectors_read'] - s1['sectors_read']
+                sectors_written = s2['sectors_written'] - s1['sectors_written']
+                ms_reading = s2['ms_reading'] - s1['ms_reading']
+                ms_writing = s2['ms_writing'] - s1['ms_writing']
+                ms_io = s2['ms_io'] - s1['ms_io']
+
+                # Sector size is typically 512 bytes
+                sector_size = 512
+
+                # Calculate derived metrics
+                total_ios = reads_completed + writes_completed
+                await_ms = 0.0
+                if total_ios > 0:
+                    await_ms = (ms_reading + ms_writing) / total_ios
+
+                # Utilization: ms_io / 1000ms * 100%
+                util_percent = ms_io / 10.0  # ms_io per second, convert to percent
+
+                devices[device] = {
+                    'reads_per_sec': float(reads_completed),
+                    'writes_per_sec': float(writes_completed),
+                    'read_mb_per_sec': round((sectors_read * sector_size) / (1024 * 1024), 2),
+                    'write_mb_per_sec': round((sectors_written * sector_size) / (1024 * 1024), 2),
+                    'await_ms': round(await_ms, 2),
+                    'svctm_ms': round(await_ms, 2),  # Approximation
+                    'util_percent': round(min(util_percent, 100.0), 2),
+                    'ios_in_progress': s2['ios_in_progress']
+                }
+
+        except Exception as e:
+            logger.debug(f"Error parsing diskstats: {e}")
+
+        return devices
+
+    def _parse_single_diskstats(self, text: str) -> Dict[str, Dict]:
+        """
+        Parse a single /proc/diskstats sample.
+
+        Args:
+            text: Raw /proc/diskstats content
+
+        Returns:
+            Dictionary mapping device names to raw stats
+        """
+        devices = {}
+
+        for line in text.strip().split('\n'):
+            parts = line.split()
+            if len(parts) < 14:
+                continue
+
+            device_name = parts[2]
+            try:
+                devices[device_name] = {
+                    'reads_completed': int(parts[3]),
+                    'reads_merged': int(parts[4]),
+                    'sectors_read': int(parts[5]),
+                    'ms_reading': int(parts[6]),
+                    'writes_completed': int(parts[7]),
+                    'writes_merged': int(parts[8]),
+                    'sectors_written': int(parts[9]),
+                    'ms_writing': int(parts[10]),
+                    'ios_in_progress': int(parts[11]),
+                    'ms_io': int(parts[12]),
+                    'weighted_ms_io': int(parts[13])
+                }
+            except (ValueError, IndexError) as e:
+                logger.debug(f"Error parsing diskstats line: {e}")
+
+        return devices
 
     def _parse_iostat_output(self, output: str) -> Dict[str, Dict]:
         """

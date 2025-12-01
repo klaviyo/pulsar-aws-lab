@@ -9,7 +9,8 @@
 #   --push              Push image to ECR after build
 #   --registry REPO     Docker registry/repository (default: ECR sre/pulsar-omb)
 #   --tag TAG           Additional image tag (timestamp tag is always added)
-#   --platform PLATFORM Build for specific platform (default: linux/amd64)
+#   --platform PLATFORM Build for specific platform (default: linux/amd64,linux/arm64)
+#   --multi-arch        Build for both amd64 and arm64 (same as --platform linux/amd64,linux/arm64)
 #
 
 set -euo pipefail
@@ -24,7 +25,8 @@ PUSH=false
 REGISTRY="439508887365.dkr.ecr.us-east-1.amazonaws.com/sre/pulsar-omb"
 AWS_REGION="us-east-1"
 TAG=""
-PLATFORM="linux/amd64"  # Default to x86_64 for AWS compatibility
+PLATFORM="linux/amd64,linux/arm64"  # Default to multi-arch for Graviton support
+MULTI_ARCH=true
 
 # Generate timestamp tag: YYYYMMDDHHmm
 TIMESTAMP_TAG=$(date -u +"%Y%m%d%H%M")
@@ -46,7 +48,16 @@ while [[ $# -gt 0 ]]; do
             ;;
         --platform)
             PLATFORM="$2"
+            MULTI_ARCH=false
+            if [[ "$PLATFORM" == *","* ]]; then
+                MULTI_ARCH=true
+            fi
             shift 2
+            ;;
+        --multi-arch)
+            PLATFORM="linux/amd64,linux/arm64"
+            MULTI_ARCH=true
+            shift
             ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
@@ -56,10 +67,16 @@ while [[ $# -gt 0 ]]; do
             echo "  --registry REPO     Docker registry/repository"
             echo "                      (default: 439508887365.dkr.ecr.us-east-1.amazonaws.com/sre/pulsar-omb)"
             echo "  --tag TAG           Additional image tag (timestamp tag is always created)"
-            echo "  --platform PLATFORM Build for specific platform (default: linux/amd64)"
+            echo "  --platform PLATFORM Build for specific platform (default: linux/amd64,linux/arm64)"
+            echo "  --multi-arch        Build for both amd64 and arm64 (default)"
             echo "  -h, --help          Show this help message"
             echo ""
             echo "Image is always tagged with timestamp (YYYYMMDDHHmm) and 'latest'"
+            echo ""
+            echo "Examples:"
+            echo "  $0 --push                    # Build multi-arch and push to ECR"
+            echo "  $0 --platform linux/amd64    # Build x86_64 only"
+            echo "  $0 --platform linux/arm64    # Build ARM64 only"
             exit 0
             ;;
         *)
@@ -82,48 +99,59 @@ if [ -n "$TAG" ]; then
 fi
 echo ""
 echo "Dockerfile location: ${DOCKERFILE_DIR}"
+echo "Platform(s): ${PLATFORM}"
+echo "Multi-arch: ${MULTI_ARCH}"
 echo ""
 
-BUILD_CMD="docker build -t ${TIMESTAMP_IMAGE} -t ${LATEST_IMAGE}"
+# For multi-arch builds, we need to use buildx and push in a single command
+# because multi-arch manifests can't be stored locally
+if [ "$MULTI_ARCH" = true ]; then
+    echo "Multi-arch build requires pushing to registry. Checking prerequisites..."
 
-if [ -n "$TAG" ]; then
-    CUSTOM_IMAGE="${REGISTRY}:${TAG}"
-    BUILD_CMD="${BUILD_CMD} -t ${CUSTOM_IMAGE}"
-fi
+    # Ensure buildx builder exists
+    if ! docker buildx inspect multiarch-builder &>/dev/null; then
+        echo "Creating buildx builder for multi-arch builds..."
+        docker buildx create --name multiarch-builder --use --bootstrap
+    else
+        docker buildx use multiarch-builder
+    fi
 
-if [ -n "$PLATFORM" ]; then
-    BUILD_CMD="${BUILD_CMD} --platform ${PLATFORM}"
-fi
+    if [ "$PUSH" = false ]; then
+        echo ""
+        echo "ERROR: Multi-arch builds must be pushed to a registry."
+        echo "       Multi-platform images cannot be stored locally."
+        echo ""
+        echo "Please run with --push flag:"
+        echo "  $0 --push"
+        echo ""
+        echo "Or build for a single platform:"
+        echo "  $0 --platform linux/amd64"
+        echo "  $0 --platform linux/arm64"
+        exit 1
+    fi
 
-BUILD_CMD="${BUILD_CMD} ${DOCKERFILE_DIR}"
-
-echo "Running: ${BUILD_CMD}"
-eval "${BUILD_CMD}"
-
-echo "✓ Successfully built images"
-
-# Push if requested
-if [ "$PUSH" = true ]; then
     echo ""
     echo "Logging in to ECR..."
     aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${REGISTRY%%/*}
 
     echo ""
-    echo "Pushing images to ECR..."
+    echo "Building and pushing multi-arch image..."
 
-    echo "  Pushing ${TIMESTAMP_TAG}..."
-    docker push "${TIMESTAMP_IMAGE}"
-
-    echo "  Pushing latest..."
-    docker push "${LATEST_IMAGE}"
+    BUILD_CMD="docker buildx build --platform ${PLATFORM}"
+    BUILD_CMD="${BUILD_CMD} -t ${TIMESTAMP_IMAGE} -t ${LATEST_IMAGE}"
 
     if [ -n "$TAG" ]; then
-        echo "  Pushing ${TAG}..."
-        docker push "${CUSTOM_IMAGE}"
+        CUSTOM_IMAGE="${REGISTRY}:${TAG}"
+        BUILD_CMD="${BUILD_CMD} -t ${CUSTOM_IMAGE}"
     fi
 
+    BUILD_CMD="${BUILD_CMD} --push ${DOCKERFILE_DIR}"
+
+    echo "Running: ${BUILD_CMD}"
+    eval "${BUILD_CMD}"
+
     echo ""
-    echo "✓ Successfully pushed all images to ECR"
+    echo "✓ Successfully built and pushed multi-arch images"
     echo ""
     echo "Images available at:"
     echo "  ${TIMESTAMP_IMAGE}"
@@ -131,17 +159,66 @@ if [ "$PUSH" = true ]; then
     if [ -n "$TAG" ]; then
         echo "  ${CUSTOM_IMAGE}"
     fi
-fi
+    echo ""
+    echo "Supported architectures: amd64 (x86_64), arm64 (Graviton)"
 
-echo ""
-echo "Local image details:"
-docker images "${REGISTRY}" | head -5
-echo ""
-echo "To run the image:"
-echo "  docker run --rm ${LATEST_IMAGE} 'benchmark --help'"
-echo ""
+else
+    # Single platform build - can be done locally
+    BUILD_CMD="docker build -t ${TIMESTAMP_IMAGE} -t ${LATEST_IMAGE}"
 
-if [ "$PUSH" = false ]; then
-    echo "To push images to ECR:"
-    echo "  $0 --push"
+    if [ -n "$TAG" ]; then
+        CUSTOM_IMAGE="${REGISTRY}:${TAG}"
+        BUILD_CMD="${BUILD_CMD} -t ${CUSTOM_IMAGE}"
+    fi
+
+    BUILD_CMD="${BUILD_CMD} --platform ${PLATFORM} ${DOCKERFILE_DIR}"
+
+    echo "Running: ${BUILD_CMD}"
+    eval "${BUILD_CMD}"
+
+    echo "✓ Successfully built images"
+
+    # Push if requested
+    if [ "$PUSH" = true ]; then
+        echo ""
+        echo "Logging in to ECR..."
+        aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${REGISTRY%%/*}
+
+        echo ""
+        echo "Pushing images to ECR..."
+
+        echo "  Pushing ${TIMESTAMP_TAG}..."
+        docker push "${TIMESTAMP_IMAGE}"
+
+        echo "  Pushing latest..."
+        docker push "${LATEST_IMAGE}"
+
+        if [ -n "$TAG" ]; then
+            echo "  Pushing ${TAG}..."
+            docker push "${CUSTOM_IMAGE}"
+        fi
+
+        echo ""
+        echo "✓ Successfully pushed all images to ECR"
+        echo ""
+        echo "Images available at:"
+        echo "  ${TIMESTAMP_IMAGE}"
+        echo "  ${LATEST_IMAGE}"
+        if [ -n "$TAG" ]; then
+            echo "  ${CUSTOM_IMAGE}"
+        fi
+    fi
+
+    echo ""
+    echo "Local image details:"
+    docker images "${REGISTRY}" | head -5
+    echo ""
+    echo "To run the image:"
+    echo "  docker run --rm ${LATEST_IMAGE} 'benchmark --help'"
+    echo ""
+
+    if [ "$PUSH" = false ]; then
+        echo "To push images to ECR:"
+        echo "  $0 --push"
+    fi
 fi

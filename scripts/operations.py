@@ -5,11 +5,17 @@ Handles cleanup operations for workers, topics, and namespaces.
 
 import logging
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Tuple
+
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 
 logger = logging.getLogger(__name__)
+console = Console()
 
 
 def cleanup_pulsar_topics(namespace: str, pulsar_namespace: str) -> None:
@@ -73,16 +79,141 @@ def cleanup_pulsar_topics(namespace: str, pulsar_namespace: str) -> None:
         logger.warning(f"⚠ {failed} topics failed to delete")
 
 
-def cleanup_pulsar_namespaces(pattern: str = "omb-test-*", dry_run: bool = False) -> None:
+@dataclass
+class NamespaceDeleteResult:
+    """Result of deleting a single namespace."""
+    namespace: str
+    success: bool
+    topics_deleted: int
+    topics_failed: int
+    error: str = ""
+
+
+def _delete_single_namespace(ns: str, progress: Progress = None) -> NamespaceDeleteResult:
     """
-    Clean up Pulsar namespaces matching a pattern.
+    Delete a single Pulsar namespace and all its topics.
+
+    Args:
+        ns: Full namespace path (e.g., public/omb-test-abc)
+        progress: Optional Rich Progress object for sub-task tracking
+
+    Returns:
+        NamespaceDeleteResult with deletion outcome
+    """
+    topics_deleted = 0
+    topics_failed = 0
+    ns_short = ns.split('/')[-1]  # Get just the namespace name for display
+    topic_task = None
+
+    # First, list all topics (regular + partitioned) to get total count
+    all_topics = []
+
+    topic_result = subprocess.run(
+        ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+         "bin/pulsar-admin", "topics", "list", ns],
+        capture_output=True,
+        text=True,
+        check=False
+    )
+
+    if topic_result.returncode == 0:
+        regular_topics = [t.strip() for t in topic_result.stdout.strip().split('\n')
+                        if t.strip() and t.strip().startswith('persistent://')]
+        all_topics.extend([('regular', t) for t in regular_topics])
+
+    partitioned_result = subprocess.run(
+        ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+         "bin/pulsar-admin", "topics", "list-partitioned-topics", ns],
+        capture_output=True,
+        text=True,
+        check=False
+    )
+
+    if partitioned_result.returncode == 0:
+        partitioned_topics = [t.strip() for t in partitioned_result.stdout.strip().split('\n')
+                             if t.strip() and t.strip().startswith('persistent://')]
+        all_topics.extend([('partitioned', t) for t in partitioned_topics])
+
+    # Create sub-task for topic deletion if we have topics and a progress bar
+    if progress and all_topics:
+        topic_task = progress.add_task(
+            f"  [dim]{ns_short}[/dim]",
+            total=len(all_topics)
+        )
+
+    # Delete all topics
+    for topic_type, topic in all_topics:
+        if topic_type == 'regular':
+            delete_result = subprocess.run(
+                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+                 "bin/pulsar-admin", "topics", "delete", topic, "-f"],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+        else:  # partitioned
+            delete_result = subprocess.run(
+                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+                 "bin/pulsar-admin", "topics", "delete-partitioned-topic", topic, "-f"],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+
+        if delete_result.returncode == 0:
+            topics_deleted += 1
+        else:
+            topics_failed += 1
+
+        if topic_task is not None:
+            progress.advance(topic_task)
+
+    # Remove sub-task when done
+    if topic_task is not None:
+        progress.remove_task(topic_task)
+
+    # Now delete the namespace
+    result = subprocess.run(
+        ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+         "bin/pulsar-admin", "namespaces", "delete", ns],
+        capture_output=True,
+        text=True,
+        check=False
+    )
+
+    if result.returncode == 0:
+        return NamespaceDeleteResult(
+            namespace=ns,
+            success=True,
+            topics_deleted=topics_deleted,
+            topics_failed=topics_failed
+        )
+    else:
+        error_msg = result.stderr.strip()
+        # Filter out "Defaulted container" warnings
+        error_lines = [line for line in error_msg.split('\n')
+                      if 'Defaulted container' not in line]
+        clean_error = '\n'.join(error_lines).strip()
+        return NamespaceDeleteResult(
+            namespace=ns,
+            success=False,
+            topics_deleted=topics_deleted,
+            topics_failed=topics_failed,
+            error=clean_error
+        )
+
+
+def cleanup_pulsar_namespaces(pattern: str = "omb-test-*", dry_run: bool = False, max_workers: int = 5) -> None:
+    """
+    Clean up Pulsar namespaces matching a pattern (parallel deletion).
 
     Args:
         pattern: Glob pattern for namespace names to delete (default: omb-test-*)
         dry_run: If True, only list namespaces without deleting
+        max_workers: Number of parallel deletion workers (default: 5)
     """
-    print(f"\nLooking for Pulsar namespaces matching: public/{pattern}")
-    print("=" * 60)
+    console.print(f"\n[cyan]Looking for Pulsar namespaces matching:[/cyan] public/{pattern}")
+    console.print("=" * 60)
 
     # List all namespaces in public tenant
     result = subprocess.run(
@@ -94,7 +225,7 @@ def cleanup_pulsar_namespaces(pattern: str = "omb-test-*", dry_run: bool = False
     )
 
     if result.returncode != 0:
-        print(f"Error listing namespaces: {result.stderr}")
+        console.print(f"[red]Error listing namespaces:[/red] {result.stderr}")
         return
 
     # Parse namespace list and filter by pattern
@@ -109,118 +240,91 @@ def cleanup_pulsar_namespaces(pattern: str = "omb-test-*", dry_run: bool = False
                 namespaces.append(line)
 
     if not namespaces:
-        print(f"No namespaces found matching pattern: {pattern}")
+        console.print(f"[yellow]No namespaces found matching pattern:[/yellow] {pattern}")
         return
 
-    print(f"Found {len(namespaces)} namespace(s) to {'delete' if not dry_run else 'list'}:\n")
+    console.print(f"\n[green]Found {len(namespaces)} namespace(s)[/green] to {'delete' if not dry_run else 'list'}:\n")
     for ns in namespaces:
-        print(f"  - {ns}")
+        console.print(f"  • {ns}")
 
     if dry_run:
-        print("\n[DRY RUN] No changes made. Run without --dry-run to delete.")
+        console.print("\n[yellow][DRY RUN][/yellow] No changes made. Run without --dry-run to delete.")
         return
 
-    print(f"\n{'='*60}")
-    confirm = input(f"Delete {len(namespaces)} namespace(s)? (yes/no): ")
+    console.print(f"\n{'='*60}")
+    confirm = console.input(f"[bold]Delete {len(namespaces)} namespace(s)?[/bold] (yes/no): ")
     if confirm.lower() != 'yes':
-        print("Cancelled.")
+        console.print("[yellow]Cancelled.[/yellow]")
         return
 
-    print("\nDeleting namespaces...")
-    deleted = 0
-    failed = 0
+    console.print(f"\n[cyan]Deleting namespaces with {max_workers} parallel workers...[/cyan]\n")
 
-    for ns in namespaces:
-        print(f"\nProcessing {ns}...")
+    # Track results
+    results: List[NamespaceDeleteResult] = []
+    errors: List[NamespaceDeleteResult] = []
 
-        total_deleted = 0
-        total_failed = 0
+    # Use Rich progress bar with parallel execution
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("({task.completed}/{task.total})"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False
+    ) as progress:
+        main_task = progress.add_task("[cyan]Deleting namespaces...", total=len(namespaces))
 
-        # First, delete regular (non-partitioned) topics
-        topic_result = subprocess.run(
-            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-             "bin/pulsar-admin", "topics", "list", ns],
-            capture_output=True,
-            text=True,
-            check=False
-        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all deletion tasks, passing progress for sub-task tracking
+            future_to_ns = {
+                executor.submit(_delete_single_namespace, ns, progress): ns
+                for ns in namespaces
+            }
 
-        if topic_result.returncode == 0:
-            topics = [t.strip() for t in topic_result.stdout.strip().split('\n')
-                     if t.strip() and t.strip().startswith('persistent://')]
+            # Process results as they complete
+            for future in as_completed(future_to_ns):
+                ns = future_to_ns[future]
+                try:
+                    result = future.result()
+                    results.append(result)
 
-            if topics:
-                print(f"  Found {len(topics)} regular topic(s), deleting...")
-                for topic in topics:
-                    delete_result = subprocess.run(
-                        ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                         "bin/pulsar-admin", "topics", "delete", topic, "-f"],
-                        capture_output=True,
-                        text=True,
-                        check=False
-                    )
-
-                    if delete_result.returncode == 0:
-                        total_deleted += 1
+                    if result.success:
+                        progress.console.print(
+                            f"  [green]✓[/green] {result.namespace} "
+                            f"[dim](topics: {result.topics_deleted} deleted, {result.topics_failed} failed)[/dim]"
+                        )
                     else:
-                        total_failed += 1
-                        print(f"    ✗ Failed to delete topic {topic}: {delete_result.stderr.strip()}")
+                        errors.append(result)
+                        progress.console.print(
+                            f"  [red]✗[/red] {result.namespace}: {result.error}"
+                        )
 
-        # Second, delete partitioned topics
-        partitioned_result = subprocess.run(
-            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-             "bin/pulsar-admin", "topics", "list-partitioned-topics", ns],
-            capture_output=True,
-            text=True,
-            check=False
-        )
+                except Exception as e:
+                    errors.append(NamespaceDeleteResult(
+                        namespace=ns,
+                        success=False,
+                        topics_deleted=0,
+                        topics_failed=0,
+                        error=str(e)
+                    ))
+                    progress.console.print(f"  [red]✗[/red] {ns}: {e}")
 
-        if partitioned_result.returncode == 0:
-            partitioned_topics = [t.strip() for t in partitioned_result.stdout.strip().split('\n')
-                                 if t.strip() and t.strip().startswith('persistent://')]
+                progress.advance(main_task)
 
-            if partitioned_topics:
-                print(f"  Found {len(partitioned_topics)} partitioned topic(s), deleting...")
-                for topic in partitioned_topics:
-                    delete_result = subprocess.run(
-                        ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                         "bin/pulsar-admin", "topics", "delete-partitioned-topic", topic, "-f"],
-                        capture_output=True,
-                        text=True,
-                        check=False
-                    )
+    # Summary
+    deleted = sum(1 for r in results if r.success)
+    failed = len(errors)
+    total_topics_deleted = sum(r.topics_deleted for r in results)
+    total_topics_failed = sum(r.topics_failed for r in results)
 
-                    if delete_result.returncode == 0:
-                        total_deleted += 1
-                    else:
-                        total_failed += 1
-                        print(f"    ✗ Failed to delete partitioned topic {topic}: {delete_result.stderr.strip()}")
+    console.print(f"\n{'='*60}")
+    console.print(f"[bold]Summary:[/bold]")
+    console.print(f"  Namespaces: [green]{deleted} deleted[/green], [red]{failed} failed[/red]")
+    console.print(f"  Topics:     [green]{total_topics_deleted} deleted[/green], [red]{total_topics_failed} failed[/red]")
 
-        if total_deleted > 0 or total_failed > 0:
-            print(f"  Total topics: {total_deleted} deleted, {total_failed} failed")
-        else:
-            print(f"  No topics found in {ns}")
-
-        # Now delete the namespace
-        result = subprocess.run(
-            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-             "bin/pulsar-admin", "namespaces", "delete", ns],
-            capture_output=True,
-            text=True,
-            check=False
-        )
-
-        if result.returncode == 0:
-            print(f"  ✓ Namespace deleted: {ns}")
-            deleted += 1
-        else:
-            error_msg = result.stderr.strip()
-            # Filter out "Defaulted container" warnings
-            error_lines = [line for line in error_msg.split('\n')
-                          if 'Defaulted container' not in line]
-            clean_error = '\n'.join(error_lines).strip()
-            print(f"  ✗ Failed to delete namespace {ns}: {clean_error}")
-            failed += 1
-
-    print(f"\n{'='*60}")
-    print(f"Summary: {deleted} deleted, {failed} failed")
+    if errors:
+        console.print(f"\n[red]Failed namespaces:[/red]")
+        for err in errors:
+            console.print(f"  • {err.namespace}: {err.error}")

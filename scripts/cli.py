@@ -36,6 +36,7 @@ def create_parser() -> argparse.ArgumentParser:
     cleanup_pulsar_parser = subparsers.add_parser("cleanup-pulsar", help="Delete Pulsar namespaces matching a pattern")
     cleanup_pulsar_parser.add_argument("--pattern", default="omb-test-*", help="Namespace pattern to match (default: omb-test-*)")
     cleanup_pulsar_parser.add_argument("--dry-run", action="store_true", help="List namespaces without deleting")
+    cleanup_pulsar_parser.add_argument("--workers", type=int, default=5, help="Number of parallel deletion workers (default: 5)")
 
     return parser
 

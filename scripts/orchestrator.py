@@ -1279,7 +1279,7 @@ def main():
 
         # Handle cleanup-pulsar command (doesn't need experiment ID)
         if args.command == "cleanup-pulsar":
-            cleanup_pulsar_namespaces(pattern=args.pattern, dry_run=args.dry_run)
+            cleanup_pulsar_namespaces(pattern=args.pattern, dry_run=args.dry_run, max_workers=args.workers)
             return
 
         # Resolve experiment ID
