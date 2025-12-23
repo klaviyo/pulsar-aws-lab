@@ -89,13 +89,46 @@ class NamespaceDeleteResult:
     error: str = ""
 
 
-def _delete_single_namespace(ns: str, progress: Progress = None) -> NamespaceDeleteResult:
+def _delete_single_topic(topic_info: Tuple[str, str]) -> bool:
     """
-    Delete a single Pulsar namespace and all its topics.
+    Delete a single topic.
+
+    Args:
+        topic_info: Tuple of (topic_type, topic_name) where topic_type is 'regular' or 'partitioned'
+
+    Returns:
+        True if deletion succeeded, False otherwise
+    """
+    topic_type, topic = topic_info
+
+    if topic_type == 'regular':
+        result = subprocess.run(
+            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+             "bin/pulsar-admin", "topics", "delete", topic, "-f"],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+    else:  # partitioned
+        result = subprocess.run(
+            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
+             "bin/pulsar-admin", "topics", "delete-partitioned-topic", topic, "-f"],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+
+    return result.returncode == 0
+
+
+def _delete_single_namespace(ns: str, progress: Progress = None, topic_workers: int = 10) -> NamespaceDeleteResult:
+    """
+    Delete a single Pulsar namespace and all its topics (with parallel topic deletion).
 
     Args:
         ns: Full namespace path (e.g., public/omb-test-abc)
         progress: Optional Rich Progress object for sub-task tracking
+        topic_workers: Number of parallel workers for topic deletion (default: 10)
 
     Returns:
         NamespaceDeleteResult with deletion outcome
@@ -141,32 +174,23 @@ def _delete_single_namespace(ns: str, progress: Progress = None) -> NamespaceDel
             total=len(all_topics)
         )
 
-    # Delete all topics
-    for topic_type, topic in all_topics:
-        if topic_type == 'regular':
-            delete_result = subprocess.run(
-                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                 "bin/pulsar-admin", "topics", "delete", topic, "-f"],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-        else:  # partitioned
-            delete_result = subprocess.run(
-                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                 "bin/pulsar-admin", "topics", "delete-partitioned-topic", topic, "-f"],
-                capture_output=True,
-                text=True,
-                check=False
-            )
+    # Delete all topics in parallel
+    if all_topics:
+        with ThreadPoolExecutor(max_workers=topic_workers) as executor:
+            future_to_topic = {
+                executor.submit(_delete_single_topic, topic_info): topic_info
+                for topic_info in all_topics
+            }
 
-        if delete_result.returncode == 0:
-            topics_deleted += 1
-        else:
-            topics_failed += 1
+            for future in as_completed(future_to_topic):
+                success = future.result()
+                if success:
+                    topics_deleted += 1
+                else:
+                    topics_failed += 1
 
-        if topic_task is not None:
-            progress.advance(topic_task)
+                if topic_task is not None:
+                    progress.advance(topic_task)
 
     # Remove sub-task when done
     if topic_task is not None:

@@ -21,7 +21,7 @@ test_runs:
     description: "5M msgs/sec high load test"
     type: "fixed_rate"
     producer_rate: 5000000
-    num_workers: 60
+    num_workers: 20
 
 reporting:
   output_format:
