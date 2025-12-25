@@ -1,7 +1,7 @@
 # OpenMessaging Benchmark Docker Image
-# Uses Maven 3.9 and Java 17 LTS
+# Uses Maven 3.9 and Java 21 LTS
 
-FROM maven:3.9-eclipse-temurin-17 AS builder
+FROM maven:3.9-eclipse-temurin-21 AS builder
 
 # Install ca-certificates and update certificate store
 RUN apt-get update && \
@@ -12,8 +12,8 @@ RUN apt-get update && \
 # Set working directory
 WORKDIR /app
 
-# Clone OpenMessaging Benchmark repository
-RUN git clone https://github.com/openmessaging/benchmark.git .
+# Clone OpenMessaging Benchmark repository (kazamatzuri fork)
+RUN git clone https://github.com/kazamatzuri/omb-benchmark.git .
 
 # Build the benchmark project using Maven
 # Use 'install' to create distribution package with all dependencies
@@ -28,7 +28,7 @@ RUN echo "=== Build output structure ===" && \
     ls -la /app/target/ || echo "No root target"
 
 # Runtime stage - use JDK (not JRE) to ensure all Java tools are available
-FROM eclipse-temurin:17-jdk
+FROM eclipse-temurin:21-jdk
 
 # Install runtime dependencies
 RUN apt-get update && \
