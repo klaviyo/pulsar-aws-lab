@@ -1,7 +1,7 @@
 # OpenMessaging Benchmark Docker Image
 # Uses Maven 3.9 and Java 21 LTS
 
-FROM maven:3.9-eclipse-temurin-21 AS builder
+FROM maven:3.9.12-eclipse-temurin-21 AS builder
 
 # Install ca-certificates and update certificate store
 RUN apt-get update && \
@@ -15,9 +15,21 @@ WORKDIR /app
 # Clone OpenMessaging Benchmark repository (kazamatzuri fork)
 RUN git clone https://github.com/kazamatzuri/omb-benchmark.git .
 
-# Build the benchmark project using Maven
-# Use 'install' to create distribution package with all dependencies
-RUN mvn clean install -DskipTests
+# Build the project
+# Skip all formatting/style checks in Docker:
+# - spotless: Google Java Format has JDK version incompatibilities (JDK 17 vs 21)
+# - spotbugs: slow and not needed for packaging
+# - checkstyle: style checks should run in CI, not Docker builds
+# - license: already validated in CI
+# - tests: should run separately in CI pipeline
+RUN mvn clean install \
+        -Dspotless.check.skip=true \
+        -Dspotbugs.skip=true \
+        -DskipTests \
+        -Dlicense.skip=true \
+        -Dcheckstyle.skip=true \
+        --batch-mode \
+        --no-transfer-progress
 
 # List the build output to debug the structure
 RUN echo "=== Build output structure ===" && \
