@@ -43,7 +43,7 @@ Results are saved to `results/latest/` with detailed metrics, latency percentile
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/pulsar-aws-lab.git
+   git clone https://github.com/klaviyo/pulsar-aws-lab.git
    cd pulsar-aws-lab
    ```
 
@@ -353,10 +353,9 @@ kubectl get pods -n pulsar
 ## Contributing
 
 Contributions welcome! Please:
-1. Check existing issues or create a new one
-2. Fork the repository
-3. Create a feature branch
-4. Submit a pull request with tests
+1. Check existing Jira tickets in the PLAT project or create a new one
+2. Create a feature branch
+3. Submit a pull request with tests
 
 ## License
 
@@ -364,5 +363,5 @@ MIT License - see LICENSE file
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/pulsar-aws-lab/issues)
+- **Issues**: Jira (PLAT project)
 - **Pulsar Community**: [Slack](https://pulsar.apache.org/community/) | [Mailing List](mailto:users@pulsar.apache.org)
