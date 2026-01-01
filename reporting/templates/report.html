@@ -414,26 +414,6 @@
         </div>
         {% endif %}
 
-        {% if grafana_dashboards %}
-        <div class="grafana-section">
-            <h3>📊 Grafana Dashboards</h3>
-            <p>View real-time metrics during the test execution period</p>
-            <div class="grafana-links">
-                {% for dashboard_name, dashboard_url in grafana_dashboards.items() %}
-                <a href="{{ dashboard_url }}" target="_blank" class="grafana-link">
-                    {{ dashboard_name }}
-                </a>
-                {% endfor %}
-            </div>
-            <div class="grafana-info">
-                {% if config.pulsar_namespace %}
-                <strong>Namespace:</strong> {{ config.pulsar_namespace.replace('public/', '') }}<br>
-                {% endif %}
-                <strong>Time range:</strong> Test execution ± 5 minutes
-            </div>
-        </div>
-        {% endif %}
-
         {% if charts %}
         <h2>Performance Charts</h2>
         <p style="color: #7f8c8d; margin-bottom: 20px;">

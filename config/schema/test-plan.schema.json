@@ -13,6 +13,29 @@
       "type": "string",
       "description": "Test plan description"
     },
+    "plateau_detection": {
+      "type": "object",
+      "description": "Configuration for automatic plateau detection during ramping tests",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable automatic plateau detection"
+        },
+        "min_improvement_percent": {
+          "type": "number",
+          "minimum": 0,
+          "default": 2.0,
+          "description": "Minimum throughput improvement percentage to consider as improvement"
+        },
+        "consecutive_steps_required": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2,
+          "description": "Number of consecutive steps without improvement before stopping"
+        }
+      }
+    },
     "base_workload": {
       "type": "object",
       "description": "Base workload configuration that all test runs inherit",

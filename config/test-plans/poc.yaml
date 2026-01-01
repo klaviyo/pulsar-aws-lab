@@ -23,7 +23,7 @@ test_runs:
     description: "20k msgs/sec validation test"
     type: "fixed_rate"
     producer_rate: 20000
-    num_workers: 15  # Number of OMB worker pods for distributed load generation
+    num_workers: 2  # Number of OMB worker pods for distributed load generation
 
 # Minimal reporting
 reporting:

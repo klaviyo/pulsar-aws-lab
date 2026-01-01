@@ -860,6 +860,67 @@ spec:
 """
 
 
+    def _extract_avg_throughput(self, result_file: Path) -> Optional[float]:
+        """
+        Extract average publish rate (throughput) from OMB result file.
+
+        Args:
+            result_file: Path to the OMB JSON result file
+
+        Returns:
+            Average publish rate in msgs/sec, or None if extraction fails
+        """
+        try:
+            with open(result_file, 'r') as f:
+                data = json.load(f)
+
+            # publishRate is an array of per-interval throughput values
+            publish_rates = data.get('publishRate', [])
+            if publish_rates:
+                avg_rate = sum(publish_rates) / len(publish_rates)
+                return avg_rate
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to extract throughput from {result_file}: {e}")
+            return None
+
+    def _check_plateau(
+        self,
+        throughput_history: List[float],
+        min_improvement_percent: float,
+        consecutive_steps_required: int
+    ) -> bool:
+        """
+        Check if throughput has plateaued based on recent history.
+
+        Args:
+            throughput_history: List of achieved throughput values (msgs/sec)
+            min_improvement_percent: Minimum improvement percentage to consider as "improvement"
+            consecutive_steps_required: Number of consecutive steps without improvement to trigger plateau
+
+        Returns:
+            True if plateau detected, False otherwise
+        """
+        if len(throughput_history) < consecutive_steps_required + 1:
+            return False
+
+        # Get the baseline (best throughput before the last N steps)
+        baseline_idx = len(throughput_history) - consecutive_steps_required - 1
+        baseline = throughput_history[baseline_idx]
+
+        # Check if all recent steps failed to improve beyond the threshold
+        for i in range(consecutive_steps_required):
+            recent_idx = baseline_idx + 1 + i
+            recent = throughput_history[recent_idx]
+            improvement = ((recent - baseline) / baseline) * 100 if baseline > 0 else 0
+
+            if improvement > min_improvement_percent:
+                # Found improvement, no plateau
+                return False
+
+        # No improvement in consecutive_steps_required steps
+        return True
+
     def run_tests(self, test_plan_file: Path) -> None:
         """
         Execute test plan with OMB.
@@ -879,6 +940,23 @@ spec:
 
         # Track test execution times for Grafana links
         self.test_start_time = datetime.now()
+
+        # Plateau detection configuration
+        plateau_config = test_plan.get('plateau_detection', {})
+        plateau_enabled = plateau_config.get('enabled', False)
+        min_improvement_percent = plateau_config.get('min_improvement_percent', 2.0)
+        consecutive_steps_required = plateau_config.get('consecutive_steps_required', 2)
+
+        if plateau_enabled:
+            logger.info(f"Plateau detection ENABLED:")
+            logger.info(f"  - Min improvement threshold: {min_improvement_percent}%")
+            logger.info(f"  - Consecutive steps required: {consecutive_steps_required}")
+
+        # Track throughput history for plateau detection
+        throughput_history: List[float] = []
+        plateau_detected = False
+        max_throughput = 0.0
+        max_throughput_step = ""
 
         # Run tests with Rich Live display
         with Live(self._create_layout(), refresh_per_second=2, console=self.console) as live:
@@ -904,8 +982,34 @@ spec:
                     self._add_status(f"✓ Test '{test_name}' completed", 'success')
                     live.update(self._create_layout())
                     logger.info(f"✓ Test '{test_name}' completed")
+
                     if result_file.exists():
                         logger.info(f"Results: {result_file}")
+
+                        # Extract throughput for plateau detection
+                        if plateau_enabled:
+                            throughput = self._extract_avg_throughput(result_file)
+                            if throughput is not None:
+                                throughput_history.append(throughput)
+                                logger.info(f"  Achieved throughput: {throughput:,.0f} msgs/sec")
+
+                                # Track maximum throughput
+                                if throughput > max_throughput:
+                                    max_throughput = throughput
+                                    max_throughput_step = test_name
+
+                                # Check for plateau
+                                if self._check_plateau(throughput_history, min_improvement_percent, consecutive_steps_required):
+                                    plateau_detected = True
+                                    logger.info("="*60)
+                                    logger.info("PLATEAU DETECTED!")
+                                    logger.info(f"Throughput has not improved by >{min_improvement_percent}% for {consecutive_steps_required} consecutive steps")
+                                    logger.info(f"Maximum throughput achieved: {max_throughput:,.0f} msgs/sec (at step '{max_throughput_step}')")
+                                    logger.info("Stopping test run early and generating report...")
+                                    logger.info("="*60)
+                                    self._add_status(f"🎯 Plateau detected at {max_throughput:,.0f} msgs/sec", 'success')
+                                    live.update(self._create_layout())
+                                    break
                     else:
                         logger.warning(f"Results file not found: {result_file}")
 
@@ -915,10 +1019,20 @@ spec:
                     logger.error(f"Test '{test_name}' failed: {e}")
                     continue
 
-        logger.info(f"\n{'='*60}")
-        logger.info(f"ALL TESTS COMPLETED")
-        logger.info(f"Results: {results_dir}")
-        logger.info(f"{'='*60}\n")
+        if plateau_detected:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"TEST RUN STOPPED - PLATEAU DETECTED")
+            logger.info(f"Maximum sustained throughput: {max_throughput:,.0f} msgs/sec")
+            logger.info(f"Achieved at step: {max_throughput_step}")
+            logger.info(f"Results: {results_dir}")
+            logger.info(f"{'='*60}\n")
+        else:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"ALL TESTS COMPLETED")
+            if throughput_history:
+                logger.info(f"Maximum throughput: {max(throughput_history):,.0f} msgs/sec")
+            logger.info(f"Results: {results_dir}")
+            logger.info(f"{'='*60}\n")
 
         # Track end time for Grafana links
         self.test_end_time = datetime.now()
