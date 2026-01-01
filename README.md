@@ -11,19 +11,29 @@ A systematic Apache Pulsar load testing framework using OpenMessaging Benchmark 
 
 ### Prerequisites
 
-Your environment needs:
-- **Running Pulsar cluster** (EKS, self-hosted, etc.) accessible via kubectl
-- kubectl configured and connected to your cluster
-- Python 3.8+
+**One-time setup (macOS/Linux):**
+
+1. **Install Nix** (package manager):
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
+   ```
+
+2. **Install direnv**:
+   ```bash
+   # macOS
+   brew install direnv nix-direnv
+
+   # Add to ~/.zshrc (or ~/.bashrc):
+   eval "$(direnv hook zsh)"
+   ```
+
+3. **Restart your shell** after adding the direnv hook.
+
+> **First time in a repo:** When you `cd` into a directory with a new `.envrc`, direnv blocks it for security. Run `direnv allow` once to approve it.
+
+**Cluster access:**
+- Running Pulsar cluster (EKS, self-hosted, etc.) accessible via kubectl
 - AWS credentials (for cost tracking only)
-
-```bash
-# Verify cluster access
-kubectl get pods -n pulsar
-
-# Install Python dependencies
-pip install -r scripts/requirements.txt
-```
 
 ### Run Your First Test
 
@@ -47,12 +57,24 @@ Results are saved to `results/latest/` with detailed metrics, latency percentile
    cd pulsar-aws-lab
    ```
 
-2. **Install dependencies:**
+2. **Allow direnv** (first time only):
    ```bash
-   pip install -r scripts/requirements.txt
+   direnv allow
    ```
 
-3. **Configure kubectl:**
+   This will automatically:
+   - Download and cache Python 3.13.11
+   - Create `.venv` with all dependencies
+   - Provide kubectl, helm, aws CLI in PATH
+
+3. **Verify setup:**
+   ```bash
+   which python        # Should show: .../pulsar-aws-lab/.venv/bin/python
+   python --version    # Should show: Python 3.13.11
+   kubectl version     # Should work (provided by Nix)
+   ```
+
+4. **Configure kubectl** (for your Pulsar cluster):
    ```bash
    # For EKS clusters
    aws eks update-kubeconfig --region <region> --name <cluster-name>
@@ -62,7 +84,7 @@ Results are saved to `results/latest/` with detailed metrics, latency percentile
    kubectl get pods -n pulsar
    ```
 
-4. **Configure AWS credentials** (optional, for cost tracking):
+5. **Configure AWS credentials** (optional, for cost tracking):
    ```bash
    aws configure
    # Or export environment variables
@@ -70,6 +92,8 @@ Results are saved to `results/latest/` with detailed metrics, latency percentile
    export AWS_SECRET_ACCESS_KEY=your_secret_key
    export AWS_DEFAULT_REGION=us-east-1
    ```
+
+> **Note for pyenv users:** The Nix environment automatically removes pyenv shims from PATH to avoid conflicts. Your global pyenv setup is unaffected outside this repository.
 
 ## Usage
 

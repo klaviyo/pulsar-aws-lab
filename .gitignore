@@ -26,7 +26,17 @@ MANIFEST
 venv/
 ENV/
 env/
-.venv
+.venv/
+
+# direnv
+.direnv/
+
+# Nix
+result
+result-*
+
+# uv lock (generated, can be committed or ignored based on preference)
+# uv.lock
 
 # Terraform
 terraform/.terraform/

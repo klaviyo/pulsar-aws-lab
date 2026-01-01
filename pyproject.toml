@@ -1,0 +1,35 @@
+[project]
+name = "pulsar-aws-lab"
+version = "0.1.0"
+description = "Apache Pulsar load testing framework using OpenMessaging Benchmark"
+readme = "README.md"
+requires-python = ">=3.13"
+
+dependencies = [
+    "boto3>=1.28.0",
+    "click>=8.1.3",
+    "jinja2>=3.1.2",
+    "jsonschema>=4.17.0",
+    "kaleido>=0.2.1",
+    "kubernetes>=28.0.0",
+    "markdown>=3.4.0",
+    "matplotlib>=3.7.0",
+    "pandas>=2.0.0",
+    "plotly>=5.18.0",
+    "pyyaml>=6.0",
+    "requests>=2.31.0",
+    "rich>=13.3.0",
+    "urllib3>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
