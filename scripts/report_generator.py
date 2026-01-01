@@ -226,6 +226,104 @@ class ReportGenerator:
 
         logger.info(f"JSON export complete: {output_file}")
 
+    def generate_overview_markdown(
+        self,
+        all_metrics: Dict,
+        summary: Dict
+    ) -> str:
+        """
+        Generate overview.md with file index and quick results summary table.
+
+        Args:
+            all_metrics: Aggregated metrics including workload_configs
+            summary: Summary statistics
+
+        Returns:
+            Markdown content as string
+        """
+        lines = []
+
+        # Header
+        lines.append(f"# Experiment Overview: {self.experiment_id}")
+        lines.append("")
+        lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("")
+
+        # Quick Results Summary Table
+        lines.append("## Quick Results Summary")
+        lines.append("")
+        lines.append("| Phase | Target Rate | Achieved Rate | Deviation | Status |")
+        lines.append("|-------|-------------|---------------|-----------|--------|")
+
+        workload_configs = all_metrics.get('workload_configs', {})
+
+        for test_name in all_metrics.get('throughput', {}).keys():
+            # Get achieved rate (average publish rate)
+            achieved_rate = all_metrics['throughput'][test_name].get('publish_rate', 0)
+
+            # Get target rate from workload config
+            target_rate = None
+            if test_name in workload_configs:
+                workload = workload_configs[test_name].get('workload', {})
+                target_rate = workload.get('producerRate', None)
+
+            # Format values and calculate deviation
+            achieved_str = f"{achieved_rate:,.0f}"
+
+            if target_rate is None:
+                target_str = "N/A"
+                deviation_str = "N/A"
+                status = ""
+            elif target_rate == 0:
+                # Max throughput mode
+                target_str = "unlimited"
+                deviation_str = "N/A"
+                status = ""
+            else:
+                target_str = f"{target_rate:,.0f}"
+                deviation = ((achieved_rate - target_rate) / target_rate) * 100
+                deviation_str = f"{deviation:+.1f}%"
+
+                # Determine status based on deviation
+                abs_deviation = abs(deviation)
+                if abs_deviation < 5:
+                    status = "OK"
+                elif abs_deviation < 20:
+                    status = "WARN"
+                else:
+                    status = "FAIL"
+
+            lines.append(f"| {test_name} | {target_str} | {achieved_str} | {deviation_str} | {status} |")
+
+        lines.append("")
+
+        # Summary stats
+        lines.append("## Summary Statistics")
+        lines.append("")
+        lines.append(f"- **Total Tests:** {summary.get('total_tests', 0)}")
+        lines.append(f"- **Average Throughput:** {summary.get('avg_throughput', 0):,.0f} msgs/sec")
+        lines.append(f"- **Peak Throughput:** {summary.get('peak_throughput', 0):,.0f} msgs/sec")
+        lines.append(f"- **Average P99 Latency:** {summary.get('avg_p99_latency', 0):.2f} ms")
+        lines.append(f"- **Total Errors:** {summary.get('total_errors', 0)}")
+        lines.append("")
+
+        # Files Index
+        lines.append("## Files Index")
+        lines.append("")
+        lines.append("- [Full HTML Report](report/index.html)")
+        lines.append("- [Metrics CSV](report/metrics.csv)")
+        lines.append("- [Metrics JSON](report/metrics.json)")
+        lines.append("- [Raw Benchmark Data](benchmark_results/)")
+
+        # Check if charts directory exists
+        charts_dir = self.experiment_dir / "report" / "charts"
+        if charts_dir.exists() and any(charts_dir.iterdir()):
+            lines.append("- [Performance Charts](report/charts/)")
+
+        lines.append("")
+
+        return "\n".join(lines)
+
     def load_workload_configs(self, results_files: List[Path]) -> Dict[str, Dict]:
         """
         Load workload configurations for each test.
@@ -382,6 +480,14 @@ class ReportGenerator:
         if cost_data:
             with open(report_dir / "costs.json", 'w') as f:
                 json.dump(cost_data, f, indent=2)
+
+        # Generate overview.md in experiment root
+        summary = self.calculate_summary_stats(all_metrics)
+        overview_md = self.generate_overview_markdown(all_metrics, summary)
+        overview_file = self.experiment_dir / "overview.md"
+        with open(overview_file, 'w') as f:
+            f.write(overview_md)
+        logger.info(f"Overview generated: {overview_file}")
 
         logger.info(f"Report package created: {report_dir}")
         return report_dir
