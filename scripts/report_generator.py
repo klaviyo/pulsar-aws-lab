@@ -156,6 +156,53 @@ class ReportGenerator:
 
         return summary
 
+    def _group_charts_by_stage(self, charts: List[Path]) -> Dict[str, List[Path]]:
+        """
+        Group charts by stage/workload name for organized display.
+
+        Charts are named like "{stage_name} - {chart_type}.html"
+        This extracts the stage name and groups charts accordingly.
+
+        Args:
+            charts: List of chart paths (relative to report dir)
+
+        Returns:
+            Dict mapping stage name to list of chart paths, sorted by stage number
+        """
+        from collections import defaultdict
+        import re
+
+        grouped = defaultdict(list)
+
+        for chart in charts:
+            # Extract stage name from chart filename
+            # Pattern: "{stage_name} - {chart_type}.html" or "{stage_name}_{chart_type}.html"
+            filename = chart.stem  # filename without extension
+
+            # Try to extract stage name (everything before " - " or before last underscore if no " - ")
+            if ' - ' in filename:
+                stage_name = filename.split(' - ')[0].strip()
+            elif '_' in filename:
+                # Fallback: use everything before the last underscore
+                parts = filename.rsplit('_', 1)
+                stage_name = parts[0] if len(parts) > 1 else filename
+            else:
+                stage_name = filename
+
+            grouped[stage_name].append(chart)
+
+        # Sort stages by their numeric prefix (e.g., "001-rate-100k" before "002-rate-140k")
+        def stage_sort_key(stage_name: str):
+            # Try to extract leading number
+            match = re.match(r'^(\d+)', stage_name)
+            if match:
+                return (int(match.group(1)), stage_name)
+            return (999, stage_name)
+
+        sorted_grouped = dict(sorted(grouped.items(), key=lambda x: stage_sort_key(x[0])))
+
+        return sorted_grouped
+
     def generate_html_report(
         self,
         metrics: Dict,
@@ -179,6 +226,9 @@ class ReportGenerator:
             key=lambda x: (int(x.split('-')[0]) if x.split('-')[0].isdigit() else 999, x)
         )
 
+        # Group charts by stage for organized display
+        charts_by_stage = self._group_charts_by_stage(charts or [])
+
         # Prepare template context
         context = {
             'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -188,7 +238,8 @@ class ReportGenerator:
             'sorted_test_names': sorted_test_names,
             'cost_data': cost_data or {},
             'config': config or {},
-            'charts': charts or [],
+            'charts': charts or [],  # Keep flat list for backwards compatibility
+            'charts_by_stage': charts_by_stage,  # Grouped charts for new UI
             'grafana_dashboards': grafana_dashboards or {},
         }
 

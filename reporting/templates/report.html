@@ -291,6 +291,89 @@
             font-weight: 500;
         }
 
+        /* Collapsible Stage Sections */
+        .stage-section {
+            margin-bottom: 15px;
+            border: 1px solid #ecf0f1;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .stage-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 16px;
+            background: #f8f9fa;
+            cursor: pointer;
+            user-select: none;
+            transition: background 0.2s ease;
+        }
+
+        .stage-header:hover {
+            background: #ecf0f1;
+        }
+
+        .stage-header h3 {
+            margin: 0;
+            font-size: 1em;
+            color: #2c3e50;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .stage-header .stage-badge {
+            background: #3498db;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.75em;
+            font-weight: 600;
+        }
+
+        .stage-header .toggle-icon {
+            font-size: 1.2em;
+            color: #7f8c8d;
+            transition: transform 0.2s ease;
+        }
+
+        .stage-section.expanded .stage-header .toggle-icon {
+            transform: rotate(180deg);
+        }
+
+        .stage-content {
+            display: none;
+            padding: 15px;
+            background: white;
+        }
+
+        .stage-section.expanded .stage-content {
+            display: block;
+        }
+
+        .expand-all-controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .expand-all-controls button {
+            padding: 8px 16px;
+            border: 1px solid #3498db;
+            background: white;
+            color: #3498db;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+            transition: all 0.2s ease;
+        }
+
+        .expand-all-controls button:hover {
+            background: #3498db;
+            color: white;
+        }
+
         /* Responsive adjustments */
         @media (max-width: 1200px) {
             .charts-grid {
@@ -368,10 +451,51 @@
         </div>
         {% endif %}
 
-        {% if charts %}
+        {% if charts_by_stage %}
         <h2>Performance Charts</h2>
         <p style="color: #7f8c8d; margin-bottom: 20px;">
-            📊 Click on any chart to view full-size. Interactive charts support zoom, pan, and hover for details.
+            Click on any chart to view full-size. Interactive charts support zoom, pan, and hover for details.
+        </p>
+
+        {% if charts_by_stage|length > 1 %}
+        <div class="expand-all-controls">
+            <button onclick="expandAllStages()">Expand All</button>
+            <button onclick="collapseAllStages()">Collapse All</button>
+        </div>
+        {% endif %}
+
+        {% for stage_name, stage_charts in charts_by_stage.items() %}
+        <div class="stage-section{% if charts_by_stage|length == 1 %} expanded{% endif %}" data-stage="{{ stage_name }}">
+            <div class="stage-header" onclick="toggleStage(this.parentElement)">
+                <h3>
+                    {{ stage_name }}
+                    <span class="stage-badge">{{ stage_charts|length }} chart{{ 's' if stage_charts|length != 1 else '' }}</span>
+                </h3>
+                <span class="toggle-icon">▼</span>
+            </div>
+            <div class="stage-content">
+                <div class="charts-grid">
+                    {% for chart in stage_charts %}
+                    <div class="chart-item" onclick="openModal('{{ chart }}')">
+                        {% if chart.suffix == '.html' %}
+                        <iframe src="{{ chart }}" style="width: 100%; height: 300px; border: none; pointer-events: none;"></iframe>
+                        <div class="chart-overlay">{{ chart.stem.split(' - ')[-1] if ' - ' in chart.stem else chart.stem }} (Interactive)</div>
+                        {% else %}
+                        <img src="{{ chart }}" alt="{{ chart.stem }}">
+                        <div class="chart-overlay">{{ chart.stem.split(' - ')[-1] if ' - ' in chart.stem else chart.stem }}</div>
+                        {% endif %}
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+
+        {% elif charts %}
+        {# Fallback for flat charts list (backwards compatibility) #}
+        <h2>Performance Charts</h2>
+        <p style="color: #7f8c8d; margin-bottom: 20px;">
+            Click on any chart to view full-size. Interactive charts support zoom, pan, and hover for details.
         </p>
         <div class="charts-grid">
             {% for chart in charts %}
@@ -469,6 +593,23 @@
     </div>
 
     <script>
+        // Stage section toggle functionality
+        function toggleStage(stageElement) {
+            stageElement.classList.toggle('expanded');
+        }
+
+        function expandAllStages() {
+            document.querySelectorAll('.stage-section').forEach(section => {
+                section.classList.add('expanded');
+            });
+        }
+
+        function collapseAllStages() {
+            document.querySelectorAll('.stage-section').forEach(section => {
+                section.classList.remove('expanded');
+            });
+        }
+
         // Modal functionality for chart viewing
         function openModal(chartSrc) {
             console.log('Opening modal with chart:', chartSrc);
