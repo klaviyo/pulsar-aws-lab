@@ -28,7 +28,7 @@
           "default": 10.0,
           "description": "Maximum allowed deviation (%) between achieved and target throughput before considering it a plateau step"
         },
-        "consecutive_steps_required": {
+        "consecutive_fails_allowed": {
           "type": "integer",
           "minimum": 1,
           "default": 2,

@@ -9,33 +9,33 @@ def check_plateau(
     throughput_history: List[float],
     target_rates: List[float],
     allowed_deviation: float,
-    consecutive_steps_required: int
+    consecutive_fails_allowed: int
 ) -> bool:
     """
     Check if throughput has plateaued based on deviation from target rate.
 
     A plateau is detected when the achieved throughput falls below the acceptable
-    threshold (target * (1 - allowed_deviation/100)) for consecutive_steps_required
+    threshold (target * (1 - allowed_deviation/100)) for consecutive_fails_allowed
     consecutive steps.
 
     Args:
         throughput_history: List of achieved throughput values (msgs/sec)
         target_rates: List of target rates corresponding to each throughput measurement
         allowed_deviation: Maximum allowed deviation percentage from target rate
-        consecutive_steps_required: Number of consecutive steps with deviation before triggering plateau
+        consecutive_fails_allowed: Number of consecutive steps with deviation before triggering plateau
 
     Returns:
         True if plateau detected, False otherwise
     """
-    if len(throughput_history) < consecutive_steps_required:
+    if len(throughput_history) < consecutive_fails_allowed:
         return False
 
     if len(throughput_history) != len(target_rates):
         return False
 
     # Check last N steps for deviation from target
-    for i in range(consecutive_steps_required):
-        idx = len(throughput_history) - consecutive_steps_required + i
+    for i in range(consecutive_fails_allowed):
+        idx = len(throughput_history) - consecutive_fails_allowed + i
         achieved = throughput_history[idx]
         target = target_rates[idx]
 
@@ -62,7 +62,7 @@ def generate_bash_plateau_check(plateau_config: Dict) -> str:
     for embedding in batch mode bash scripts.
 
     Args:
-        plateau_config: Dict with 'enabled', 'allowed_deviation', 'consecutive_steps_required'
+        plateau_config: Dict with 'enabled', 'allowed_deviation', 'consecutive_fails_allowed'
 
     Returns:
         Bash code snippet for plateau detection, or empty string if disabled
@@ -71,7 +71,7 @@ def generate_bash_plateau_check(plateau_config: Dict) -> str:
         return ""
 
     allowed_deviation = plateau_config.get('allowed_deviation', 10.0)
-    consecutive_required = plateau_config.get('consecutive_steps_required', 2)
+    consecutive_required = plateau_config.get('consecutive_fails_allowed', 2)
 
     return f'''
     # PLATEAU DETECTION (compare achieved vs target rate)

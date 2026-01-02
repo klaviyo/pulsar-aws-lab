@@ -1058,6 +1058,58 @@ class MetricsCollector:
 
         return summary
 
+    def collect_cluster_topology(self) -> Dict:
+        """
+        Collect cluster topology information for reporting.
+
+        Returns:
+            Dictionary with component counts and resource configurations
+        """
+        topology = {
+            'brokers': {'count': 0, 'resources': {}},
+            'bookies': {'count': 0, 'resources': {}},
+            'zookeeper': {'count': 0, 'resources': {}}
+        }
+
+        component_labels = [
+            ('brokers', 'broker'),
+            ('bookies', 'bookie'),
+            ('zookeeper', 'zookeeper')
+        ]
+
+        for component_key, label in component_labels:
+            try:
+                result = self.run_command(
+                    ["kubectl", "get", "pods", "-n", "pulsar", "-l", f"component={label}", "-o", "json"],
+                    f"Get {component_key} pods",
+                    capture_output=True,
+                    check=False
+                )
+                if result.returncode == 0:
+                    pods_data = json.loads(result.stdout)
+                    items = pods_data.get('items', [])
+                    topology[component_key]['count'] = len(items)
+
+                    # Extract resource specs from first pod (assuming homogeneous config)
+                    if items:
+                        containers = items[0].get('spec', {}).get('containers', [])
+                        if containers:
+                            resources = containers[0].get('resources', {})
+                            requests = resources.get('requests', {})
+                            limits = resources.get('limits', {})
+
+                            topology[component_key]['resources'] = {
+                                'memory_request': requests.get('memory', 'N/A'),
+                                'memory_limit': limits.get('memory', 'N/A'),
+                                'cpu_request': requests.get('cpu', 'N/A'),
+                                'cpu_limit': limits.get('cpu', 'N/A')
+                            }
+
+            except Exception as e:
+                logger.debug(f"Error collecting {component_key} topology: {e}")
+
+        return topology
+
     def export_metrics_for_plotting(self) -> Dict:
         """
         Export collected metrics in format optimized for plotting.

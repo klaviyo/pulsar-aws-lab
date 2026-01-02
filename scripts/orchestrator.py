@@ -681,6 +681,13 @@ class Orchestrator:
         results_dir = self.experiment_dir / "benchmark_results"
         results_dir.mkdir(exist_ok=True)
 
+        # Collect cluster topology info (snapshot at test start)
+        logger.info("Collecting cluster topology...")
+        self.cluster_topology = self.metrics_collector.collect_cluster_topology()
+        logger.info(f"Cluster topology: {self.cluster_topology['brokers']['count']} brokers, "
+                   f"{self.cluster_topology['bookies']['count']} bookies, "
+                   f"{self.cluster_topology['zookeeper']['count']} zookeeper nodes")
+
         # Check if batch mode is applicable
         if self.batch_executor.is_batch_compatible(test_plan):
             batch_config = test_plan.get('batch_mode', {})
@@ -702,12 +709,12 @@ class Orchestrator:
         plateau_config = test_plan.get('plateau_detection', {})
         plateau_enabled = plateau_config.get('enabled', False)
         allowed_deviation = plateau_config.get('allowed_deviation', 10.0)
-        consecutive_steps_required = plateau_config.get('consecutive_steps_required', 2)
+        consecutive_fails_allowed = plateau_config.get('consecutive_fails_allowed', 2)
 
         if plateau_enabled:
             logger.info(f"Plateau detection ENABLED:")
             logger.info(f"  - Allowed deviation from target: {allowed_deviation}%")
-            logger.info(f"  - Consecutive steps required: {consecutive_steps_required}")
+            logger.info(f"  - Consecutive steps required: {consecutive_fails_allowed}")
 
         # Track throughput history for plateau detection
         throughput_history: List[float] = []
@@ -760,11 +767,11 @@ class Orchestrator:
                                     max_throughput_step = test_name
 
                                 # Check for plateau
-                                if check_plateau(throughput_history, target_rates, allowed_deviation, consecutive_steps_required):
+                                if check_plateau(throughput_history, target_rates, allowed_deviation, consecutive_fails_allowed):
                                     plateau_detected = True
                                     logger.info("="*60)
                                     logger.info("PLATEAU DETECTED!")
-                                    logger.info(f"Achieved throughput deviated >{allowed_deviation}% from target for {consecutive_steps_required} consecutive steps")
+                                    logger.info(f"Achieved throughput deviated >{allowed_deviation}% from target for {consecutive_fails_allowed} consecutive steps")
                                     logger.info(f"Maximum throughput achieved: {max_throughput:,.0f} msgs/sec (at step '{max_throughput_step}')")
                                     logger.info("Stopping test run early and generating report...")
                                     logger.info("="*60)
@@ -811,7 +818,8 @@ class Orchestrator:
                 'namespace': self.namespace,
                 'pulsar_namespace': self.pulsar_tenant_namespace,  # Use detected namespace
                 'pulsar_service_url': self.pulsar_service_url,
-                'experiment_id': self.experiment_id
+                'experiment_id': self.experiment_id,
+                'cluster_topology': getattr(self, 'cluster_topology', None)
             }
 
             report_dir = report_gen.create_report_package(

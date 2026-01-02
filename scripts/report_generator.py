@@ -287,7 +287,8 @@ class ReportGenerator:
     def generate_overview_markdown(
         self,
         all_metrics: Dict,
-        summary: Dict
+        summary: Dict,
+        cluster_topology: Optional[Dict] = None
     ) -> str:
         """
         Generate overview.md with file index and quick results summary table.
@@ -295,6 +296,7 @@ class ReportGenerator:
         Args:
             all_metrics: Aggregated metrics including workload_configs
             summary: Summary statistics
+            cluster_topology: Cluster topology info (brokers, bookies, zookeeper counts and resources)
 
         Returns:
             Markdown content as string
@@ -306,6 +308,30 @@ class ReportGenerator:
         lines.append("")
         lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append("")
+
+        # Cluster Configuration Section
+        if cluster_topology:
+            lines.append("## Cluster Configuration")
+            lines.append("")
+            lines.append("| Component  | Count | Memory (Req/Limit) | CPU (Req/Limit) |")
+            lines.append("|------------|-------|--------------------| ----------------|")
+
+            for component_key, display_name in [('brokers', 'Brokers'), ('bookies', 'Bookies'), ('zookeeper', 'ZooKeeper')]:
+                component = cluster_topology.get(component_key, {})
+                count = component.get('count', 0)
+                resources = component.get('resources', {})
+
+                mem_req = resources.get('memory_request', 'N/A')
+                mem_limit = resources.get('memory_limit', 'N/A')
+                cpu_req = resources.get('cpu_request', 'N/A')
+                cpu_limit = resources.get('cpu_limit', 'N/A')
+
+                memory_str = f"{mem_req} / {mem_limit}" if mem_req != 'N/A' or mem_limit != 'N/A' else "N/A"
+                cpu_str = f"{cpu_req} / {cpu_limit}" if cpu_req != 'N/A' or cpu_limit != 'N/A' else "N/A"
+
+                lines.append(f"| {display_name} | {count} | {memory_str} | {cpu_str} |")
+
+            lines.append("")
 
         # Quick Results Summary Table
         lines.append("## Quick Results Summary")
@@ -551,7 +577,8 @@ class ReportGenerator:
 
         # Generate overview.md in experiment root
         summary = self.calculate_summary_stats(all_metrics)
-        overview_md = self.generate_overview_markdown(all_metrics, summary)
+        cluster_topology = config.get('cluster_topology') if config else None
+        overview_md = self.generate_overview_markdown(all_metrics, summary, cluster_topology)
         overview_file = self.experiment_dir / "overview.md"
         with open(overview_file, 'w') as f:
             f.write(overview_md)

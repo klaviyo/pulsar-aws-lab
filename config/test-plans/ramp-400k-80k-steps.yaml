@@ -12,7 +12,7 @@ plateau_detection:
   # Stop if achieved throughput deviates more than this percentage from target rate
   allowed_deviation: 10.0
   # Number of consecutive steps with deviation before stopping
-  consecutive_steps_required: 2
+  consecutive_fails_allowed: 2
 
 base_workload:
   name: "ramp-test"
