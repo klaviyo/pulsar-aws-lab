@@ -481,7 +481,7 @@ Each experiment creates a directory at `results/<experiment-id>/`:
 ```
 results/<experiment-id>/
 ├── orchestrator.log           # Orchestrator execution log
-├── test_report.html           # Generated HTML report with Grafana links
+├── test_report.html           # Generated HTML report 
 ├── benchmark_results/
 │   ├── poc-20k.log            # Test results from OMB driver
 │   └── ...

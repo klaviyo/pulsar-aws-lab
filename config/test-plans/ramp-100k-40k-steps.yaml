@@ -23,7 +23,7 @@ base_workload:
   producers_per_topic: 1
   consumers_per_topic: 1
   consumer_backlog_size_gb: 0
-  test_duration_minutes: 3
+  test_duration_minutes: 2
   warmup_duration_minutes: 1
 
 test_runs:

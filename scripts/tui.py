@@ -22,7 +22,7 @@ class OrchestratorUI:
         self.pulsar_tenant_namespace = pulsar_tenant_namespace
         self.status_messages: List[Dict[str, str]] = []
         self.current_test: Optional[Dict] = None
-        self.grafana_url: Optional[str] = None
+
 
     def add_status(self, message: str, level: str = 'info') -> None:
         """Add a status message to the log."""
@@ -36,9 +36,6 @@ class OrchestratorUI:
         """Set the currently running test."""
         self.current_test = test
 
-    def set_grafana_url(self, url: str) -> None:
-        """Set the Grafana dashboard URL."""
-        self.grafana_url = url
 
     def set_pulsar_namespace(self, namespace: str) -> None:
         """Update the Pulsar tenant/namespace (after detection)."""
@@ -90,17 +87,8 @@ class OrchestratorUI:
         else:
             content = exp_table
 
-        # Monitoring info with Grafana link
-        if self.grafana_url:
-            monitor_text = Text()
-            monitor_text.append("\n\nMonitoring:\n", style="bold green")
-            monitor_text.append(f"{self.grafana_url}\n", style="blue underline")
 
-            final_content = Table.grid()
-            final_content.add_row(content)
-            final_content.add_row(monitor_text)
-        else:
-            final_content = content
+        final_content = content
 
         return Panel(
             final_content,

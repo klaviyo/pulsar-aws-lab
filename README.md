@@ -47,7 +47,7 @@ python scripts/orchestrator.py list
 python scripts/orchestrator.py report --experiment-id latest
 ```
 
-Results are saved to `results/latest/` with detailed metrics, latency percentiles, and HTML reports with Grafana links.
+Results are saved to `results/latest/` with detailed metrics, latency percentiles, and HTML report.
 
 ## Installation
 
@@ -253,7 +253,7 @@ All experiment data is saved to `results/<experiment-id>/`:
 
 ```
 results/exp-20241013-120000/
-├── test_report.html               # Interactive HTML report with Grafana links
+├── test_report.html               # Interactive HTML report
 ├── benchmark_results/
 │   ├── poc-20k.log                # OMB test results
 │   └── ...
