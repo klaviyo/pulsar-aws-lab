@@ -136,7 +136,7 @@ class BatchExecutor:
             return results
 
         # Copy results from pod for each completed stage
-        for stage_id, _, target_rate in workloads:
+        for stage_id, workload, target_rate in workloads:
             try:
                 source_path = f"/results/{self.experiment_id}/{stage_id}.json"
                 dest_path = results_dir / f"{stage_id}.json"
@@ -161,9 +161,7 @@ class BatchExecutor:
                     # Save workload config for report generator
                     workload_config_path = results_dir / f"{stage_id}_workload.json"
                     workload_config = {
-                        'workload': {
-                            'producerRate': target_rate
-                        }
+                        'workload': workload
                     }
                     with open(workload_config_path, 'w') as wf:
                         json.dump(workload_config, wf, indent=2)
@@ -365,7 +363,11 @@ class BatchExecutor:
             report_gen = ReportGenerator(self.experiment_dir, self.experiment_id)
 
             results_dir = self.experiment_dir / "benchmark_results"
-            result_files = list(results_dir.glob("*.json"))
+            # Exclude _workload.json files (config files, not results)
+            result_files = [
+                f for f in results_dir.glob("*.json")
+                if not f.name.endswith('_workload.json')
+            ]
 
             if result_files:
                 report_config = {

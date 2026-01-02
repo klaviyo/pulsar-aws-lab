@@ -173,12 +173,19 @@ class ReportGenerator:
         # Calculate summary stats
         summary = self.calculate_summary_stats(metrics)
 
+        # Sort test names by stage number (e.g., "001-rate-100k" before "002-rate-140k")
+        sorted_test_names = sorted(
+            metrics.get('throughput', {}).keys(),
+            key=lambda x: (int(x.split('-')[0]) if x.split('-')[0].isdigit() else 999, x)
+        )
+
         # Prepare template context
         context = {
             'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'experiment_dir': str(self.experiment_dir),
             'summary': summary,
             'metrics': metrics,
+            'sorted_test_names': sorted_test_names,
             'cost_data': cost_data or {},
             'config': config or {},
             'charts': charts or [],
@@ -257,7 +264,13 @@ class ReportGenerator:
 
         workload_configs = all_metrics.get('workload_configs', {})
 
-        for test_name in all_metrics.get('throughput', {}).keys():
+        # Sort test names by stage number (e.g., "001-rate-100k" before "002-rate-140k")
+        sorted_tests = sorted(
+            all_metrics.get('throughput', {}).keys(),
+            key=lambda x: (int(x.split('-')[0]) if x.split('-')[0].isdigit() else 999, x)
+        )
+
+        for test_name in sorted_tests:
             # Get achieved rate (average publish rate)
             achieved_rate = all_metrics['throughput'][test_name].get('publish_rate', 0)
 
@@ -391,6 +404,10 @@ class ReportGenerator:
         }
 
         for results_file in results_files:
+            # Skip workload config files (they're not benchmark results)
+            if results_file.name.endswith('_workload.json'):
+                continue
+
             test_name = results_file.stem  # Filename without extension
             results = self.load_benchmark_results(results_file)
             metrics = self.parse_benchmark_metrics(results, test_name=test_name)

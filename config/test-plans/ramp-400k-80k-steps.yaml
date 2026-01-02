@@ -1,0 +1,144 @@
+# Ramping Throughput Test Plan
+# Start at 400k msgs/sec, increase by 80k every 3 minutes
+# Message size: 0.5KB (512 bytes)
+# Automatic plateau detection: stops when throughput doesn't increase for 2 consecutive steps
+
+name: "ramping-400k-80k-steps"
+description: "Ramping throughput test: 400k start, +80k/3min increments, 512 byte messages, auto-plateau detection"
+
+# Plateau detection settings
+plateau_detection:
+  enabled: true
+  # Stop if throughput doesn't increase by this percentage for consecutive_steps_required steps
+  min_improvement_percent: 10.0
+  # Number of consecutive steps without improvement before stopping
+  consecutive_steps_required: 2
+
+base_workload:
+  name: "ramp-test"
+  topics: 100
+  partitions_per_topic: 8
+  message_size: 512  # 0.5 KB
+  subscriptions_per_topic: 1
+  producers_per_topic: 1
+  consumers_per_topic: 1
+  consumer_backlog_size_gb: 0
+  test_duration_minutes: 2
+  warmup_duration_minutes: 1
+
+test_runs:
+  # Step 1: 400k msgs/sec
+  - name: "rate-400k"
+    description: "400k msgs/sec (baseline)"
+    type: "fixed_rate"
+    producer_rate: 400000
+    num_workers: 5
+
+  # Step 2: 480k msgs/sec
+  - name: "rate-480k"
+    description: "480k msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 480000
+    num_workers: 5
+
+  # Step 3: 560k msgs/sec
+  - name: "rate-560k"
+    description: "560k msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 560000
+    num_workers: 5
+
+  # Step 4: 640k msgs/sec
+  - name: "rate-640k"
+    description: "640k msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 640000
+    num_workers: 5
+
+  # Step 5: 720k msgs/sec
+  - name: "rate-720k"
+    description: "720k msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 720000
+    num_workers: 5
+
+  # Step 6: 800k msgs/sec
+  - name: "rate-800k"
+    description: "800k msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 800000
+    num_workers: 5
+
+  # Step 7: 880k msgs/sec
+  - name: "rate-880k"
+    description: "880k msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 880000
+    num_workers: 5
+
+  # Step 8: 960k msgs/sec
+  - name: "rate-960k"
+    description: "960k msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 960000
+    num_workers: 5
+
+  # Step 9: 1040k msgs/sec (1M+)
+  - name: "rate-1040k"
+    description: "1.04M msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 1040000
+    num_workers: 5
+
+  # Step 10: 1120k msgs/sec
+  - name: "rate-1120k"
+    description: "1.12M msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 1120000
+    num_workers: 5
+
+  # Step 11: 1200k msgs/sec
+  - name: "rate-1200k"
+    description: "1.2M msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 1200000
+    num_workers: 5
+
+  # Step 12: 1280k msgs/sec
+  - name: "rate-1280k"
+    description: "1.28M msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 1280000
+    num_workers: 5
+
+  # Step 13: 1360k msgs/sec
+  - name: "rate-1360k"
+    description: "1.36M msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 1360000
+    num_workers: 5
+
+  # Step 14: 1440k msgs/sec
+  - name: "rate-1440k"
+    description: "1.44M msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 1440000
+    num_workers: 5
+
+  # Step 15: 1520k msgs/sec
+  - name: "rate-1520k"
+    description: "1.52M msgs/sec (+80k)"
+    type: "fixed_rate"
+    producer_rate: 1520000
+    num_workers: 5
+
+reporting:
+  output_format:
+    - "html"
+    - "json"
+  include_raw_data: true
+  metrics_to_highlight:
+    - "throughput"
+    - "p99_latency"
+    - "p95_latency"
+    - "max_latency"

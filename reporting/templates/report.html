@@ -413,7 +413,7 @@
                 </tr>
             </thead>
             <tbody>
-                {% for test_name in metrics.throughput.keys() %}
+                {% for test_name in sorted_test_names %}
                 <tr>
                     <td class="test-name">{{ test_name }}</td>
                     <td>{{ "%.0f" | format(metrics.throughput[test_name].publish_rate) }}</td>
@@ -432,7 +432,9 @@
 
         {% if metrics.workload_configs %}
         <h2>Workload Configurations</h2>
-        {% for test_name, workload_config in metrics.workload_configs.items() %}
+        {% for test_name in sorted_test_names %}
+        {% set workload_config = metrics.workload_configs.get(test_name, {}) %}
+        {% if workload_config %}
         <div class="workload-compact">
             <h3>{{ test_name }}</h3>
             {% if workload_config.workload %}
@@ -457,6 +459,7 @@
             <pre style="background: #fff; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 0.85em;">{{ workload_config | tojson(indent=2) }}</pre>
             {% endif %}
         </div>
+        {% endif %}
         {% endfor %}
         {% endif %}
 
