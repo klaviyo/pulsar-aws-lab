@@ -22,12 +22,18 @@ class OrchestratorUI:
         self.pulsar_tenant_namespace = pulsar_tenant_namespace
         self.status_messages: List[Dict[str, str]] = []
         self.current_test: Optional[Dict] = None
-
+        self._start_time: Optional[datetime] = None
 
     def add_status(self, message: str, level: str = 'info') -> None:
         """Add a status message to the log."""
+        now = datetime.now()
+        if self._start_time is None:
+            self._start_time = now
+        elapsed = now - self._start_time
+        total_seconds = int(elapsed.total_seconds())
+        minutes, seconds = divmod(total_seconds, 60)
         self.status_messages.append({
-            'time': datetime.now().strftime('%H:%M:%S'),
+            'time': f"{minutes:02d}:{seconds:02d}",
             'message': message,
             'level': level
         })
@@ -117,7 +123,7 @@ class OrchestratorUI:
                 }
                 style = style_map.get(level, 'white')
 
-                content.append(f"[dim]{timestamp}[/dim] ", style="dim")
+                content.append(f"[{timestamp}] ", style="dim")
                 content.append(f"{message}\n", style=style)
 
         return Panel(

@@ -637,7 +637,7 @@ class Orchestrator:
 
                         # Only collect results when near expected completion
                         if elapsed >= check_sleep_after and not results_collected:
-                            if log_result.returncode == 0 and "Sleeping 60 seconds to allow results collection" in log_result.stdout:
+                            if log_result.returncode == 0 and "seconds to allow results collection" in log_result.stdout:
                                 # Sleep message detected! Pod is in the collection window
                                 logger.info(f"✓ Detected sleep message in logs - collecting results during 60s window")
                                 self._add_status("Collecting test results (during sleep window)...", 'info')
@@ -658,17 +658,8 @@ class Orchestrator:
                 # Log progress with rate info if available
                 minutes = elapsed // 60
                 seconds = elapsed % 60
-                if current_rate is not None:
-                    if target_rate > 0:
-                        rate_pct = (current_rate / target_rate) * 100
-                        self._add_status(
-                            f"[{minutes}m {seconds}s] Target: {target_rate:,.0f} | Actual: {current_rate:,.0f} msg/s ({rate_pct:.0f}%)",
-                            'info'
-                        )
-                    else:
-                        self._add_status(f"[{minutes}m {seconds}s] Actual: {current_rate:,.0f} msg/s (max rate)", 'info')
-                else:
-                    self._add_status(f"Test running... ({minutes}m {seconds}s elapsed)", 'info')
+                status = self._format_rate_status(f"[{minutes}m {seconds}s]", target_rate, current_rate)
+                self._add_status(status, 'info')
                 live.update(self._create_layout())
                 logger.info(f"Job {test_name} still running... ({elapsed}s elapsed, active: {active_count}, succeeded: {succeeded_count}, failed: {failed_count})")
 
@@ -916,6 +907,16 @@ spec:
         if matches:
             return float(matches[-1])
         return None
+
+    def _format_rate_status(self, prefix: str, target_rate: float, current_rate: Optional[float]) -> str:
+        """Format a status message with rate info if available."""
+        if current_rate is not None:
+            if target_rate > 0:
+                rate_pct = (current_rate / target_rate) * 100
+                return f"{prefix} | Target: {target_rate:,.0f} | Actual: {current_rate:,.0f} msg/s ({rate_pct:.0f}%)"
+            else:
+                return f"{prefix} | Actual: {current_rate:,.0f} msg/s (max rate)"
+        return prefix
 
     def _check_plateau(
         self,
@@ -1214,8 +1215,12 @@ while IFS=',' read -r stage_id target_rate; do
 
   # Extract and track throughput
   if [ -f "/results/{self.experiment_id}/${{stage_id}}.json" ]; then
-    # jq: average of publishRate array
-    actual=$(jq '[.publishRate[]] | add / length' /results/{self.experiment_id}/${{stage_id}}.json 2>/dev/null || echo "0")
+    # Extract average publishRate using grep/awk (jq not available in container)
+    # JSON format: "publishRate" : [ 99567.0, 100042.0, ... ]
+    actual=$(grep -o '"publishRate" *: *\\[[^]]*\\]' /results/{self.experiment_id}/${{stage_id}}.json 2>/dev/null | \\
+             grep -oE '[0-9]+\\.[0-9]+' | \\
+             awk '{{sum+=$1; count++}} END {{if(count>0) printf "%.1f", sum/count; else print "0"}}')
+    actual=${{actual:-0}}
     echo "Actual throughput: $actual msgs/sec"
 
     # Add to history
@@ -1511,6 +1516,7 @@ spec:
                 break
 
             # Try to get current stage from logs
+            current_rate = None
             try:
                 log_result = self.run_command(
                     ["kubectl", "logs", "-n", self.namespace,
@@ -1532,6 +1538,9 @@ spec:
                 current_stage_match = re.findall(r'STAGE: (\S+)', logs)
                 current_stage = current_stage_match[-1] if current_stage_match else None
 
+                # Extract current rate from logs
+                current_rate = self._extract_current_rate_from_logs(logs)
+
                 # Check for plateau detection in logs
                 if 'PLATEAU DETECTED' in logs:
                     self._add_status(f"🎯 Plateau detected at stage {stages_completed}", 'success')
@@ -1545,15 +1554,15 @@ spec:
             except Exception as e:
                 logger.debug(f"Error getting batch logs: {e}")
 
-            elapsed = int(time.time() - start_time)
+            # Get target rate for current stage
+            target_rate = next((rate for stage_id, _, rate in workloads if stage_id == current_stage), 0)
+
             if current_stage:
-                self._add_status(
-                    f"Running: {current_stage} ({stages_completed} completed, {elapsed}s elapsed)",
-                    'info'
-                )
+                status = self._format_rate_status(f"Running: {current_stage}", target_rate, current_rate)
+                self._add_status(status, 'info')
             else:
                 self._add_status(
-                    f"Running batch... {stages_completed}/{len(workloads)} completed ({elapsed}s elapsed)",
+                    f"Running batch... {stages_completed}/{len(workloads)} completed",
                     'info'
                 )
             live.update(self._create_layout())
