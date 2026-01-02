@@ -28,8 +28,12 @@ from pulsar_manager import PulsarManager
 from results_collector import ResultsCollector
 from metrics_collector import MetricsCollector
 
-# Import OMB worker manager
+# Import OMB modules
 from omb.workers import WorkerManager
+from omb.manifests import ManifestBuilder, indent_yaml
+from omb.metrics import extract_avg_throughput, extract_current_rate_from_logs, format_rate_status
+from omb.plateau import check_plateau, generate_bash_plateau_check
+from omb.batch_script import render_batch_script
 
 # Setup logging
 logging.basicConfig(
@@ -114,6 +118,17 @@ class Orchestrator:
             namespace=self.namespace,
             omb_image=self.omb_image,
             results_dir=self.experiment_dir
+        )
+
+        # Initialize manifest builder for YAML generation
+        self.manifest_builder = ManifestBuilder(
+            namespace=self.namespace,
+            pulsar_service_url=self.pulsar_service_url,
+            pulsar_http_url=self.pulsar_http_url,
+            pulsar_tenant_namespace=self.pulsar_tenant_namespace,
+            omb_image=self.omb_image,
+            experiment_id=self.experiment_id,
+            worker_manager=self.worker_manager
         )
 
         # Initialize metrics collector for infrastructure health tracking
@@ -404,7 +419,7 @@ class Orchestrator:
             raise OrchestratorError(f"Failed to ensure workers: {e}")
 
         # Generate workload ConfigMap
-        workload_yaml = self._generate_omb_workload_yaml(test_name, workload_config)
+        workload_yaml = self.manifest_builder.build_workload_configmap(test_name, workload_config)
         workload_file = self.experiment_dir / f"workload_{test_name}.yaml"
 
         with open(workload_file, 'w') as f:
@@ -419,7 +434,7 @@ class Orchestrator:
         )
 
         # Create OMB driver Job
-        job_yaml = self._generate_omb_job_yaml(test_name, num_workers)
+        job_yaml = self.manifest_builder.build_driver_job(test_name, num_workers)
         job_file = self.experiment_dir / f"omb_job_{test_name}.yaml"
 
         with open(job_file, 'w') as f:
@@ -633,7 +648,7 @@ class Orchestrator:
 
                         # Extract current publish rate from logs for status display
                         if log_result.returncode == 0:
-                            current_rate = self._extract_current_rate_from_logs(log_result.stdout)
+                            current_rate = extract_current_rate_from_logs(log_result.stdout)
 
                         # Only collect results when near expected completion
                         if elapsed >= check_sleep_after and not results_collected:
@@ -658,7 +673,7 @@ class Orchestrator:
                 # Log progress with rate info if available
                 minutes = elapsed // 60
                 seconds = elapsed % 60
-                status = self._format_rate_status(f"[{minutes}m {seconds}s]", target_rate, current_rate)
+                status = format_rate_status(f"[{minutes}m {seconds}s]", target_rate, current_rate)
                 self._add_status(status, 'info')
                 live.update(self._create_layout())
                 logger.info(f"Job {test_name} still running... ({elapsed}s elapsed, active: {active_count}, succeeded: {succeeded_count}, failed: {failed_count})")
@@ -713,247 +728,6 @@ class Orchestrator:
         # Note: Workers are persistent and reused across tests - not deleted here
 
         return results
-
-    def _generate_omb_workload_yaml(self, test_name: str, workload: Dict) -> str:
-        """Generate Kubernetes ConfigMap YAML for OMB workload"""
-        workload_content = yaml.dump(workload)
-
-        return f"""apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: omb-workload-{test_name}
-  namespace: {self.namespace}
-data:
-  workload.yaml: |
-{chr(10).join('    ' + line for line in workload_content.split(chr(10)))}
-  driver.yaml: |
-    name: Pulsar
-    driverClass: io.openmessaging.benchmark.driver.pulsar.PulsarBenchmarkDriver
-    client:
-      serviceUrl: {self.pulsar_service_url}
-      httpUrl: {self.pulsar_http_url}
-      namespacePrefix: {self.pulsar_tenant_namespace}
-    producer:
-      batchingEnabled: true
-      batchingMaxPublishDelayMs: 5
-      blockIfQueueFull: true
-      pendingQueueSize: 50000
-    consumer:
-      subscriptionType: Shared
-"""
-
-    def _generate_omb_job_yaml(self, test_name: str, num_workers: int = 3) -> str:
-        """Generate Kubernetes Job YAML for OMB driver"""
-        # Get worker addresses from persistent worker pool
-        worker_addresses = self.worker_manager.get_worker_addresses(num_workers)
-        workers_list = ",".join(worker_addresses)
-
-        return f"""apiVersion: batch/v1
-kind: Job
-metadata:
-  name: omb-{test_name}
-  namespace: {self.namespace}
-  labels:
-    app: omb-driver
-    test: {test_name}
-spec:
-  backoffLimit: 0
-  template:
-    metadata:
-      labels:
-        app: omb-driver
-        test: {test_name}
-    spec:
-      restartPolicy: Never
-      nodeSelector:
-        klaviyo.com/pool-name: loadgen
-      tolerations:
-      - key: "loadgen"
-        operator: "Equal"
-        value: "true"
-        effect: "NoSchedule"
-      containers:
-      - name: omb-driver
-        image: {self.omb_image}
-        imagePullPolicy: Always
-        command: ["/bin/bash", "-c"]
-        args:
-          - |
-            set -x  # Enable debug output
-            echo "===== OMB Debug Information ====="
-            echo "Test name: {test_name}"
-            echo "Timestamp: $(date)"
-            echo "Hostname: $(hostname)"
-            echo ""
-
-            echo "===== DNS Resolution ====="
-            nslookup pulsar-broker.pulsar.svc.cluster.local || echo "DNS lookup failed"
-            echo ""
-
-            echo "===== Network Connectivity ====="
-            echo "Testing binary protocol port (6650)..."
-            timeout 5 nc -zv pulsar-broker.pulsar.svc.cluster.local 6650 || echo "Port 6650 not reachable"
-            echo "Testing HTTP port (8080)..."
-            timeout 5 nc -zv pulsar-broker.pulsar.svc.cluster.local 8080 || echo "Port 8080 not reachable"
-            echo ""
-
-            echo "===== HTTP Endpoint Tests ====="
-            echo "Testing /admin/v2/brokers/health..."
-            curl -v -m 10 http://pulsar-broker.pulsar.svc.cluster.local:8080/admin/v2/brokers/health || echo "Health check failed"
-            echo ""
-            echo "Testing /admin/v2/namespaces/public/default..."
-            curl -v -m 10 http://pulsar-broker.pulsar.svc.cluster.local:8080/admin/v2/namespaces/public/default || echo "Namespace check failed"
-            echo ""
-
-            echo "===== Configuration Files ====="
-            echo "Driver configuration:"
-            cat /workload/driver.yaml
-            echo ""
-            echo "Workload configuration:"
-            cat /workload/workload.yaml
-            echo ""
-
-            echo "===== Java Environment ====="
-            java -version
-            echo "JAVA_HOME: $JAVA_HOME"
-            echo "PATH: $PATH"
-            echo ""
-
-            echo "===== Worker Connectivity Tests ====="
-            echo "Testing worker endpoints..."
-            WORKERS="{workers_list}"
-            IFS=',' read -ra WORKER_ARRAY <<< "$WORKERS"
-            for worker in "${{WORKER_ARRAY[@]}}"; do
-              echo "Testing $worker..."
-              curl -m 5 "$worker" || echo "Worker $worker not reachable"
-            done
-            echo ""
-
-            # Create experiment-specific directory
-            mkdir -p /results/{self.experiment_id}
-
-            echo "===== Starting OMB Benchmark (Driver Mode) ====="
-            /app/bin/benchmark \\
-              --drivers /workload/driver.yaml \\
-              --workers {workers_list} \\
-              --output /results/{self.experiment_id}/{test_name}.json \\
-              /workload/workload.yaml
-
-            EXIT_CODE=$?
-            echo ""
-            echo "===== Benchmark Exit Code: $EXIT_CODE ====="
-            if [ $EXIT_CODE -eq 0 ]; then
-              echo "Results saved to /results/{self.experiment_id}/{test_name}.json"
-              cat /results/{self.experiment_id}/{test_name}.json
-
-              # Sleep to keep pod alive for results collection
-              echo "Sleeping 60 seconds to allow results collection..."
-              sleep 60
-            else
-              echo "Benchmark failed with exit code $EXIT_CODE"
-            fi
-            exit $EXIT_CODE
-        volumeMounts:
-        - name: workload
-          mountPath: /workload
-        - name: results
-          mountPath: /results
-      volumes:
-      - name: workload
-        configMap:
-          name: omb-workload-{test_name}
-      - name: results
-        emptyDir: {{}}
-"""
-
-
-    def _extract_avg_throughput(self, result_file: Path) -> Optional[float]:
-        """
-        Extract average publish rate (throughput) from OMB result file.
-
-        Args:
-            result_file: Path to the OMB JSON result file
-
-        Returns:
-            Average publish rate in msgs/sec, or None if extraction fails
-        """
-        try:
-            with open(result_file, 'r') as f:
-                data = json.load(f)
-
-            # publishRate is an array of per-interval throughput values
-            publish_rates = data.get('publishRate', [])
-            if publish_rates:
-                avg_rate = sum(publish_rates) / len(publish_rates)
-                return avg_rate
-            return None
-        except Exception as e:
-            logger.warning(f"Failed to extract throughput from {result_file}: {e}")
-            return None
-
-    def _extract_current_rate_from_logs(self, logs: str) -> Optional[float]:
-        """
-        Extract the most recent publish rate from live OMB logs.
-
-        Parses log lines like:
-        Pub rate 101926.1 msg/s / 49.8 MB/s | ...
-
-        Returns:
-            Most recent publish rate in msgs/sec, or None if not found
-        """
-        import re
-        pattern = r'Pub rate\s+([\d.]+)\s+msg/s'
-        matches = re.findall(pattern, logs)
-        if matches:
-            return float(matches[-1])
-        return None
-
-    def _format_rate_status(self, prefix: str, target_rate: float, current_rate: Optional[float]) -> str:
-        """Format a status message with rate info if available."""
-        if current_rate is not None:
-            if target_rate > 0:
-                rate_pct = (current_rate / target_rate) * 100
-                return f"{prefix} | Target: {target_rate:,.0f} | Actual: {current_rate:,.0f} msg/s ({rate_pct:.0f}%)"
-            else:
-                return f"{prefix} | Actual: {current_rate:,.0f} msg/s (max rate)"
-        return prefix
-
-    def _check_plateau(
-        self,
-        throughput_history: List[float],
-        min_improvement_percent: float,
-        consecutive_steps_required: int
-    ) -> bool:
-        """
-        Check if throughput has plateaued based on recent history.
-
-        Args:
-            throughput_history: List of achieved throughput values (msgs/sec)
-            min_improvement_percent: Minimum improvement percentage to consider as "improvement"
-            consecutive_steps_required: Number of consecutive steps without improvement to trigger plateau
-
-        Returns:
-            True if plateau detected, False otherwise
-        """
-        if len(throughput_history) < consecutive_steps_required + 1:
-            return False
-
-        # Get the baseline (best throughput before the last N steps)
-        baseline_idx = len(throughput_history) - consecutive_steps_required - 1
-        baseline = throughput_history[baseline_idx]
-
-        # Check if all recent steps failed to improve beyond the threshold
-        for i in range(consecutive_steps_required):
-            recent_idx = baseline_idx + 1 + i
-            recent = throughput_history[recent_idx]
-            improvement = ((recent - baseline) / baseline) * 100 if baseline > 0 else 0
-
-            if improvement > min_improvement_percent:
-                # Found improvement, no plateau
-                return False
-
-        # No improvement in consecutive_steps_required steps
-        return True
 
     # =========================================================================
     # BATCH MODE METHODS
@@ -1014,314 +788,6 @@ spec:
             workloads.append((stage_id, workload, target_rate))
 
         return workloads
-
-    def _indent_yaml(self, content: str, spaces: int) -> str:
-        """
-        Indent YAML content for embedding in ConfigMap.
-
-        Args:
-            content: YAML content string
-            spaces: Number of spaces to indent
-
-        Returns:
-            Indented YAML content
-        """
-        indent = ' ' * spaces
-        lines = content.split('\n')
-        return '\n'.join(indent + line if line else line for line in lines)
-
-    def _generate_batch_configmap_yaml(
-        self,
-        batch_name: str,
-        workloads: List[Tuple[str, Dict, int]]
-    ) -> str:
-        """
-        Generate Kubernetes ConfigMap YAML containing all batch workloads.
-
-        ConfigMap structure:
-          - driver.yaml: Pulsar driver configuration
-          - stages.txt: List of stage_id,target_rate pairs
-          - workload-{stage_id}.yaml: Workload for each stage
-
-        Args:
-            batch_name: Name for this batch run
-            workloads: List of (stage_id, workload_dict, target_rate) tuples
-
-        Returns:
-            ConfigMap YAML string
-        """
-        # Build stages.txt content
-        stages_content = "\n".join(
-            f"{stage_id},{target_rate}"
-            for stage_id, _, target_rate in workloads
-        )
-
-        # Build driver.yaml content
-        driver_content = f"""name: Pulsar
-driverClass: io.openmessaging.benchmark.driver.pulsar.PulsarBenchmarkDriver
-client:
-  serviceUrl: {self.pulsar_service_url}
-  httpUrl: {self.pulsar_http_url}
-  namespacePrefix: {self.pulsar_tenant_namespace}
-producer:
-  batchingEnabled: true
-  batchingMaxPublishDelayMs: 5
-  blockIfQueueFull: true
-  pendingQueueSize: 50000
-consumer:
-  subscriptionType: Shared"""
-
-        # Start ConfigMap
-        cm_yaml = f"""apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: omb-batch-{batch_name}
-  namespace: {self.namespace}
-data:
-  driver.yaml: |
-{self._indent_yaml(driver_content, 4)}
-  stages.txt: |
-{self._indent_yaml(stages_content, 4)}
-"""
-
-        # Add each workload
-        for stage_id, workload_dict, _ in workloads:
-            workload_content = yaml.dump(workload_dict, default_flow_style=False)
-            cm_yaml += f"""  workload-{stage_id}.yaml: |
-{self._indent_yaml(workload_content, 4)}
-"""
-
-        return cm_yaml
-
-    def _generate_batch_bash_script(
-        self,
-        workers_list: str,
-        plateau_config: Dict
-    ) -> str:
-        """
-        Generate bash script for batch execution with in-job plateau detection.
-
-        Script flow:
-        1. Initialize variables
-        2. Loop through stages.txt
-        3. Run benchmark for each stage
-        4. Extract throughput from JSON results
-        5. Check for plateau after each stage
-        6. Exit early if plateau detected
-        7. Sleep at end to allow results collection
-
-        Args:
-            workers_list: Comma-separated list of worker URLs
-            plateau_config: Plateau detection configuration from test plan
-
-        Returns:
-            Bash script string
-        """
-        # Plateau detection settings
-        plateau_enabled = plateau_config.get('enabled', False)
-        min_improvement = plateau_config.get('min_improvement_percent', 10.0)
-        consecutive_required = plateau_config.get('consecutive_steps_required', 2)
-
-        # Build plateau detection bash logic
-        plateau_logic = ""
-        if plateau_enabled:
-            plateau_logic = f'''
-    # PLATEAU DETECTION (matches Python _check_plateau logic)
-    if [ $stage_count -ge $(({consecutive_required} + 1)) ]; then
-      # Get baseline (best throughput before last N steps)
-      baseline_idx=$((stage_count - {consecutive_required} - 1))
-      baseline=${{throughput_history[$baseline_idx]}}
-
-      # Check if recent steps improved over baseline
-      improved=false
-      for ((i=0; i<{consecutive_required}; i++)); do
-        recent_idx=$((baseline_idx + 1 + i))
-        recent=${{throughput_history[$recent_idx]}}
-
-        # Calculate improvement percentage (using awk instead of bc)
-        if awk -v b="$baseline" 'BEGIN {{exit (b <= 0)}}'; then
-          improvement=$(awk -v r="$recent" -v b="$baseline" 'BEGIN {{printf "%.2f", ((r - b) / b) * 100}}')
-          if awk -v imp="$improvement" -v min="{min_improvement}" 'BEGIN {{exit (imp <= min)}}'; then
-            improved=true
-            break
-          fi
-        fi
-      done
-
-      if [ "$improved" = false ]; then
-        echo ""
-        echo "=============================================="
-        echo "PLATEAU DETECTED!"
-        echo "No improvement > {min_improvement}% for {consecutive_required} consecutive steps"
-        echo "Max throughput achieved: $(printf '%s\\n' "${{throughput_history[@]}}" | sort -rn | head -1) msgs/sec"
-        echo "=============================================="
-        break  # Exit loop early
-      fi
-    fi'''
-
-        return f'''#!/bin/bash
-set -e
-echo "===== OMB Batch Mode Execution ====="
-echo "Timestamp: $(date)"
-echo "Hostname: $(hostname)"
-echo "Experiment ID: {self.experiment_id}"
-echo ""
-
-# Create results directory
-mkdir -p /results/{self.experiment_id}
-
-# Initialize plateau detection variables
-declare -a throughput_history=()
-stage_count=0
-max_throughput=0
-
-echo "===== Worker Connectivity Tests ====="
-WORKERS="{workers_list}"
-IFS=',' read -ra WORKER_ARRAY <<< "$WORKERS"
-for worker in "${{WORKER_ARRAY[@]}}"; do
-  echo "Testing $worker..."
-  curl -m 5 "$worker" || echo "Worker $worker not reachable"
-done
-echo ""
-
-# Read stages file and execute each benchmark
-echo "===== Starting Batch Execution ====="
-while IFS=',' read -r stage_id target_rate; do
-  # Skip empty lines and comments
-  [[ -z "$stage_id" || "$stage_id" == "#"* ]] && continue
-
-  echo ""
-  echo "=============================================="
-  echo "STAGE: $stage_id"
-  echo "Target Rate: $target_rate msgs/sec"
-  echo "Stage: $((stage_count + 1))"
-  echo "=============================================="
-
-  # Run benchmark for this stage
-  /app/bin/benchmark \\
-    --drivers /workload/driver.yaml \\
-    --workers {workers_list} \\
-    --output /results/{self.experiment_id}/${{stage_id}}.json \\
-    /workload/workload-${{stage_id}}.yaml
-
-  BENCH_EXIT_CODE=$?
-
-  if [ $BENCH_EXIT_CODE -ne 0 ]; then
-    echo "ERROR: Benchmark failed for stage $stage_id (exit code: $BENCH_EXIT_CODE)"
-    continue
-  fi
-
-  echo "Stage $stage_id completed successfully"
-
-  # Extract and track throughput
-  if [ -f "/results/{self.experiment_id}/${{stage_id}}.json" ]; then
-    # Extract average publishRate using grep/awk (jq not available in container)
-    # JSON format: "publishRate" : [ 99567.0, 100042.0, ... ]
-    actual=$(grep -o '"publishRate" *: *\\[[^]]*\\]' /results/{self.experiment_id}/${{stage_id}}.json 2>/dev/null | \\
-             grep -oE '[0-9]+\\.[0-9]+' | \\
-             awk '{{sum+=$1; count++}} END {{if(count>0) printf "%.1f", sum/count; else print "0"}}')
-    actual=${{actual:-0}}
-    echo "Actual throughput: $actual msgs/sec"
-
-    # Add to history
-    throughput_history+=("$actual")
-    stage_count=$((stage_count + 1))
-
-    # Track max throughput (using awk for floating-point comparison)
-    if awk "BEGIN {{exit ($actual <= $max_throughput)}}"; then
-      : # not greater, do nothing
-    else
-      max_throughput=$actual
-    fi
-{plateau_logic}
-  fi
-done < /workload/stages.txt
-
-echo ""
-echo "=============================================="
-echo "BATCH EXECUTION COMPLETE"
-echo "=============================================="
-echo "Stages completed: $stage_count"
-echo "Max throughput: $max_throughput msgs/sec"
-echo ""
-echo "Results directory contents:"
-ls -la /results/{self.experiment_id}/
-
-# Sleep to allow results collection
-echo ""
-echo "Sleeping 120 seconds to allow results collection..."
-sleep 120
-echo "Batch execution finished"
-'''
-
-    def _generate_batch_job_yaml(
-        self,
-        batch_name: str,
-        num_workers: int,
-        plateau_config: Dict
-    ) -> str:
-        """
-        Generate Kubernetes Job YAML for batch mode execution.
-
-        Args:
-            batch_name: Name for this batch run
-            num_workers: Number of workers to use
-            plateau_config: Plateau detection configuration
-
-        Returns:
-            Job YAML string
-        """
-        worker_addresses = self.worker_manager.get_worker_addresses(num_workers)
-        workers_list = ",".join(worker_addresses)
-
-        bash_script = self._generate_batch_bash_script(workers_list, plateau_config)
-
-        return f"""apiVersion: batch/v1
-kind: Job
-metadata:
-  name: omb-batch-{batch_name}
-  namespace: {self.namespace}
-  labels:
-    app: omb-driver
-    mode: batch
-    test: {batch_name}
-spec:
-  backoffLimit: 0
-  template:
-    metadata:
-      labels:
-        app: omb-driver
-        mode: batch
-        test: {batch_name}
-    spec:
-      restartPolicy: Never
-      nodeSelector:
-        klaviyo.com/pool-name: loadgen
-      tolerations:
-      - key: "loadgen"
-        operator: "Equal"
-        value: "true"
-        effect: "NoSchedule"
-      containers:
-      - name: omb-batch
-        image: {self.omb_image}
-        imagePullPolicy: Always
-        command: ["/bin/bash", "-c"]
-        args:
-          - |
-{self._indent_yaml(bash_script, 12)}
-        volumeMounts:
-        - name: workload
-          mountPath: /workload
-        - name: results
-          mountPath: /results
-      volumes:
-      - name: workload
-        configMap:
-          name: omb-batch-{batch_name}
-      - name: results
-        emptyDir: {{}}
-"""
 
     def _collect_batch_results(
         self,
@@ -1425,7 +891,7 @@ spec:
         live.update(self._create_layout())
 
         # Step 2: Create batch ConfigMap
-        configmap_yaml = self._generate_batch_configmap_yaml(batch_name, workloads)
+        configmap_yaml = self.manifest_builder.build_batch_configmap(batch_name, workloads)
         configmap_file = self.experiment_dir / f"batch_configmap_{batch_name}.yaml"
         with open(configmap_file, 'w') as f:
             f.write(configmap_yaml)
@@ -1461,7 +927,10 @@ spec:
             raise OrchestratorError(f"Failed to ensure workers: {e}")
 
         # Step 4: Create and run batch Job
-        job_yaml = self._generate_batch_job_yaml(batch_name, num_workers, plateau_config)
+        worker_addresses = self.worker_manager.get_worker_addresses(num_workers)
+        workers_list = ",".join(worker_addresses)
+        bash_script = render_batch_script(self.experiment_id, workers_list, plateau_config)
+        job_yaml = self.manifest_builder.build_batch_job(batch_name, num_workers, bash_script)
         job_file = self.experiment_dir / f"batch_job_{batch_name}.yaml"
         with open(job_file, 'w') as f:
             f.write(job_yaml)
@@ -1539,7 +1008,7 @@ spec:
                 current_stage = current_stage_match[-1] if current_stage_match else None
 
                 # Extract current rate from logs
-                current_rate = self._extract_current_rate_from_logs(logs)
+                current_rate = extract_current_rate_from_logs(logs)
 
                 # Check for plateau detection in logs
                 if 'PLATEAU DETECTED' in logs:
@@ -1558,7 +1027,7 @@ spec:
             target_rate = next((rate for stage_id, _, rate in workloads if stage_id == current_stage), 0)
 
             if current_stage:
-                status = self._format_rate_status(f"Running: {current_stage}", target_rate, current_rate)
+                status = format_rate_status(f"Running: {current_stage}", target_rate, current_rate)
                 self._add_status(status, 'info')
             else:
                 self._add_status(
@@ -1699,7 +1168,7 @@ spec:
 
                         # Extract throughput for plateau detection
                         if plateau_enabled:
-                            throughput = self._extract_avg_throughput(result_file)
+                            throughput = extract_avg_throughput(result_file)
                             if throughput is not None:
                                 throughput_history.append(throughput)
                                 logger.info(f"  Achieved throughput: {throughput:,.0f} msgs/sec")
@@ -1710,7 +1179,7 @@ spec:
                                     max_throughput_step = test_name
 
                                 # Check for plateau
-                                if self._check_plateau(throughput_history, min_improvement_percent, consecutive_steps_required):
+                                if check_plateau(throughput_history, min_improvement_percent, consecutive_steps_required):
                                     plateau_detected = True
                                     logger.info("="*60)
                                     logger.info("PLATEAU DETECTED!")
@@ -1889,165 +1358,6 @@ spec:
                 raise OrchestratorError("No experiments found")
             return latest_link.resolve().name
         return experiment_id
-
-    # Cleanup method removed - now in operations.py
-    @staticmethod
-    def cleanup_pulsar_namespaces_deprecated(pattern: str = "omb-test-*", dry_run: bool = False) -> None:
-        """
-        Clean up Pulsar namespaces matching a pattern.
-
-        Args:
-            pattern: Glob pattern for namespace names to delete (default: omb-test-*)
-            dry_run: If True, only list namespaces without deleting
-        """
-        print(f"\nLooking for Pulsar namespaces matching: public/{pattern}")
-        print("=" * 60)
-
-        # List all namespaces in public tenant
-        result = subprocess.run(
-            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-             "bin/pulsar-admin", "namespaces", "list", "public"],
-            capture_output=True,
-            text=True,
-            check=False
-        )
-
-        if result.returncode != 0:
-            print(f"Error listing namespaces: {result.stderr}")
-            return
-
-        # Parse namespace list
-        lines = result.stdout.strip().split('\n')
-        namespaces = []
-        for line in lines:
-            line = line.strip()
-            if line and line.startswith('public/') and 'Defaulted container' not in line:
-                namespace_name = line.split('/')[-1]
-                # Match pattern (simple glob: omb-test-* matches omb-test-anything)
-                if pattern.endswith('*'):
-                    prefix = pattern[:-1]
-                    if namespace_name.startswith(prefix):
-                        namespaces.append(line)
-                elif namespace_name == pattern:
-                    namespaces.append(line)
-
-        if not namespaces:
-            print(f"No namespaces found matching pattern: {pattern}")
-            return
-
-        print(f"Found {len(namespaces)} namespace(s) to {'delete' if not dry_run else 'list'}:\n")
-        for ns in namespaces:
-            print(f"  - {ns}")
-
-        if dry_run:
-            print("\n[DRY RUN] No changes made. Run without --dry-run to delete.")
-            return
-
-        print(f"\n{'='*60}")
-        confirm = input(f"Delete {len(namespaces)} namespace(s)? (yes/no): ").strip().lower()
-        if confirm != 'yes':
-            print("Cancelled.")
-            return
-
-        print("\nDeleting namespaces...")
-        deleted = 0
-        failed = 0
-
-        for ns in namespaces:
-            print(f"\nProcessing {ns}...")
-
-            total_deleted = 0
-            total_failed = 0
-
-            # First, delete regular (non-partitioned) topics
-            topic_result = subprocess.run(
-                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                 "bin/pulsar-admin", "topics", "list", ns],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-
-            if topic_result.returncode == 0:
-                # Filter out non-topic lines (like "Defaulted container...")
-                topics = [t.strip() for t in topic_result.stdout.strip().split('\n')
-                         if t.strip() and t.strip().startswith('persistent://')]
-
-                if topics:
-                    print(f"  Found {len(topics)} regular topic(s), deleting...")
-                    for topic in topics:
-                        delete_result = subprocess.run(
-                            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                             "bin/pulsar-admin", "topics", "delete", topic, "-f"],
-                            capture_output=True,
-                            text=True,
-                            check=False
-                        )
-
-                        if delete_result.returncode == 0:
-                            total_deleted += 1
-                        else:
-                            total_failed += 1
-                            print(f"    ✗ Failed to delete topic {topic}: {delete_result.stderr.strip()}")
-
-            # Second, delete partitioned topics (they don't show up in regular topics list)
-            partitioned_result = subprocess.run(
-                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                 "bin/pulsar-admin", "topics", "list-partitioned-topics", ns],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-
-            if partitioned_result.returncode == 0:
-                partitioned_topics = [t.strip() for t in partitioned_result.stdout.strip().split('\n')
-                                     if t.strip() and t.strip().startswith('persistent://')]
-
-                if partitioned_topics:
-                    print(f"  Found {len(partitioned_topics)} partitioned topic(s), deleting...")
-                    for topic in partitioned_topics:
-                        delete_result = subprocess.run(
-                            ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                             "bin/pulsar-admin", "topics", "delete-partitioned-topic", topic, "-f"],
-                            capture_output=True,
-                            text=True,
-                            check=False
-                        )
-
-                        if delete_result.returncode == 0:
-                            total_deleted += 1
-                        else:
-                            total_failed += 1
-                            print(f"    ✗ Failed to delete partitioned topic {topic}: {delete_result.stderr.strip()}")
-
-            if total_deleted > 0 or total_failed > 0:
-                print(f"  Total topics: {total_deleted} deleted, {total_failed} failed")
-            else:
-                print(f"  No topics found in {ns}")
-
-            # Now delete the namespace
-            result = subprocess.run(
-                ["kubectl", "exec", "-n", "pulsar", "pulsar-broker-0", "--",
-                 "bin/pulsar-admin", "namespaces", "delete", ns],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-
-            if result.returncode == 0:
-                print(f"  ✓ Namespace deleted: {ns}")
-                deleted += 1
-            else:
-                error_msg = result.stderr.strip()
-                # Filter out "Defaulted container" warnings
-                error_lines = [line for line in error_msg.split('\n')
-                              if 'Defaulted container' not in line]
-                clean_error = '\n'.join(error_lines).strip()
-                print(f"  ✗ Failed to delete namespace {ns}: {clean_error}")
-                failed += 1
-
-        print(f"\n{'='*60}")
-        print(f"Summary: {deleted} deleted, {failed} failed")
 
     @staticmethod
     def list_experiments() -> None:

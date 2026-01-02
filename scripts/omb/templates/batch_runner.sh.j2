@@ -1,0 +1,93 @@
+#!/bin/bash
+set -e
+echo "===== OMB Batch Mode Execution ====="
+echo "Timestamp: $(date)"
+echo "Hostname: $(hostname)"
+echo "Experiment ID: {{ experiment_id }}"
+echo ""
+
+# Create results directory
+mkdir -p /results/{{ experiment_id }}
+
+# Initialize plateau detection variables
+declare -a throughput_history=()
+stage_count=0
+max_throughput=0
+
+echo "===== Worker Connectivity Tests ====="
+WORKERS="{{ workers_list }}"
+IFS=',' read -ra WORKER_ARRAY <<< "$WORKERS"
+for worker in "${WORKER_ARRAY[@]}"; do
+  echo "Testing $worker..."
+  curl -m 5 "$worker" || echo "Worker $worker not reachable"
+done
+echo ""
+
+# Read stages file and execute each benchmark
+echo "===== Starting Batch Execution ====="
+while IFS=',' read -r stage_id target_rate; do
+  # Skip empty lines and comments
+  [[ -z "$stage_id" || "$stage_id" == "#"* ]] && continue
+
+  echo ""
+  echo "=============================================="
+  echo "STAGE: $stage_id"
+  echo "Target Rate: $target_rate msgs/sec"
+  echo "Stage: $((stage_count + 1))"
+  echo "=============================================="
+
+  # Run benchmark for this stage
+  /app/bin/benchmark \
+    --drivers /workload/driver.yaml \
+    --workers {{ workers_list }} \
+    --output /results/{{ experiment_id }}/${stage_id}.json \
+    /workload/workload-${stage_id}.yaml
+
+  BENCH_EXIT_CODE=$?
+
+  if [ $BENCH_EXIT_CODE -ne 0 ]; then
+    echo "ERROR: Benchmark failed for stage $stage_id (exit code: $BENCH_EXIT_CODE)"
+    continue
+  fi
+
+  echo "Stage $stage_id completed successfully"
+
+  # Extract and track throughput
+  if [ -f "/results/{{ experiment_id }}/${stage_id}.json" ]; then
+    # Extract average publishRate using grep/awk (jq not available in container)
+    # JSON format: "publishRate" : [ 99567.0, 100042.0, ... ]
+    actual=$(grep -o '"publishRate" *: *\[[^]]*\]' /results/{{ experiment_id }}/${stage_id}.json 2>/dev/null | \
+             grep -oE '[0-9]+\.[0-9]+' | \
+             awk '{sum+=$1; count++} END {if(count>0) printf "%.1f", sum/count; else print "0"}')
+    actual=${actual:-0}
+    echo "Actual throughput: $actual msgs/sec"
+
+    # Add to history
+    throughput_history+=("$actual")
+    stage_count=$((stage_count + 1))
+
+    # Track max throughput (using awk for floating-point comparison)
+    if awk "BEGIN {exit ($actual <= $max_throughput)}"; then
+      : # not greater, do nothing
+    else
+      max_throughput=$actual
+    fi
+{{ plateau_logic }}
+  fi
+done < /workload/stages.txt
+
+echo ""
+echo "=============================================="
+echo "BATCH EXECUTION COMPLETE"
+echo "=============================================="
+echo "Stages completed: $stage_count"
+echo "Max throughput: $max_throughput msgs/sec"
+echo ""
+echo "Results directory contents:"
+ls -la /results/{{ experiment_id }}/
+
+# Sleep to allow results collection
+echo ""
+echo "Sleeping 120 seconds to allow results collection..."
+sleep 120
+echo "Batch execution finished"
