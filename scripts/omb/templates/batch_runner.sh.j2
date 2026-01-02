@@ -11,6 +11,7 @@ mkdir -p /results/{{ experiment_id }}
 
 # Initialize plateau detection variables
 declare -a throughput_history=()
+declare -a target_rates=()
 stage_count=0
 max_throughput=0
 
@@ -64,6 +65,7 @@ while IFS=',' read -r stage_id target_rate; do
 
     # Add to history
     throughput_history+=("$actual")
+    target_rates+=("$target_rate")
     stage_count=$((stage_count + 1))
 
     # Track max throughput (using awk for floating-point comparison)

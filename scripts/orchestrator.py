@@ -701,16 +701,17 @@ class Orchestrator:
         # Plateau detection configuration
         plateau_config = test_plan.get('plateau_detection', {})
         plateau_enabled = plateau_config.get('enabled', False)
-        min_improvement_percent = plateau_config.get('min_improvement_percent', 2.0)
+        allowed_deviation = plateau_config.get('allowed_deviation', 10.0)
         consecutive_steps_required = plateau_config.get('consecutive_steps_required', 2)
 
         if plateau_enabled:
             logger.info(f"Plateau detection ENABLED:")
-            logger.info(f"  - Min improvement threshold: {min_improvement_percent}%")
+            logger.info(f"  - Allowed deviation from target: {allowed_deviation}%")
             logger.info(f"  - Consecutive steps required: {consecutive_steps_required}")
 
         # Track throughput history for plateau detection
         throughput_history: List[float] = []
+        target_rates: List[float] = []
         plateau_detected = False
         max_throughput = 0.0
         max_throughput_step = ""
@@ -746,8 +747,11 @@ class Orchestrator:
                         # Extract throughput for plateau detection
                         if plateau_enabled:
                             throughput = extract_avg_throughput(result_file)
-                            if throughput is not None:
+                            target_rate = test_run.get('producer_rate', 0)
+                            if throughput is not None and target_rate > 0:
                                 throughput_history.append(throughput)
+                                target_rates.append(float(target_rate))
+                                logger.info(f"  Target rate: {target_rate:,} msgs/sec")
                                 logger.info(f"  Achieved throughput: {throughput:,.0f} msgs/sec")
 
                                 # Track maximum throughput
@@ -756,11 +760,11 @@ class Orchestrator:
                                     max_throughput_step = test_name
 
                                 # Check for plateau
-                                if check_plateau(throughput_history, min_improvement_percent, consecutive_steps_required):
+                                if check_plateau(throughput_history, target_rates, allowed_deviation, consecutive_steps_required):
                                     plateau_detected = True
                                     logger.info("="*60)
                                     logger.info("PLATEAU DETECTED!")
-                                    logger.info(f"Throughput has not improved by >{min_improvement_percent}% for {consecutive_steps_required} consecutive steps")
+                                    logger.info(f"Achieved throughput deviated >{allowed_deviation}% from target for {consecutive_steps_required} consecutive steps")
                                     logger.info(f"Maximum throughput achieved: {max_throughput:,.0f} msgs/sec (at step '{max_throughput_step}')")
                                     logger.info("Stopping test run early and generating report...")
                                     logger.info("="*60)

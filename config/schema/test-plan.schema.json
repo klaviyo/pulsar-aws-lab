@@ -22,17 +22,17 @@
           "default": false,
           "description": "Enable automatic plateau detection"
         },
-        "min_improvement_percent": {
+        "allowed_deviation": {
           "type": "number",
           "minimum": 0,
-          "default": 2.0,
-          "description": "Minimum throughput improvement percentage to consider as improvement"
+          "default": 10.0,
+          "description": "Maximum allowed deviation (%) between achieved and target throughput before considering it a plateau step"
         },
         "consecutive_steps_required": {
           "type": "integer",
           "minimum": 1,
           "default": 2,
-          "description": "Number of consecutive steps without improvement before stopping"
+          "description": "Number of consecutive steps with deviation exceeding threshold before stopping"
         }
       }
     },

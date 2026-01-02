@@ -1,5 +1,5 @@
 """
-Plateau detection - detect when throughput has stopped improving.
+Plateau detection - detect when achieved throughput deviates too far from target rate.
 """
 
 from typing import Dict, List
@@ -7,38 +7,50 @@ from typing import Dict, List
 
 def check_plateau(
     throughput_history: List[float],
-    min_improvement_percent: float,
+    target_rates: List[float],
+    allowed_deviation: float,
     consecutive_steps_required: int
 ) -> bool:
     """
-    Check if throughput has plateaued based on recent history.
+    Check if throughput has plateaued based on deviation from target rate.
+
+    A plateau is detected when the achieved throughput falls below the acceptable
+    threshold (target * (1 - allowed_deviation/100)) for consecutive_steps_required
+    consecutive steps.
 
     Args:
         throughput_history: List of achieved throughput values (msgs/sec)
-        min_improvement_percent: Minimum improvement percentage to consider as "improvement"
-        consecutive_steps_required: Number of consecutive steps without improvement to trigger plateau
+        target_rates: List of target rates corresponding to each throughput measurement
+        allowed_deviation: Maximum allowed deviation percentage from target rate
+        consecutive_steps_required: Number of consecutive steps with deviation before triggering plateau
 
     Returns:
         True if plateau detected, False otherwise
     """
-    if len(throughput_history) < consecutive_steps_required + 1:
+    if len(throughput_history) < consecutive_steps_required:
         return False
 
-    # Get the baseline (best throughput before the last N steps)
-    baseline_idx = len(throughput_history) - consecutive_steps_required - 1
-    baseline = throughput_history[baseline_idx]
+    if len(throughput_history) != len(target_rates):
+        return False
 
-    # Check if all recent steps failed to improve beyond the threshold
+    # Check last N steps for deviation from target
     for i in range(consecutive_steps_required):
-        recent_idx = baseline_idx + 1 + i
-        recent = throughput_history[recent_idx]
-        improvement = ((recent - baseline) / baseline) * 100 if baseline > 0 else 0
+        idx = len(throughput_history) - consecutive_steps_required + i
+        achieved = throughput_history[idx]
+        target = target_rates[idx]
 
-        if improvement > min_improvement_percent:
-            # Found improvement, no plateau
+        if target <= 0:
+            # Skip invalid target rates
             return False
 
-    # No improvement in consecutive_steps_required steps
+        # Calculate minimum acceptable throughput
+        min_acceptable = target * (1 - allowed_deviation / 100)
+
+        if achieved >= min_acceptable:
+            # This step is within tolerance, no plateau
+            return False
+
+    # All consecutive steps exceeded deviation threshold
     return True
 
 
@@ -46,11 +58,11 @@ def generate_bash_plateau_check(plateau_config: Dict) -> str:
     """
     Generate bash code for plateau detection.
 
-    This generates equivalent bash logic to the Python check_plateau function,
+    This generates bash logic to compare achieved throughput against target rate,
     for embedding in batch mode bash scripts.
 
     Args:
-        plateau_config: Dict with 'enabled', 'min_improvement_percent', 'consecutive_steps_required'
+        plateau_config: Dict with 'enabled', 'allowed_deviation', 'consecutive_steps_required'
 
     Returns:
         Bash code snippet for plateau detection, or empty string if disabled
@@ -58,37 +70,37 @@ def generate_bash_plateau_check(plateau_config: Dict) -> str:
     if not plateau_config.get('enabled', False):
         return ""
 
-    min_improvement = plateau_config.get('min_improvement_percent', 10.0)
+    allowed_deviation = plateau_config.get('allowed_deviation', 10.0)
     consecutive_required = plateau_config.get('consecutive_steps_required', 2)
 
     return f'''
-    # PLATEAU DETECTION (matches Python check_plateau logic)
-    if [ $stage_count -ge $(({consecutive_required} + 1)) ]; then
-      # Get baseline (best throughput before last N steps)
-      baseline_idx=$((stage_count - {consecutive_required} - 1))
-      baseline=${{throughput_history[$baseline_idx]}}
-
-      # Check if recent steps improved over baseline
-      improved=false
+    # PLATEAU DETECTION (compare achieved vs target rate)
+    if [ $stage_count -ge {consecutive_required} ]; then
+      # Check if last N steps all deviated from target by more than {allowed_deviation}%
+      all_deviated=true
       for ((i=0; i<{consecutive_required}; i++)); do
-        recent_idx=$((baseline_idx + 1 + i))
-        recent=${{throughput_history[$recent_idx]}}
+        idx=$((stage_count - {consecutive_required} + i))
+        achieved=${{throughput_history[$idx]}}
+        target=${{target_rates[$idx]}}
 
-        # Calculate improvement percentage (using awk instead of bc)
-        if awk -v b="$baseline" 'BEGIN {{exit (b <= 0)}}'; then
-          improvement=$(awk -v r="$recent" -v b="$baseline" 'BEGIN {{printf "%.2f", ((r - b) / b) * 100}}')
-          if awk -v imp="$improvement" -v min="{min_improvement}" 'BEGIN {{exit (imp <= min)}}'; then
-            improved=true
+        # Calculate minimum acceptable throughput (using awk for floating-point)
+        if awk -v t="$target" 'BEGIN {{exit (t <= 0)}}'; then
+          min_acceptable=$(awk -v t="$target" -v d="{allowed_deviation}" 'BEGIN {{printf "%.2f", t * (1 - d / 100)}}')
+
+          # Check if achieved >= min_acceptable
+          if awk -v a="$achieved" -v m="$min_acceptable" 'BEGIN {{exit (a < m)}}'; then
+            # This step is within tolerance
+            all_deviated=false
             break
           fi
         fi
       done
 
-      if [ "$improved" = false ]; then
+      if [ "$all_deviated" = true ]; then
         echo ""
         echo "=============================================="
         echo "PLATEAU DETECTED!"
-        echo "No improvement > {min_improvement}% for {consecutive_required} consecutive steps"
+        echo "Achieved throughput deviated >{allowed_deviation}% from target for {consecutive_required} consecutive steps"
         echo "Max throughput achieved: $(printf '%s\\n' "${{throughput_history[@]}}" | sort -rn | head -1) msgs/sec"
         echo "=============================================="
         break  # Exit loop early
