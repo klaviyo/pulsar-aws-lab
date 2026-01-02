@@ -36,16 +36,27 @@ def extract_avg_throughput(result_file: Path) -> Optional[float]:
         return None
 
 
-def extract_current_rate_from_logs(logs: str) -> Optional[float]:
+def extract_current_rate_from_logs(logs: str, stage_id: Optional[str] = None) -> Optional[float]:
     """
     Extract the most recent publish rate from live OMB logs.
 
     Parses log lines like:
     Pub rate 101926.1 msg/s / 49.8 MB/s | ...
 
+    Args:
+        logs: Raw log output
+        stage_id: If provided, only extract rates from after this stage marker
+
     Returns:
         Most recent publish rate in msgs/sec, or None if not found
     """
+    # If stage_id provided, only look at logs after the stage marker
+    if stage_id:
+        stage_marker = f"STAGE: {stage_id}"
+        marker_pos = logs.rfind(stage_marker)
+        if marker_pos != -1:
+            logs = logs[marker_pos:]
+
     pattern = r'Pub rate\s+([\d.]+)\s+msg/s'
     matches = re.findall(pattern, logs)
     if matches:

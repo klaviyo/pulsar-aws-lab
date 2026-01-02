@@ -7,13 +7,12 @@ Workflow controller for running OpenMessaging Benchmark tests against existing P
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import boto3
 import yaml
@@ -30,10 +29,10 @@ from metrics_collector import MetricsCollector
 
 # Import OMB modules
 from omb.workers import WorkerManager
-from omb.manifests import ManifestBuilder, indent_yaml
+from omb.manifests import ManifestBuilder
 from omb.metrics import extract_avg_throughput, extract_current_rate_from_logs, format_rate_status
-from omb.plateau import check_plateau, generate_bash_plateau_check
-from omb.batch_script import render_batch_script
+from omb.plateau import check_plateau
+from omb.batch_executor import BatchExecutor
 
 # Setup logging
 logging.basicConfig(
@@ -91,9 +90,6 @@ class Orchestrator:
             pulsar_tenant_namespace=self.pulsar_tenant_namespace
         )
 
-        # Track test run times for Grafana links
-        self.test_start_time = None
-        self.test_end_time = None
 
         # Store test results from immediate collection
         self.test_results = ""
@@ -136,6 +132,18 @@ class Orchestrator:
             namespace="pulsar",  # Pulsar components are in "pulsar" namespace
             experiment_dir=self.experiment_dir,
             run_command_func=self.run_command
+        )
+
+        # Initialize batch executor for batch mode tests
+        self.batch_executor = BatchExecutor(
+            experiment_id=self.experiment_id,
+            experiment_dir=self.experiment_dir,
+            namespace=self.namespace,
+            worker_manager=self.worker_manager,
+            manifest_builder=self.manifest_builder,
+            run_command_func=self.run_command,
+            add_status_func=self._add_status,
+            create_layout_func=self._create_layout
         )
 
         # Ensure K8s namespace exists
@@ -217,84 +225,8 @@ class Orchestrator:
 
     def _create_layout(self):
         """Create the UI layout (delegates to UI)."""
-        # Update UI with latest test info and Grafana URL
-        
         return self.ui.create_layout()
 
-
-
-
-
-    def _format_grafana_time(self, dt: Optional[datetime], offset_seconds: int = 0) -> str:
-        """
-        Format datetime for Grafana URL.
-
-        Args:
-            dt: Datetime to format
-            offset_seconds: Offset in seconds to add (can be negative)
-
-        Returns:
-            Timestamp string in milliseconds or 'now' fallback
-        """
-        if dt:
-            timestamp_ms = int((dt.timestamp() + offset_seconds) * 1000)
-            return str(timestamp_ms)
-        return 'now' if offset_seconds >= 0 else 'now-15m'
-
-    def _get_grafana_url(self, from_time: str = 'now-15m', to_time: str = 'now', dashboard_path: Optional[str] = None) -> str:
-        """
-        Generate Grafana dashboard URL with the correct parameters for each dashboard type.
-
-        Args:
-            from_time: Start time for dashboard (e.g., 'now-15m' or timestamp in ms)
-            to_time: End time for dashboard (e.g., 'now' or timestamp in ms)
-            dashboard_path: Override default dashboard path
-
-        Returns:
-            Full Grafana dashboard URL
-        """
-        # Extract just the namespace part (without 'public/' prefix) for Grafana
-        namespace_part = self.pulsar_tenant_namespace.replace('public/', '')
-
-        # Base parameters for all dashboards
-        params = {
-            'orgId': '1',
-            'from': from_time,
-            'to': to_time,
-            'timezone': 'utc',
-        }
-
-        path = dashboard_path or GRAFANA_DASHBOARD_PATH
-
-        # Add dashboard-specific parameters
-        if 'pulsar-messaging' in path:
-            params.update({
-                'var-cluster': '$__all',
-                'var-tenant': 'public',
-                'var-namespace': namespace_part,
-                'refresh': '30s'
-            })
-        elif 'pulsar-jvm' in path:
-            params.update({
-                'var-cluster': '$__all',
-                'var-job': '$__all',
-                'var-instance': '$__all',
-                'refresh': '30s'
-            })
-        elif 'pulsar-proxy' in path:
-            params.update({
-                'var-proxy': '$__all',
-                'refresh': '30s'
-            })
-        else:
-            # Default parameters
-            params.update({
-                'var-cluster': '$__all',
-                'refresh': '10s'
-            })
-
-        param_string = '&'.join([f"{k}={v}" for k, v in params.items()])
-        return f"{GRAFANA_BASE_URL}{path}?{param_string}"
 
     def load_config(self, config_file: Path) -> Dict:
         """
@@ -729,355 +661,6 @@ class Orchestrator:
 
         return results
 
-    # =========================================================================
-    # BATCH MODE METHODS
-    # =========================================================================
-
-    def _is_batch_compatible(self, test_plan: Dict) -> bool:
-        """
-        Check if test plan is eligible for batch mode execution.
-
-        Criteria:
-        - All test_runs must have same num_workers
-        - All test_runs must be fixed_rate type
-        - Must have more than 1 test_run (otherwise no benefit)
-        - batch_mode.enabled is not explicitly False
-
-        Args:
-            test_plan: Parsed test plan dictionary
-
-        Returns:
-            True if batch mode can be used, False otherwise
-        """
-        test_runs = test_plan.get('test_runs', [])
-
-        if len(test_runs) <= 1:
-            return False
-
-        batch_config = test_plan.get('batch_mode', {})
-        if batch_config.get('enabled') is False:
-            return False
-
-        # Check all runs have same worker count and are fixed_rate
-        first_workers = test_runs[0].get('num_workers', 3)
-        for run in test_runs:
-            if run.get('type') != 'fixed_rate':
-                return False
-            if run.get('num_workers', 3) != first_workers:
-                return False
-
-        return True
-
-    def _generate_batch_workloads(self, test_plan: Dict) -> List[Tuple[str, Dict, int]]:
-        """
-        Generate all workload configurations for batch mode.
-
-        Args:
-            test_plan: Parsed test plan dictionary
-
-        Returns:
-            List of (stage_id, workload_dict, target_rate) tuples
-        """
-        workloads = []
-        base_workload = test_plan['base_workload']
-
-        for idx, test_run in enumerate(test_plan['test_runs']):
-            stage_id = f"{idx+1:03d}-{test_run['name']}"
-            workload = self._generate_workload(base_workload, test_run)
-            target_rate = test_run.get('producer_rate', 0)
-            workloads.append((stage_id, workload, target_rate))
-
-        return workloads
-
-    def _collect_batch_results(
-        self,
-        batch_name: str,
-        workloads: List[Tuple[str, Dict, int]]
-    ) -> Dict[str, Dict]:
-        """
-        Collect results from batch Job pod.
-
-        Uses kubectl logs to retrieve results output.
-
-        Args:
-            batch_name: Name of the batch run
-            workloads: List of (stage_id, workload_dict, target_rate) tuples
-
-        Returns:
-            Dictionary mapping stage_id to result data
-        """
-        results = {}
-        results_dir = self.experiment_dir / "benchmark_results"
-        results_dir.mkdir(exist_ok=True)
-
-        # Get pod name for the batch job
-        try:
-            result = self.run_command(
-                ["kubectl", "get", "pods", "-n", self.namespace,
-                 "-l", f"job-name=omb-batch-{batch_name}",
-                 "-o", "jsonpath={.items[0].metadata.name}"],
-                "Get batch pod name",
-                capture_output=True,
-                check=True
-            )
-            pod_name = result.stdout.strip()
-        except Exception as e:
-            logger.error(f"Could not find pod for batch job {batch_name}: {e}")
-            return results
-
-        if not pod_name:
-            logger.error(f"No pod found for batch job {batch_name}")
-            return results
-
-        # Copy results from pod for each completed stage
-        for stage_id, _, target_rate in workloads:
-            try:
-                # Try to copy the result file
-                source_path = f"/results/{self.experiment_id}/{stage_id}.json"
-                dest_path = results_dir / f"{stage_id}.json"
-
-                self.run_command(
-                    ["kubectl", "cp",
-                     f"{self.namespace}/{pod_name}:{source_path}",
-                     str(dest_path)],
-                    f"Copy results for stage {stage_id}",
-                    check=False
-                )
-
-                # Load and parse if file was copied
-                if dest_path.exists():
-                    with open(dest_path, 'r') as f:
-                        data = json.load(f)
-                    results[stage_id] = {
-                        'data': data,
-                        'target_rate': target_rate
-                    }
-                    logger.info(f"Collected results for stage {stage_id}")
-            except Exception as e:
-                logger.warning(f"Failed to collect results for stage {stage_id}: {e}")
-
-        return results
-
-    def run_batch_tests(self, test_plan: Dict, live: Live) -> None:
-        """
-        Execute a test plan in batch mode.
-
-        Steps:
-        1. Generate all workloads upfront
-        2. Create single batch ConfigMap
-        3. Ensure workers are ready (once)
-        4. Create and run single batch Job
-        5. Monitor Job completion
-        6. Collect all results
-        7. Generate report
-
-        Args:
-            test_plan: Parsed test plan dictionary
-            live: Rich Live display instance
-        """
-        batch_name = test_plan['name'].replace(' ', '-').lower()
-        num_workers = test_plan['test_runs'][0].get('num_workers', 3)
-        plateau_config = test_plan.get('plateau_detection', {})
-
-        logger.info(f"Running batch mode for: {batch_name}")
-        logger.info(f"Stages: {len(test_plan['test_runs'])}")
-
-        self._add_status(f"Starting batch mode: {len(test_plan['test_runs'])} stages", 'info')
-        live.update(self._create_layout())
-
-        # Step 1: Generate all workloads
-        workloads = self._generate_batch_workloads(test_plan)
-        self._add_status(f"Generated {len(workloads)} workload configurations", 'success')
-        live.update(self._create_layout())
-
-        # Step 2: Create batch ConfigMap
-        configmap_yaml = self.manifest_builder.build_batch_configmap(batch_name, workloads)
-        configmap_file = self.experiment_dir / f"batch_configmap_{batch_name}.yaml"
-        with open(configmap_file, 'w') as f:
-            f.write(configmap_yaml)
-
-        self._add_status("Creating batch ConfigMap...", 'info')
-        live.update(self._create_layout())
-        self.run_command(
-            ["kubectl", "apply", "-f", str(configmap_file)],
-            f"Apply batch ConfigMap for {batch_name}"
-        )
-        self._add_status("✓ Batch ConfigMap created", 'success')
-        live.update(self._create_layout())
-
-        # Step 3: Ensure workers (ONCE for entire batch)
-        self._add_status(f"Ensuring {num_workers} workers are ready...", 'info')
-        live.update(self._create_layout())
-        try:
-            self.worker_manager.ensure_workers(num_workers)
-            self._add_status("✓ Workers ready", 'success')
-            live.update(self._create_layout())
-
-            # Single grace period for worker warmup
-            self._add_status("Waiting 30s for workers to fully initialize...", 'info')
-            live.update(self._create_layout())
-            for i in range(30):
-                progress = (i + 1) / 30 * 100
-                self._add_status(f"Worker startup: {i+1}/30s ({progress:.0f}%)", 'info')
-                live.update(self._create_layout())
-                time.sleep(1)
-            self._add_status("✓ Worker startup complete", 'success')
-            live.update(self._create_layout())
-        except Exception as e:
-            raise OrchestratorError(f"Failed to ensure workers: {e}")
-
-        # Step 4: Create and run batch Job
-        worker_addresses = self.worker_manager.get_worker_addresses(num_workers)
-        workers_list = ",".join(worker_addresses)
-        bash_script = render_batch_script(self.experiment_id, workers_list, plateau_config)
-        job_yaml = self.manifest_builder.build_batch_job(batch_name, num_workers, bash_script)
-        job_file = self.experiment_dir / f"batch_job_{batch_name}.yaml"
-        with open(job_file, 'w') as f:
-            f.write(job_yaml)
-
-        self._add_status("Starting batch Job...", 'info')
-        live.update(self._create_layout())
-        self.run_command(
-            ["kubectl", "apply", "-f", str(job_file)],
-            f"Create batch Job for {batch_name}"
-        )
-        self._add_status("✓ Batch Job started", 'success')
-        live.update(self._create_layout())
-
-        # Step 5: Monitor Job completion
-        # Calculate expected duration: (warmup + test) * num_stages
-        warmup_min = test_plan['base_workload'].get('warmup_duration_minutes', 1)
-        test_min = test_plan['base_workload'].get('test_duration_minutes', 3)
-        stage_duration_sec = (warmup_min + test_min) * 60
-        total_expected_sec = stage_duration_sec * len(workloads)
-        timeout_seconds = total_expected_sec + (15 * 60)  # Add 15min buffer
-
-        self._add_status(f"Monitoring batch Job (timeout: {timeout_seconds//60}min)...", 'info')
-        live.update(self._create_layout())
-
-        start_time = time.time()
-        job_completed = False
-        stages_completed = 0
-        current_stage = None
-
-        while time.time() - start_time < timeout_seconds:
-            # Check job status
-            result = self.run_command(
-                ["kubectl", "get", "job", f"omb-batch-{batch_name}",
-                 "-n", self.namespace,
-                 "-o", "jsonpath={.status.succeeded},{.status.failed}"],
-                "Check batch job status",
-                capture_output=True,
-                check=False
-            )
-
-            status = result.stdout.strip()
-            succeeded, failed = status.split(',') if ',' in status else ('', '')
-
-            if succeeded == '1':
-                job_completed = True
-                self._add_status("✓ Batch Job completed successfully", 'success')
-                live.update(self._create_layout())
-                break
-            elif failed == '1':
-                self._add_status("✗ Batch Job failed", 'error')
-                live.update(self._create_layout())
-                break
-
-            # Try to get current stage from logs
-            current_rate = None
-            try:
-                log_result = self.run_command(
-                    ["kubectl", "logs", "-n", self.namespace,
-                     "-l", f"job-name=omb-batch-{batch_name}",
-                     "--tail=2000"],
-                    "Get batch job logs",
-                    capture_output=True,
-                    check=False
-                )
-                logs = log_result.stdout
-
-                # Count COMPLETED stages (not just started)
-                # Look for "Stage X completed successfully" messages
-                completed_matches = re.findall(r'Stage (\S+) completed successfully', logs)
-                if completed_matches:
-                    stages_completed = len(completed_matches)
-
-                # Also check for currently running stage
-                current_stage_match = re.findall(r'STAGE: (\S+)', logs)
-                current_stage = current_stage_match[-1] if current_stage_match else None
-
-                # Extract current rate from logs
-                current_rate = extract_current_rate_from_logs(logs)
-
-                # Check for plateau detection in logs
-                if 'PLATEAU DETECTED' in logs:
-                    self._add_status(f"🎯 Plateau detected at stage {stages_completed}", 'success')
-                    live.update(self._create_layout())
-
-                # Check if batch execution is complete (after plateau or all stages done)
-                if 'BATCH EXECUTION COMPLETE' in logs:
-                    self._add_status("✓ Batch execution complete, collecting results...", 'success')
-                    live.update(self._create_layout())
-                    break  # Exit monitoring loop early
-            except Exception as e:
-                logger.debug(f"Error getting batch logs: {e}")
-
-            # Get target rate for current stage
-            target_rate = next((rate for stage_id, _, rate in workloads if stage_id == current_stage), 0)
-
-            if current_stage:
-                status = format_rate_status(f"Running: {current_stage}", target_rate, current_rate)
-                self._add_status(status, 'info')
-            else:
-                self._add_status(
-                    f"Running batch... {stages_completed}/{len(workloads)} completed",
-                    'info'
-                )
-            live.update(self._create_layout())
-            time.sleep(10)
-
-        # Step 6: Collect results
-        self._add_status("Collecting batch results...", 'info')
-        live.update(self._create_layout())
-
-        results = self._collect_batch_results(batch_name, workloads)
-        self._add_status(f"✓ Collected {len(results)} stage results", 'success')
-        live.update(self._create_layout())
-
-        # Step 7: Cleanup
-        self._add_status("Cleaning up batch resources...", 'info')
-        live.update(self._create_layout())
-
-        self.run_command(
-            ["kubectl", "delete", "job", f"omb-batch-{batch_name}",
-             "-n", self.namespace, "--wait=false"],
-            f"Delete batch Job {batch_name}",
-            check=False
-        )
-        self.run_command(
-            ["kubectl", "delete", "configmap", f"omb-batch-{batch_name}",
-             "-n", self.namespace],
-            f"Delete batch ConfigMap {batch_name}",
-            check=False
-        )
-
-        self._add_status("✓ Batch cleanup complete", 'success')
-        live.update(self._create_layout())
-
-        # Log summary
-        if results:
-            throughputs = []
-            for stage_id, result_data in results.items():
-                data = result_data.get('data', {})
-                publish_rates = data.get('publishRate', [])
-                if publish_rates:
-                    avg = sum(publish_rates) / len(publish_rates)
-                    throughputs.append(avg)
-
-            if throughputs:
-                logger.info(f"Batch complete: {len(results)} stages, max throughput: {max(throughputs):,.0f} msgs/sec")
-
     def run_tests(self, test_plan_file: Path) -> None:
         """
         Execute test plan with OMB.
@@ -1098,11 +681,8 @@ class Orchestrator:
         results_dir = self.experiment_dir / "benchmark_results"
         results_dir.mkdir(exist_ok=True)
 
-        # Track test execution times for Grafana links
-        self.test_start_time = datetime.now()
-
         # Check if batch mode is applicable
-        if self._is_batch_compatible(test_plan):
+        if self.batch_executor.is_batch_compatible(test_plan):
             batch_config = test_plan.get('batch_mode', {})
             if batch_config.get('enabled', True):  # Default to enabled for compatible plans
                 logger.info("="*60)
@@ -1112,10 +692,7 @@ class Orchestrator:
                 logger.info("="*60)
 
                 with Live(self._create_layout(), refresh_per_second=2, console=self.console) as live:
-                    self.run_batch_tests(test_plan, live)
-
-                # Track end time for Grafana links
-                self.test_end_time = datetime.now()
+                    self.batch_executor.run_batch_tests(test_plan, live, self._generate_workload)
                 return
 
         # Fall back to standard single-job-per-stage mode
@@ -1214,9 +791,6 @@ class Orchestrator:
             logger.info(f"Results: {results_dir}")
             logger.info(f"{'='*60}\n")
 
-        # Track end time for Grafana links
-        self.test_end_time = datetime.now()
-
         # Generate HTML report using existing report generator
         self.console.print("\n[bold cyan]Generating test report...[/bold cyan]")
 
@@ -1236,22 +810,11 @@ class Orchestrator:
                 'experiment_id': self.experiment_id
             }
 
-            # Generate Grafana dashboard URLs with test execution time range
-            from_time = self._format_grafana_time(self.test_start_time, offset_seconds=-300)  # Start 5 minutes before
-            to_time = self._format_grafana_time(self.test_end_time, offset_seconds=300)  # End 5 minutes after
-
-            grafana_dashboards = {
-                'Pulsar Messaging': self._get_grafana_url(from_time, to_time, "/d/EetmjdhnA/pulsar-messaging"),
-                'JVM Metrics': self._get_grafana_url(from_time, to_time, "/d/ystagDCsB/pulsar-jvm"),
-                'Proxy Metrics': self._get_grafana_url(from_time, to_time, "/d/vgnAupsuh/pulsar-proxy")
-            }
-
             report_dir = report_gen.create_report_package(
                 results_files=result_files,
                 cost_data=None,  # No cost data for test runs (only for full experiments)
                 config=report_config,
                 include_raw_data=False,  # Don't duplicate - files already in benchmark_results/
-                grafana_dashboards=grafana_dashboards
             )
             self.console.print(f"[bold green]✓ Report generated:[/bold green] {report_dir}\n")
             self.console.print(f"[dim]Raw results: {results_dir}[/dim]\n")

@@ -1,0 +1,56 @@
+# Ramping Throughput Test Plan
+# Start at 100k msgs/sec, increase by 40k every 3 minutes
+# Message size: 0.5KB (512 bytes)
+# Automatic plateau detection: stops when throughput doesn't increase for 2 consecutive steps
+
+name: "ramping-100k-40k-steps"
+description: "Ramping throughput test: 100k start, +40k/3min increments, 512 byte messages, auto-plateau detection"
+
+# Plateau detection settings
+plateau_detection:
+  enabled: true
+  # Stop if throughput doesn't increase by this percentage for consecutive_steps_required steps
+  min_improvement_percent: 10.0
+  # Number of consecutive steps without improvement before stopping
+  consecutive_steps_required: 2
+
+base_workload:
+  name: "ramp-test"
+  topics: 100
+  partitions_per_topic: 8
+  message_size: 512  # 0.5 KB
+  subscriptions_per_topic: 1
+  producers_per_topic: 1
+  consumers_per_topic: 1
+  consumer_backlog_size_gb: 0
+  test_duration_minutes: 2
+  warmup_duration_minutes: 1
+
+test_runs:
+  # Step 1: 100k msgs/sec
+  - name: "rate-100k"
+    description: "100k msgs/sec (baseline)"
+    type: "fixed_rate"
+    producer_rate: 100000
+    num_workers: 5
+
+  # Step 2: 140k msgs/sec
+  - name: "rate-140k"
+    description: "140k msgs/sec (+40k)"
+    type: "fixed_rate"
+    producer_rate: 140000
+    num_workers: 5
+
+  
+
+reporting:
+  output_format:
+    - "html"
+    - "json"
+  include_raw_data: true
+  metrics_to_highlight:
+    - "throughput"
+    - "p99_latency"
+    - "p95_latency"
+    - "max_latency"
+
