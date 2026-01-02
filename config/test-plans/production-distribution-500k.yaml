@@ -1,0 +1,46 @@
+# Production-like Message Size Distribution Test Plan
+# Based on real production traffic patterns with variable message sizes
+# Uses OpenMessaging Benchmark messageSizeDistribution feature (PR #443)
+
+name: "production-distribution-500k"
+description: "500k msgs/sec with production-like message size distribution"
+
+base_workload:
+  name: "prod-dist-500k-test"
+  topics: 200
+  partitions_per_topic: 8
+  subscriptions_per_topic: 1
+  producers_per_topic: 1
+  consumers_per_topic: 1
+  consumer_backlog_size_gb: 0
+  test_duration_minutes: 15
+  warmup_duration_minutes: 1
+
+  # Production-like message size distribution (normalized from traffic analysis, via https://klaviyo.chronosphere.io/dashboards/fkh-pulsar?start=5m)
+  # Weights sum to ~1001, representing percentage distribution
+  message_size_distribution:
+    "0-128": 1           # 0.04% - tiny messages
+    "128-512": 76        # 7.62% - small messages
+    "512-1024": 601      # 60.12% - typical messages (~1KB)
+    "1024-2048": 170     # 17.02% - medium messages
+    "2048-4096": 35      # 3.46% - larger messages
+    "4096-16384": 102    # 10.22% - large messages
+    "16384-102400": 15   # 1.46% - very large messages
+    "102400-1048576": 1  # 0.05% - huge messages (up to 1MB)
+
+test_runs:
+  - name: "throughput-500k"
+    description: "500k msgs/sec with production message size distribution"
+    type: "fixed_rate"
+    producer_rate: 500000
+    num_workers: 5
+
+reporting:
+  output_format:
+    - "html"
+    - "json"
+  include_raw_data: true
+  metrics_to_highlight:
+    - "throughput"
+    - "p99_latency"
+    - "cpu_usage"

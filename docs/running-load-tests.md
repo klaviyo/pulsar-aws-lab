@@ -27,6 +27,8 @@ The orchestrator creates Kubernetes Jobs that run OMB worker pods. Workers conne
 
 ### Prerequisites
 
+Check out https://github.com/klaviyo/pulsar-aws-lab
+
 - Nix package manager with flakes enabled
 - [direnv](https://direnv.net/) installed and hooked into your shell
 - AWS credentials for TeamSRE (or really any) account
@@ -124,6 +126,60 @@ reporting:
 |------|-------------|
 | `fixed_rate` | Producers target a specific msgs/sec rate |
 | `max_rate` | Producers send at maximum possible rate (saturation test) |
+
+### Message Size Distribution
+
+For more realistic load testing, you can use a histogram-based message size distribution instead of a fixed `message_size`. This feature uses the `messageSizeDistribution` parameter from [OpenMessaging Benchmark PR #443](https://github.com/openmessaging/benchmark/pull/443) (we are currently using a build based on this fork: https://github.com/kazamatzuri/omb-benchmark.git, which has the PR, (this is Fab's account...)).
+
+**Gathering Production Distribution Data:**
+
+To create realistic test profiles, gather message size distribution from production:
+- **Chronosphere Dashboard:** https://klaviyo.chronosphere.io/dashboards/fkh-pulsar?start=5m
+- Look at the message size histogram to get counts per bucket
+- Normalize the counts to weights (the framework handles weighted random selection)
+
+**Configuration Format:**
+
+```yaml
+base_workload:
+  name: "production-like-test"
+  topics: 200
+  partitions_per_topic: 8
+  # ... other settings ...
+
+  # Use message_size_distribution instead of message_size
+  # Keys are byte ranges, values are relative weights
+  message_size_distribution:
+    "0-128": 1           # 0.04% - tiny messages
+    "128-512": 76        # 7.62% - small messages
+    "512-1024": 601      # 60.12% - typical messages (~1KB)
+    "1024-2048": 170     # 17.02% - medium messages
+    "2048-4096": 35      # 3.46% - larger messages
+    "4096-16384": 102    # 10.22% - large messages
+    "16384-102400": 15   # 1.46% - very large messages
+    "102400-1048576": 1  # 0.05% - huge messages (up to 1MB)
+```
+
+**How Weights Work:**
+- Weights are relative, not percentages (they're normalized internally)
+- Higher weight = more messages in that size range
+- Example: weight 601 vs weight 1 means ~601x more messages in that bucket
+
+**Normalizing from Chronosphere:**
+
+1. Export message counts per bucket from the histogram
+2. Convert to relative weights (can divide by smallest value, or use raw counts)
+3. Map bucket boundaries to byte ranges
+
+| Chronosphere Bucket | Byte Range | Raw Count | Weight |
+|---------------------|------------|-----------|--------|
+| ≤128B | 0-128 | 82.58K | 1 |
+| ≤512B | 128-512 | 16.07M | 76 |
+| ≤1KB | 512-1024 | 126.71M | 601 |
+| ≤2KB | 1024-2048 | 35.87M | 170 |
+| ... | ... | ... | ... |
+
+See `config/test-plans/production-distribution-500k.yaml` for a complete example.
 
 ### Example: Ramping Throughput Test
 

@@ -844,7 +844,6 @@ class Orchestrator:
             'name': overrides.get('name', base['name']),
             'topics': overrides.get('workload_overrides', {}).get('topics', base['topics']),
             'partitionsPerTopic': overrides.get('workload_overrides', {}).get('partitions_per_topic', base['partitions_per_topic']),
-            'messageSize': overrides.get('workload_overrides', {}).get('message_size', base['message_size']),
             'useRandomizedPayloads': True,
             'randomBytesRatio': 0,
             'randomizedPayloadPoolSize': 1,
@@ -855,6 +854,24 @@ class Orchestrator:
             'testDurationMinutes': overrides.get('workload_overrides', {}).get('test_duration_minutes', base.get('test_duration_minutes', 5)),
             'warmupDurationMinutes': overrides.get('workload_overrides', {}).get('warmup_duration_minutes', base.get('warmup_duration_minutes', 1)),
         }
+
+        # Handle message size - either fixed size or distribution (mutually exclusive)
+        override_distribution = overrides.get('workload_overrides', {}).get('message_size_distribution')
+        override_size = overrides.get('workload_overrides', {}).get('message_size')
+        base_distribution = base.get('message_size_distribution')
+        base_size = base.get('message_size')
+
+        if override_distribution:
+            workload['messageSizeDistribution'] = override_distribution
+        elif override_size:
+            workload['messageSize'] = override_size
+        elif base_distribution:
+            workload['messageSizeDistribution'] = base_distribution
+        elif base_size:
+            workload['messageSize'] = base_size
+        else:
+            # Default to 1KB if nothing specified
+            workload['messageSize'] = 1024
 
         # Set producer rate based on test type
         if overrides['type'] == 'fixed_rate' and 'producer_rate' in overrides:
